@@ -128,14 +128,14 @@ impl Function {
                     // Stack: [..., error_object, traceback_string]
                     let tb = to_string(state, -1);
                     let err_value = lua.stack_value_at(-2, None, state);            
-                    return Err(E::from_lua_err(err_value, ret, tb));
+                    return Err(E::from_lua_err(lua.lua(), err_value, ret, tb));
                 } else if num_err_retvals == 1 {
                     // Stack: [..., error_object]
                     let err_value = lua.stack_value_at(-1, None, state);         
-                    return Err(E::from_lua_err(err_value, ret, String::with_capacity(0)));
+                    return Err(E::from_lua_err(lua.lua(), err_value, ret, String::with_capacity(0)));
                 } else {
                     // No results, catastrophic failure
-                    return Err(E::from_lua_err(crate::Value::Nil, ret, String::with_capacity(0)));
+                    return Err(E::from_lua_err(lua.lua(), crate::Value::Nil, ret, String::with_capacity(0)));
                 }
             }
 
