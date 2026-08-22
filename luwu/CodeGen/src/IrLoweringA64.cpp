@@ -1932,6 +1932,27 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         inst.regA64 = regs.takeReg(x0, index);
         break;
     }
+    case IrCmd::NEW_VECTOR:
+    {
+        RegisterA64 tempx = tempDouble(OP_A(inst));
+        RegisterA64 tempy = tempDouble(OP_B(inst));
+        RegisterA64 tempz = tempDouble(OP_C(inst));
+
+        regs.spill(index, {tempx, tempy, tempz});
+
+        build.mov(x0, rState);
+        if (tempx != d0)
+            build.fmov(d0, tempx);
+        if (tempy != d1)
+            build.fmov(d1, tempy);
+        if (tempz != d2)
+            build.fmov(d2, tempz);
+        build.ldr(x1, mem(rNativeContext, offsetof(NativeContext, newVector)));
+        build.blr(x1);
+
+        inst.regA64 = regs.takeReg(x0, index);
+        break;
+    }
     case IrCmd::INT64_TO_NUM:
     {
         inst.regA64 = regs.allocReg(KindA64::d, index);
@@ -4214,7 +4235,7 @@ AddressA64 IrLoweringA64::tempAddr(IrOp op, int offset, RegisterA64 tempStorage)
 
 AddressA64 IrLoweringA64::tempAddrBuffer(IrOp bufferOp, IrOp indexOp, uint8_t tag)
 {
-    CODEGEN_ASSERT(tag == LUA_TUSERDATA || tag == LUA_TBUFFER);
+    CODEGEN_ASSERT(tag == LUA_TUSERDATA || tag == LUA_TBUFFER || tag == LUA_TVECTOR);
     if (tag == LUA_TBUFFER)
     {
         // data may be inline_data (mode 0) or an non-inline (externally owned) pointer (mode 1/2)
@@ -4250,9 +4271,9 @@ AddressA64 IrLoweringA64::tempAddrBuffer(IrOp bufferOp, IrOp indexOp, uint8_t ta
         CODEGEN_ASSERT(!"Unsupported instruction form");
         return noreg;
     }
-    else // LUA_TUSERDATA
+    else // LUA_TUSERDATA or LUA_TVECTOR
     {
-        int dataOffset = offsetof(Udata, data);
+        int dataOffset = tag == LUA_TVECTOR ? offsetof(LuauVector, v) : offsetof(Udata, data);
         if (indexOp.kind == IrOpKind::Inst)
         {
             CODEGEN_ASSERT(!producesDirtyHighRegisterBits(function.instOp(indexOp).cmd));

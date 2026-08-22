@@ -295,7 +295,7 @@ impl Thread {
             ffi::LUA_ERRMEM => {
                 let err_value = lua.stack_value_at(-1, None, thread_state);
                 ffi::lua_pop(thread_state, 1);
-                Err(E::from_lua_err(err_value, ret, String::with_capacity(0)))
+                Err(E::from_lua_err(lua.lua(), err_value, ret, String::with_capacity(0)))
             }
             _ => {
                 let tb_string = if E::NEEDS_TRACEBACK {
@@ -313,7 +313,7 @@ impl Thread {
                     StdString::with_capacity(0)
                 };
                 let err_value = lua.stack_value_at(-1, None, thread_state);
-                Err(E::from_lua_err(err_value, ret, tb_string))
+                Err(E::from_lua_err(lua.lua(), err_value, ret, tb_string))
             }
         }
     }

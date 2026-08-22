@@ -1939,6 +1939,17 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         inst.regX64 = regs.takeReg(rax, index);
         break;
     }
+    case IrCmd::NEW_VECTOR:
+    {
+        IrCallWrapperX64 callWrap(regs, build, index);
+        callWrap.addArgument(SizeX64::qword, rState);
+        callWrap.addArgument(SizeX64::xmmword, memRegDoubleOp(OP_A(inst)), OP_A(inst));
+        callWrap.addArgument(SizeX64::xmmword, memRegDoubleOp(OP_B(inst)), OP_B(inst));
+        callWrap.addArgument(SizeX64::xmmword, memRegDoubleOp(OP_C(inst)), OP_C(inst));
+        callWrap.call(qword[rNativeContext + offsetof(NativeContext, newVector)]);
+        inst.regX64 = regs.takeReg(rax, index);
+        break;
+    }
     case IrCmd::INT_TO_NUM:
         inst.regX64 = regs.allocReg(SizeX64::xmmword, index);
 
@@ -4107,7 +4118,7 @@ RegisterX64 IrLoweringX64::regOp(IrOp op)
 
 OperandX64 IrLoweringX64::bufferAddrOp(IrOp bufferOp, IrOp indexOp, uint8_t tag)
 {
-    CODEGEN_ASSERT(tag == LUA_TUSERDATA || tag == LUA_TBUFFER);
+    CODEGEN_ASSERT(tag == LUA_TUSERDATA || tag == LUA_TBUFFER || tag == LUA_TVECTOR);
     if (tag == LUA_TBUFFER)
     {
         // data may be inline_data (mode 0) or an non-inline (externally owned) pointer (mode 1/2)
@@ -4131,8 +4142,8 @@ OperandX64 IrLoweringX64::bufferAddrOp(IrOp bufferOp, IrOp indexOp, uint8_t tag)
     } 
     else 
     { 
-        // LUA_TUSERDATA
-        int dataOffset = offsetof(Udata, data);
+        // LUA_TUSERDATA or LUA_TVECTOR
+        int dataOffset = tag == LUA_TVECTOR ? offsetof(LuauVector, v) : offsetof(Udata, data);
         if (indexOp.kind == IrOpKind::Inst)
         {
             CODEGEN_ASSERT(!producesDirtyHighRegisterBits(function.instOp(indexOp).cmd)); // Ensure that high register bits are cleared
