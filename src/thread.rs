@@ -441,7 +441,7 @@ impl Thread {
     /// # fn main() -> Result<()> {
     /// let lua = Lua::new();
     /// let thread = lua.create_thread(lua.create_function(|lua2, ()| {
-    ///     lua2.load("var = 123").exec()?;
+    ///     lua2.load("var = 123").call::<()>(())?;
     ///     assert_eq!(lua2.globals().get::<u32>("var")?, 123);
     ///     Ok::<_, mluau::Error>(())
     /// })?)?;

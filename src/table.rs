@@ -51,7 +51,7 @@ impl Table {
     ///     else
     ///         error("assertions neither on nor off?")
     ///     end
-    /// "#).exec()?;
+    /// "#).call::<()>(())?;
     /// # Ok(())
     /// # }
     /// ```

@@ -28,7 +28,7 @@ fn test_value_eq() -> Result<()> {
         })
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
     #[cfg(feature = "none-primitive")]
     globals.set("null", Value::None)?;
 
@@ -104,7 +104,7 @@ fn test_value_to_pointer() -> Result<()> {
         thread = coroutine.create(function() end)
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     #[cfg(feature = "none-primitive")]
     globals.set("null", Value::None)?;

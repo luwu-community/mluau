@@ -25,7 +25,7 @@ fn test_byte_string_round_trip() -> Result<()> {
         an_actual_string = "Hello, world!"
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     let globals = lua.globals();
 
@@ -74,7 +74,7 @@ fn test_byte_string_round_trip() -> Result<()> {
         assert(bstr_an_actual_string == an_actual_string)
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     globals.set("bstring_invalid_sequence_identifier", isi)?;
     globals.set("bstring_invalid_2_octet_sequence_2nd", i2os2)?;
@@ -97,7 +97,7 @@ fn test_byte_string_round_trip() -> Result<()> {
         assert(bstring_an_actual_string == an_actual_string)
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     Ok(())
 }

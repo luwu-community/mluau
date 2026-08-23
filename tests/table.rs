@@ -10,7 +10,7 @@ fn test_globals_set_get() -> Result<()> {
     assert_eq!(globals.get::<String>("foo")?, "bar");
     assert_eq!(globals.get::<String>("baz")?, "baf");
 
-    lua.load(r#"assert(foo == "bar")"#).exec().unwrap();
+    lua.load(r#"assert(foo == "bar")"#).call::<()>(()).unwrap();
 
     Ok(())
 }
@@ -28,7 +28,7 @@ fn test_table() -> Result<()> {
         table3 = {1, 2, nil, 4, 5}
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     let table1 = globals.get::<Table>("table1")?;
     assert_eq!(table1.len()?, 5);
@@ -301,7 +301,7 @@ fn test_table_scope() -> Result<()> {
         }
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     // Make sure that table gets do not borrow the table, but instead just borrow lua.
     let tin;
@@ -350,7 +350,7 @@ fn test_table_equals() -> Result<()> {
         })
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     let table1 = globals.get::<Table>("table1")?;
     let table2 = globals.get::<Table>("table2")?;
@@ -402,7 +402,7 @@ fn test_table_error() -> Result<()> {
         })
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     let bad_table: Table = globals.get("table")?;
     assert!(bad_table.set(1, 1).is_err());
@@ -475,7 +475,7 @@ fn test_table_get_set() -> Result<()> {
         end
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     let table: Table = lua.globals().get("table")?;
 

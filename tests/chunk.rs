@@ -134,11 +134,11 @@ fn test_chunk_wrap() -> Result<()> {
 
     let f = Chunk::wrap("return 123");
     lua.globals().set("f", f)?;
-    lua.load("assert(f() == 123)").exec().unwrap();
+    lua.load("assert(f() == 123)").call::<()>(()).unwrap();
 
     lua.globals().set("f2", Chunk::wrap("c()"))?;
     assert!(
-        (lua.load("f2()").exec().err().unwrap().to_string()).contains(file!()),
+        (lua.load("f2()").call::<()>(()).err().unwrap().to_string()).contains(file!()),
         "wrong chunk location"
     );
 
