@@ -298,7 +298,7 @@ fn test_to_value_struct() -> LuaResult<()> {
             assert(value["data"] == null)
         "#,
     )
-    .exec()
+    .call::<()>(())
 }
 
 #[test]
@@ -316,11 +316,11 @@ fn test_to_value_enum() -> LuaResult<()> {
 
     let u = E::Unit;
     globals.set("value", lua.to_value(&u)?)?;
-    lua.load(r#"assert(value == "Unit")"#).exec()?;
+    lua.load(r#"assert(value == "Unit")"#).call::<()>(())?;
 
     let n = E::Integer(1);
     globals.set("value", lua.to_value(&n)?)?;
-    lua.load(r#"assert(value["Integer"] == 1)"#).exec()?;
+    lua.load(r#"assert(value["Integer"] == 1)"#).call::<()>(())?;
 
     let t = E::Tuple(1, 2);
     globals.set("value", lua.to_value(&t)?)?;
@@ -330,11 +330,11 @@ fn test_to_value_enum() -> LuaResult<()> {
             assert(value["Tuple"][2] == 2)
         "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     let s = E::Struct { a: 1 };
     globals.set("value", lua.to_value(&s)?)?;
-    lua.load(r#"assert(value["Struct"]["a"] == 1)"#).exec()?;
+    lua.load(r#"assert(value["Struct"]["a"] == 1)"#).call::<()>(())?;
     Ok(())
 }
 
@@ -356,7 +356,7 @@ fn test_to_value_with_options() -> Result<(), Box<dyn StdError>> {
         assert(getmetatable(data) == nil)
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     #[derive(Serialize)]
     struct UnitStruct;
@@ -385,7 +385,7 @@ fn test_to_value_with_options() -> Result<(), Box<dyn StdError>> {
         assert(data2.unitstruct == null)
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     // serialize_unit_to_null
     let data3 = lua.to_value_with(&mydata, SerializeOptions::new().serialize_unit_to_null(false))?;
@@ -397,7 +397,7 @@ fn test_to_value_with_options() -> Result<(), Box<dyn StdError>> {
         assert(data3.unitstruct == nil)
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     Ok(())
 }
@@ -623,7 +623,7 @@ fn test_from_value_with_options() -> Result<(), Box<dyn StdError>> {
     let options = DeserializeOptions::new()
         .deny_unsupported_types(false)
         .deny_recursive_tables(false);
-    lua.load(r#"hello = "world""#).exec()?;
+    lua.load(r#"hello = "world""#).call::<()>(())?;
     let globals: Globals = lua.from_value_with(Value::Table(lua.globals()), options)?;
     assert_eq!(globals.hello, "world");
 
@@ -678,7 +678,7 @@ fn test_from_value_sorted() -> Result<(), Box<dyn StdError>> {
         assert(json == '{"0a":{"d":"d","z":"z"},"b":2,"c":3,"hello":"world","x":[1]}', "invalid json")
     "#,
     )
-    .exec()
+    .call::<()>(())
     .unwrap();
 
     Ok(())

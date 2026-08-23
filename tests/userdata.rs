@@ -52,7 +52,7 @@ fn test_method_variadic() -> Result<()> {
     let lua = Lua::new();
     let globals = lua.globals();
     globals.set("userdata", MyUserData(0.into()))?;
-    lua.load("userdata:add(1, 5, -10)").exec()?;
+    lua.load("userdata:add(1, 5, -10)").call::<()>(())?;
     let ud: UserDataRef<MyUserData> = globals.get("userdata")?;
     assert_eq!(ud.0.load(std::sync::atomic::Ordering::SeqCst), -4);
 
@@ -164,7 +164,7 @@ fn test_gc_userdata() -> Result<()> {
             hatch:access()
         "#
         )
-        .exec()
+        .call::<()>(())
         .is_err());
 
     Ok(())
@@ -207,7 +207,7 @@ fn test_functions() -> Result<()> {
         end
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
     let get = globals.get::<Function>("get_it")?;
     let get_constant = globals.get::<Function>("get_constant")?;
     assert_eq!(get.call::<i64>(())?, 42);
@@ -237,12 +237,12 @@ fn test_metatable() -> Result<()> {
     let lua = Lua::new();
     let globals = lua.globals();
     globals.set("ud", MyUserData)?;
-    lua.load(r#"assert(ud:my_type_name() == "MyUserData")"#).exec()?;
+    lua.load(r#"assert(ud:my_type_name() == "MyUserData")"#).call::<()>(())?;
 
     lua.load(r#"assert(tostring(ud):sub(1, 11) == "MyUserData:")"#)
-        .exec()?;
+        .call::<()>(())?;
 
-    lua.load(r#"assert(typeof(ud) == "MyUserData")"#).exec()?;
+    lua.load(r#"assert(typeof(ud) == "MyUserData")"#).call::<()>(())?;
 
     let ud: AnyUserData = globals.get("ud")?;
     let metatable = ud.metatable().unwrap();
@@ -387,7 +387,7 @@ fn test_methods() -> Result<()> {
             end
         "#,
         )
-        .exec()?;
+        .call::<()>(())?;
         let get = globals.get::<Function>("get_it")?;
         let set = globals.get::<Function>("set_it")?;
         assert_eq!(get.call::<i64>(())?, 42);

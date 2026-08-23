@@ -12,7 +12,7 @@ fn test_module_simple() -> Result<()> {
         assert(mod.sum(2,2) == 4)
     "#,
     )
-    .exec()
+    .call::<()>(())
 }
 
 #[test]
@@ -25,7 +25,7 @@ fn test_module_multi() -> Result<()> {
         assert(mod.check_userdata(mod2.userdata) == 123)
     "#,
     )
-    .exec()
+    .call::<()>(())
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn test_module_error() -> Result<()> {
         assert(string.find(tostring(err), "custom module error"))
     "#,
     )
-    .exec()
+    .call::<()>(())
 }
 
 #[cfg(any(
@@ -66,7 +66,7 @@ fn test_module_from_thread() -> Result<()> {
         assert(mod.used_memory() > 0)
     "#,
     )
-    .exec()
+    .call::<()>(())
 }
 
 #[cfg(any(
@@ -89,7 +89,7 @@ fn test_module_multi_from_thread() -> Result<()> {
         assert(ok, err)
     "#,
     )
-    .exec()
+    .call::<()>(())
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn test_module_new_vm() -> Result<()> {
         assert(mod.eval("return \"hello, world\"") == "hello, world")
     "#,
     )
-    .exec()
+    .call::<()>(())
 }
 
 fn make_lua() -> Result<Lua> {
@@ -139,6 +139,6 @@ fn make_lua() -> Result<Lua> {
     }
 
     let lua = unsafe { Lua::unsafe_new() }; // To be able to load C modules
-    lua.load(&format!("package.cpath = \"{}\"", cpath)).exec()?;
+    lua.load(&format!("package.cpath = \"{}\"", cpath)).call::<()>(())?;
     Ok(lua)
 }

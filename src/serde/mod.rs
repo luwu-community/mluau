@@ -37,7 +37,7 @@ pub trait LuaSerdeExt: Sealed {
     ///     lua.load(r#"
     ///         assert(user["name"] == "John Smith")
     ///         assert(user["age"] == 20)
-    ///     "#).exec()
+    ///     "#).call::<()>(())
     /// }
     /// ```
     fn to_value<T: Serialize + ?Sized>(&self, t: &T) -> Result<Value>;
@@ -58,7 +58,7 @@ pub trait LuaSerdeExt: Sealed {
     ///     lua.load(r#"
     ///         assert(#v == 3 and v[1] == 1 and v[2] == 2 and v[3] == 3)
     ///         assert(getmetatable(v) == nil)
-    ///     "#).exec()
+    ///     "#).call::<()>(())
     /// }
     /// ```
     fn to_value_with<T>(&self, t: &T, options: ser::Options) -> Result<Value>

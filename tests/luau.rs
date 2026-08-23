@@ -38,7 +38,7 @@ fn test_vectors() -> Result<()> {
         assert(v.z == 3)
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     // Test vector methods (fastcall)
     lua.load(
@@ -50,7 +50,7 @@ fn test_vectors() -> Result<()> {
     "#,
     )
     .set_compiler(Compiler::new().set_vector_ctor("vector"))
-    .exec()?;
+    .call::<()>(())?;
 
     Ok(())
 }
@@ -79,7 +79,7 @@ fn test_vectors() -> Result<()> {
         assert(v.w == 4)
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     // Test vector methods (fastcall)
     lua.load(
@@ -92,7 +92,7 @@ fn test_vectors() -> Result<()> {
     "#,
     )
     .set_compiler(Compiler::new().set_vector_ctor("vector"))
-    .exec()?;
+    .call::<()>(())?;
 
     Ok(())
 }
@@ -147,7 +147,7 @@ fn test_vector_metatable() -> Result<()> {
     "#,
     )
     .set_compiler(compiler)
-    .exec()?;
+    .call::<()>(())?;
 
     Ok(())
 }
@@ -193,7 +193,7 @@ fn test_sandbox() -> Result<()> {
 
     lua.sandbox(true)?;
 
-    lua.load("global = 123").exec()?;
+    lua.load("global = 123").call::<()>(())?;
     let n: i32 = lua.load("return global").eval()?;
     assert_eq!(n, 123);
     assert_eq!(lua.globals().get::<Option<i32>>("global")?, Some(123));
@@ -240,7 +240,7 @@ fn test_sandbox_safeenv() -> Result<()> {
     lua.sandbox(true)?;
     lua.globals().set("state", lua.create_table()?)?;
     lua.globals().set_safeenv(false);
-    lua.load("state.a = 123").exec()?;
+    lua.load("state.a = 123").call::<()>(())?;
     let a: i32 = lua.load("state.a = 321; return state.a").eval()?;
     assert_eq!(a, 321);
 
@@ -252,7 +252,7 @@ fn test_sandbox_nolibs() -> Result<()> {
     let lua = Lua::new_with(StdLib::NONE).unwrap();
 
     lua.sandbox(true)?;
-    lua.load("global = 123").exec()?;
+    lua.load("global = 123").call::<()>(())?;
     let n: i32 = lua.load("return global").eval()?;
     assert_eq!(n, 123);
     assert_eq!(lua.globals().get::<Option<i32>>("global")?, Some(123));
@@ -506,7 +506,7 @@ fn test_classes_value_enum_roundtrip() -> Result<()> {
         assert(receive_object(cat) == cat)
         "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     let class_value = seen_class
         .lock()
@@ -646,7 +646,7 @@ fn test_thread_events() -> Result<()> {
             co()
     "#,
         )
-        .exec();
+        .call::<()>(());
     assert!(result.is_err());
     assert!(matches!(result, Err(Error::RuntimeError(err)) if err.contains("thread limit exceeded")));
     lua.gc_collect()?; // Drop the coroutine

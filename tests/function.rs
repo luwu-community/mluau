@@ -41,7 +41,7 @@ fn test_function_info() -> Result<()> {
     "#,
     )
     .set_name("source1")
-    .exec()?;
+    .call::<()>(())?;
 
     let function1 = globals.get::<Function>("function1")?;
     let function2 = function1.call::<Function>(())?;

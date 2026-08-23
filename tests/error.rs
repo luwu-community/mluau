@@ -30,7 +30,7 @@ fn test_disable_error_userdata() -> Result<()> {
 
     // Force a memory error
     for i in 0..10000 {
-        match lua.load(format!("return string.rep('a', {})", i)).exec() {
+        match lua.load(format!("return string.rep('a', {})", i)).call::<()>(()) {
             Ok(_) => {}
             Err(mluau::Error::MemoryError { .. }) => {
                 // Memory error is expected, we can stop here

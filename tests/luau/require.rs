@@ -104,7 +104,7 @@ fn test_require_errors() {
         .create_require_function(MyRequire(TextRequirer::new()))
         .unwrap();
     lua.globals().set("require", require).unwrap();
-    let res = lua.load(r#"return require('./a/relative/path')"#).exec();
+    let res = lua.load(r#"return require('./a/relative/path')"#).call::<()>(());
     assert!((res.unwrap_err().to_string()).contains("test error"));
 }
 

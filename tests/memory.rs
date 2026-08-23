@@ -105,7 +105,7 @@ fn test_bump_allocator() {
     let alloc = Box::new(BumpAllocator::new());
     let lua = Lua::new_with_allocator(StdLib::ALL_SAFE, alloc).unwrap();
     
-    lua.load("x = 1 + 2").exec().unwrap();
+    lua.load("x = 1 + 2").call::<()>(()).unwrap();
     let x: i32 = lua.globals().get("x").unwrap();
     assert_eq!(x, 3);
 }

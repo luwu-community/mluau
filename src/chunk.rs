@@ -5,11 +5,12 @@ use std::io::Result as IoResult;
 use std::panic::Location;
 use std::string::String as StdString;
 
+use crate::{FromLuaErr, IntoLuaMulti};
 use crate::error::{Error, Result};
 use crate::function::Function;
 use crate::state::{Lua, WeakLua};
 use crate::table::Table;
-use crate::traits::{FromLuaMulti, IntoLua, IntoLuaMulti};
+use crate::traits::{FromLuaMulti, IntoLua};
 use crate::value::Value;
 
 /// Trait for types [loadable by Lua] and convertible to a [`Chunk`]
@@ -624,29 +625,27 @@ impl Chunk<'_> {
         self
     }
 
-    /// Execute this chunk of code.
-    ///
-    /// This is equivalent to calling the chunk function with no arguments and no return values.
-    pub fn exec(self) -> Result<()> {
-        self.call(())
-    }
-
     /// Evaluate the chunk as either an expression or block.
     ///
     /// If the chunk can be parsed as an expression, this loads and executes the chunk and returns
     /// the value that it evaluates to. Otherwise, the chunk is interpreted as a block as normal,
     /// and this is equivalent to calling `exec`.
     pub fn eval<R: FromLuaMulti>(self) -> Result<R> {
+        self.eval_with_err::<R, crate::Error>()
+    }
+
+    /// Same as eval but supports custom error values
+    pub fn eval_with_err<R: FromLuaMulti, E: FromLuaErr>(self) -> std::result::Result<R, E> {
         // Bytecode is always interpreted as a statement.
         // For source code, first try interpreting the lua as an expression by adding
         // "return", then as a statement. This is the same thing the
         // actual lua repl does.
         if self.mode == ChunkMode::Binary {
-            self.call(())
+            self.into_function().map_err(E::from_rust_err)?.call_with_err::<R, E>(())
         } else if let Ok(function) = self.to_expression() {
-            function.call(())
+            function.call_with_err::<R, E>(())
         } else {
-            self.call(())
+            self.into_function().map_err(E::from_rust_err)?.call_with_err::<R, E>(())
         }
     }
 
@@ -654,13 +653,17 @@ impl Chunk<'_> {
     ///
     /// This is equivalent to `into_function` and calling the resulting function.
     pub fn call<R: FromLuaMulti>(self, args: impl IntoLuaMulti) -> Result<R> {
-        self.into_function()?.call(args)
+        self.call_with_err::<R, crate::Error>(args)
+    }
+
+    /// Same as call but supports custom error values
+    pub fn call_with_err<R: FromLuaMulti, E: FromLuaErr>(self, args: impl IntoLuaMulti) -> std::result::Result<R, E> {
+        self.into_function().map_err(E::from_rust_err)?.call_with_err::<R, E>(args)
     }
 
     /// Load this chunk into a regular [`Function`].
     ///
     /// This simply compiles the chunk without actually executing it.
-
     pub fn into_function(mut self) -> Result<Function> {
         if self.compiler.is_some() {
             // We don't need to compile source if no compiler set

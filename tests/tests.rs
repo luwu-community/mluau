@@ -36,8 +36,8 @@ fn test_load() -> Result<()> {
     let result: i32 = func.call(())?;
     assert_eq!(result, 3);
 
-    assert!(lua.load("").exec().is_ok());
-    assert!(lua.load("§$%§&$%&").exec().is_err());
+    assert!(lua.load("").call::<()>(()).is_ok());
+    assert!(lua.load("§$%§&$%&").call::<()>(()).is_err());
 
     Ok(())
 }
@@ -52,7 +52,7 @@ fn test_exec() -> Result<()> {
         res = 'foo'..'bar'
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
     assert_eq!(globals.get::<String>("res")?, "foobar");
 
     let module: Table = lua
@@ -135,7 +135,7 @@ fn test_lua_multi() -> Result<()> {
         end
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     let globals = lua.globals();
     let concat = globals.get::<Function>("concat")?;
@@ -163,7 +163,7 @@ fn test_coercion() -> Result<()> {
         func = function() end
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     let globals = lua.globals();
     assert_eq!(globals.get::<String>("int")?, "123");
@@ -251,7 +251,7 @@ fn test_error() -> Result<()> {
         end
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     let rust_error_function = lua.create_function(|_, ()| -> Result<()> { Err(mluau::Error::external(TestError)) })?;
     globals.set("rust_error_function", rust_error_function)?;
@@ -378,9 +378,9 @@ fn test_pcall_xpcall() -> Result<()> {
 
     // make sure that we handle not enough arguments
 
-    assert!(lua.load("pcall()").exec().is_err());
-    assert!(lua.load("xpcall()").exec().is_err());
-    assert!(lua.load("xpcall(function() end)").exec().is_err());
+    assert!(lua.load("pcall()").call::<()>(()).is_err());
+    assert!(lua.load("xpcall()").call::<()>(()).is_err());
+    assert!(lua.load("xpcall(function() end)").call::<()>(()).is_err());
 
     // Lua >= 5.2 compatible version of xpcall for 5.1
     #[cfg(feature = "lua51")]
@@ -392,7 +392,7 @@ fn test_pcall_xpcall() -> Result<()> {
         end
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     // Make sure that the return values from are correct on success
 
@@ -419,7 +419,7 @@ fn test_pcall_xpcall() -> Result<()> {
         xpcall_status, _ = xpcall(error, function(err) xpcall_error = err end, "testerror")
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     assert_eq!(globals.get::<bool>("pcall_status")?, false);
     assert_eq!(globals.get::<String>("pcall_error")?, "testerror");
@@ -434,7 +434,7 @@ fn test_pcall_xpcall() -> Result<()> {
         end
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
     let _ = globals.get::<Function>("xpcall_recursion")?.call::<()>(());
 
     Ok(())
@@ -449,7 +449,7 @@ fn test_set_metatable_nil() -> Result<()> {
         setmetatable(a, nil)
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
     Ok(())
 }
 
@@ -527,7 +527,7 @@ fn test_rust_function() -> Result<()> {
         return 1
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     let lua_function = globals.get::<Function>("lua_function")?;
     let rust_function = lua.create_function(|_, ()| Ok("hello"))?;
@@ -674,7 +674,7 @@ fn test_chunk_env() -> Result<()> {
     "#,
     )
     .set_environment(env1.clone())
-    .exec()?;
+    .call::<()>(())?;
 
     lua.load(
         r#"
@@ -683,7 +683,7 @@ fn test_chunk_env() -> Result<()> {
     "#,
     )
     .set_environment(env2.clone())
-    .exec()?;
+    .call::<()>(())?;
 
     assert_eq!(lua.load("test_var").set_environment(env1).eval::<i32>()?, 1);
     assert_eq!(lua.load("test_var").set_environment(env2).eval::<i32>()?, 2);
@@ -723,7 +723,7 @@ fn test_register_module() -> Result<()> {
         assert(my_module.name == "my_module")
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     lua.unload_module("@my_module")?;
     lua.load(
@@ -732,7 +732,7 @@ fn test_register_module() -> Result<()> {
         assert(not ok)
         "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     {
         // Luau registered modules must have '@' prefix
@@ -752,7 +752,7 @@ fn test_register_module() -> Result<()> {
             assert(my_module.name == "my_module")
         "#,
         )
-        .exec()?;
+        .call::<()>(())?;
     }
 
     Ok(())
@@ -795,7 +795,7 @@ fn test_inspect_stack() -> Result<()> {
     "#,
     )
     .set_name("chunk")
-    .exec()?;
+    .call::<()>(())?;
 
     let stack_info = lua.create_function(|lua, ()| {
         let stack_info = lua.inspect_stack(1, |debug| debug.stack()).unwrap();
@@ -812,7 +812,7 @@ fn test_inspect_stack() -> Result<()> {
         assert(baz() == 'DebugStack { num_ups: 1, num_params: 3, is_vararg: true }')
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     // LuaJIT does not pass this test for some reason
     #[cfg(feature = "lua51")]
@@ -825,7 +825,7 @@ fn test_inspect_stack() -> Result<()> {
         assert(baz() == 'DebugStack { num_ups: 1 }')
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     // Test retrieving currently running function
     let running_function =
@@ -844,7 +844,7 @@ fn test_inspect_stack() -> Result<()> {
         end
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     Ok(())
 }
@@ -883,7 +883,7 @@ fn test_traceback() -> Result<()> {
         end
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     // Test traceback at different levels
     lua.load(
@@ -902,7 +902,7 @@ fn test_traceback() -> Result<()> {
         local tb0, tb1, tb2 = bar()
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     Ok(())
 }
@@ -920,7 +920,7 @@ fn test_multi_states() -> Result<()> {
     lua.globals().set("f", f)?;
 
     lua.load("f(function() coroutine.wrap(function() f() end)() end)")
-        .exec()?;
+        .call::<()>(())?;
 
     Ok(())
 }

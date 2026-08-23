@@ -39,7 +39,7 @@ fn test_string_views() -> Result<()> {
         empty = ""
     "#,
     )
-    .exec()?;
+    .call::<()>(())?;
 
     let globals = lua.globals();
     let ok: String = globals.get("ok")?;

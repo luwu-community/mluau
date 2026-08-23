@@ -327,7 +327,7 @@ impl Lua {
     /// let lua = Lua::new();
     ///
     /// lua.sandbox(true)?;
-    /// lua.load("var = 123").exec()?;
+    /// lua.load("var = 123").call::<()>(())?;
     /// assert_eq!(lua.globals().get::<u32>("var")?, 123);
     ///
     /// // Restore the global environment (clear changes made in sandbox)
@@ -1276,7 +1276,7 @@ impl Lua {
     /// let mt = lua.create_table()?;
     /// mt.set("__tostring", lua.create_function(|_, b: bool| Ok::<_, mluau::Error>(if b { "2" } else { "0" }))?)?;
     /// lua.set_type_metatable::<bool>(Some(mt));
-    /// lua.load("assert(tostring(true) == '2')").exec()?;
+    /// lua.load("assert(tostring(true) == '2')").call::<()>(())?;
     /// # Ok(())
     /// # }
     /// ```
