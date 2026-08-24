@@ -524,6 +524,14 @@ enum LuauBytecodeTag
     LBC_CONSTANT__COUNT
 };
 
+// Per-member attribute bits serialized as part of LBC_CONSTANT_CLASS_SHAPE (Luau Classes,
+// experimental). The single source of truth for these bits; both the compiler
+// (Compiler/src/Compiler.cpp) and the VM (VM/src/lclass.h/.cpp) use these directly.
+#define LBC_CLASSMEMBER_PRIVATE (1 << 0)
+#define LBC_CLASSMEMBER_CONST (1 << 1)
+// Set on properties that have a default value expression (see AstClassProperty::defaultValue).
+#define LBC_CLASSMEMBER_HASDEFAULT (1 << 2)
+
 // Type table tags
 enum LuauBytecodeType
 {

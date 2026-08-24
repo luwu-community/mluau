@@ -580,7 +580,7 @@ reentry:
                             if (LUAU_LIKELY(ttisstring(gkey(n)) && tsvalue(gkey(n)) == tsvalue(kv) && !ttisnil(gval(n))))
                             {
                                 lua_UserdataDirectFieldGet fn = reinterpret_cast<lua_UserdataDirectFieldGet>(pvalue(gval(n)));
-                                fn(uvalue(rb)->data, resultarg);
+                                fn(L, uvalue(rb)->data, resultarg);
                                 VM_NEXT();
                             }
 
@@ -590,7 +590,7 @@ reentry:
                                 // cache slot for future lookups
                                 VM_PATCH_C(pc - 2, gval2slot(dispatch, fptr));
                                 lua_UserdataDirectFieldGet fn = reinterpret_cast<lua_UserdataDirectFieldGet>(pvalue(fptr));
-                                fn(uvalue(rb)->data, resultarg);
+                                fn(L, uvalue(rb)->data, resultarg);
                                 VM_NEXT();
                             }
                         }
@@ -664,6 +664,8 @@ reentry:
                         LuauObject* inst = objectvalue(rb);
                         if (LUAU_LIKELY(slot < inst->lclass->numberofallmembers && tsvalue(kv) == inst->lclass->offsettomember[slot]))
                         {
+                            if (LUAU_UNLIKELY(inst->lclass->hasprivatemembers))
+                                luaR_checkprivateaccess(L, kv, inst->lclass, cl, slot);
                             setobj2s(L, ra, luaR_lookupmemberatoffset(inst, slot));
                             VM_NEXT();
                         }
@@ -674,6 +676,8 @@ reentry:
                             if (ttisnil(offset))
                                 luaG_missingmembererror(L, rb, kv);
                             const uint32_t offsetnum = uint32_t(nvalue(offset));
+                            if (LUAU_UNLIKELY(inst->lclass->hasprivatemembers))
+                                luaR_checkprivateaccess(L, kv, inst->lclass, cl, offsetnum);
                             setobj2s(L, ra, luaR_lookupmemberatoffset(inst, offsetnum));
                             VM_PATCH_C(pc - 2, offsetnum);
                             VM_NEXT();
@@ -974,6 +978,36 @@ reentry:
                             luaG_methoderror(L, ra + 1, tsvalue(kv));
                     }
                 }
+                else if (LUAU_UNLIKELY(FFlag::DebugLuauUserDefinedClassesRuntime && ttisobject(rb)))
+                {
+                    // Objects are dispatched on their own: they don't use L->global->mt[ttype]
+                    // like userdata/vectors do (each class has its own instancemetatable), and
+                    // they don't support __index/__newindex at all, so none of the generic
+                    // metatable machinery below applies to them.
+                    uint8_t slot = LUAU_INSN_C(insn);
+                    LuauObject* inst = objectvalue(rb);
+                    if (slot < inst->lclass->numberofallmembers && tsvalue(kv) == inst->lclass->offsettomember[slot])
+                    {
+                        if (LUAU_UNLIKELY(inst->lclass->hasprivatemembers))
+                            luaR_checkprivateaccess(L, kv, inst->lclass, cl, slot);
+                        // note: order of copies allows rb to alias ra+1 or ra
+                        setobj2s(L, ra + 1, rb);
+                        setobj2s(L, ra, luaR_lookupmemberatoffset(inst, slot));
+                    }
+                    // slow-er path: try to fetch the field manually.
+                    else
+                    {
+                        const TValue* offset = luaH_getstr(inst->lclass->memberstooffset, tsvalue(kv));
+                        if (ttisnil(offset))
+                            luaG_missingmembererror(L, rb, kv);
+                        const uint32_t offsetnum = uint32_t(nvalue(offset));
+                        if (LUAU_UNLIKELY(inst->lclass->hasprivatemembers))
+                            luaR_checkprivateaccess(L, kv, inst->lclass, cl, offsetnum);
+                        setobj2s(L, ra + 1, rb);
+                        setobj2s(L, ra, luaR_lookupmemberatoffset(inst, offsetnum));
+                        VM_PATCH_C(pc - 2, offsetnum);
+                    }
+                }
                 else
                 {
                     LuaTable* mt = ttisuserdata(rb) ? uvalue(rb)->metatable : L->global->mt[ttype(rb)];
@@ -1013,28 +1047,6 @@ reentry:
                             ra = VM_REG(LUAU_INSN_A(insn));
                             if (ttisnil(ra))
                                 luaG_methoderror(L, ra + 1, tsvalue(kv));
-                        }
-                    }
-                    else if (LUAU_UNLIKELY(FFlag::DebugLuauUserDefinedClassesRuntime && ttisobject(rb)))
-                    {
-                        uint8_t slot = LUAU_INSN_C(insn);
-                        LuauObject* inst = objectvalue(rb);
-                        if (slot < inst->lclass->numberofallmembers && tsvalue(kv) == inst->lclass->offsettomember[slot])
-                        {
-                            // note: order of copies allows rb to alias ra+1 or ra
-                            setobj2s(L, ra + 1, rb);
-                            setobj2s(L, ra, luaR_lookupmemberatoffset(inst, slot));
-                        }
-                        // slow-er path: try to fetch the field manually.
-                        else
-                        {
-                            const TValue* offset = luaH_getstr(inst->lclass->memberstooffset, tsvalue(kv));
-                            if (ttisnil(offset))
-                                luaG_missingmembererror(L, rb, kv);
-                            const uint32_t offsetnum = uint32_t(nvalue(offset));
-                            setobj2s(L, ra + 1, rb);
-                            setobj2s(L, ra, luaR_lookupmemberatoffset(inst, offsetnum));
-                            VM_PATCH_C(pc - 2, offsetnum);
                         }
                     }
                     else
