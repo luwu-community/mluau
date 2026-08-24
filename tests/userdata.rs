@@ -431,3 +431,263 @@ fn test_methods() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_alignment() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    #[repr(C)]
+    #[repr(align(64))] // Forces a huge alignment gap to catch any under-allocation/padding bugs
+    pub struct AlignmentStressTester {
+        pub magic_id: u64,
+        pub payload: [f32; 4], 
+        _padding_trap: u8,     // Explicitly offsets struct size to create non-standard padding trailing bytes
+    }
+
+    impl AlignmentStressTester {
+        pub fn new(id: u64) -> Self {
+            Self {
+                magic_id: id,
+                payload: [1.0, 2.0, 3.0, 4.0],
+                _padding_trap: 0xAA,
+            }
+        }
+    }
+
+    impl Drop for AlignmentStressTester {
+        fn drop(&mut self) {
+            // Increment global counter to ensure drop_fn actually executed the inner drop
+            DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let lua = Lua::new();
+    lua.create_any_userdata(AlignmentStressTester::new(0xDEADBEEF_12345678), None)?;
+    Ok(())
+}
+
+#[test]
+fn test_wacky_high_alignment_stress() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROP_COUNT_64: AtomicUsize = AtomicUsize::new(0);
+    static DROP_COUNT_128: AtomicUsize = AtomicUsize::new(0);
+    static DROP_COUNT_256: AtomicUsize = AtomicUsize::new(0);
+    static DROP_COUNT_512: AtomicUsize = AtomicUsize::new(0);
+    static DROP_COUNT_1024: AtomicUsize = AtomicUsize::new(0);
+    static DROP_COUNT_4096: AtomicUsize = AtomicUsize::new(0);
+
+    #[repr(C, align(64))]
+    struct Align64 {
+        magic: u64,
+        data: [u8; 48],
+    }
+    impl Drop for Align64 {
+        fn drop(&mut self) {
+            assert_eq!(self.magic, 0x1111_2222_3333_4444);
+            DROP_COUNT_64.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[repr(C, align(128))]
+    struct Align128 {
+        magic: u64,
+        values: [f64; 8],
+    }
+    impl Drop for Align128 {
+        fn drop(&mut self) {
+            assert_eq!(self.magic, 0x2222_3333_4444_5555);
+            DROP_COUNT_128.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[repr(C, align(256))]
+    struct Align256 {
+        magic: u64,
+        table: [u32; 32],
+    }
+    impl Drop for Align256 {
+        fn drop(&mut self) {
+            assert_eq!(self.magic, 0x3333_4444_5555_6666);
+            DROP_COUNT_256.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[repr(C, align(512))]
+    struct Align512 {
+        magic: u64,
+        payload: [u64; 32],
+    }
+    impl Drop for Align512 {
+        fn drop(&mut self) {
+            assert_eq!(self.magic, 0x4444_5555_6666_7777);
+            DROP_COUNT_512.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[repr(C, align(1024))]
+    struct Align1024 {
+        magic: u64,
+        buffer: [u8; 512],
+    }
+    impl Drop for Align1024 {
+        fn drop(&mut self) {
+            assert_eq!(self.magic, 0x5555_6666_7777_8888);
+            DROP_COUNT_1024.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[repr(C, align(4096))] // Page-aligned!
+    struct Align4096 {
+        magic: u64,
+        page_chunk: [u64; 256],
+    }
+    impl Drop for Align4096 {
+        fn drop(&mut self) {
+            assert_eq!(self.magic, 0x6666_7777_8888_9999);
+            DROP_COUNT_4096.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    const COUNT_PER_TIER: usize = 50;
+
+    let lua = Lua::new();
+
+    // Verify alignment predicate at compile-time / runtime
+    assert!(std::mem::align_of::<Align64>() == 64);
+    assert!(std::mem::align_of::<Align128>() == 128);
+    assert!(std::mem::align_of::<Align256>() == 256);
+    assert!(std::mem::align_of::<Align512>() == 512);
+    assert!(std::mem::align_of::<Align1024>() == 1024);
+    assert!(std::mem::align_of::<Align4096>() == 4096);
+
+    {
+        let mut u64_vec = Vec::new();
+        let mut u128_vec = Vec::new();
+        let mut u256_vec = Vec::new();
+        let mut u512_vec = Vec::new();
+        let mut u1024_vec = Vec::new();
+        let mut u4096_vec = Vec::new();
+
+        for i in 0..COUNT_PER_TIER {
+            // Tier 64
+            let ud64 = lua.create_any_userdata(
+                Align64 {
+                    magic: 0x1111_2222_3333_4444,
+                    data: [i as u8; 48],
+                },
+                None,
+            )?;
+            let r64: mluau::TypedUserData<Align64> = ud64.clone().into::<Align64>().unwrap();
+            let ptr64 = &*r64 as *const Align64;
+            assert_eq!(ptr64 as usize % 64, 0, "Align64 pointer was not 64-byte aligned!");
+            assert_eq!(r64.magic, 0x1111_2222_3333_4444);
+            assert_eq!(r64.data[0], i as u8);
+            u64_vec.push(ud64);
+
+            // Tier 128
+            let ud128 = lua.create_any_userdata(
+                Align128 {
+                    magic: 0x2222_3333_4444_5555,
+                    values: [i as f64 * 1.5; 8],
+                },
+                None,
+            )?;
+            let r128: mluau::TypedUserData<Align128> = ud128.clone().into::<Align128>().unwrap();
+            let ptr128 = &*r128 as *const Align128;
+            assert_eq!(ptr128 as usize % 128, 0, "Align128 pointer was not 128-byte aligned!");
+            assert_eq!(r128.magic, 0x2222_3333_4444_5555);
+            assert_eq!(r128.values[3], i as f64 * 1.5);
+            u128_vec.push(ud128);
+
+            // Tier 256
+            let ud256 = lua.create_any_userdata(
+                Align256 {
+                    magic: 0x3333_4444_5555_6666,
+                    table: [i as u32 + 100; 32],
+                },
+                None,
+            )?;
+            let r256: mluau::TypedUserData<Align256> = ud256.clone().into::<Align256>().unwrap();
+            let ptr256 = &*r256 as *const Align256;
+            assert_eq!(ptr256 as usize % 256, 0, "Align256 pointer was not 256-byte aligned!");
+            assert_eq!(r256.magic, 0x3333_4444_5555_6666);
+            assert_eq!(r256.table[15], i as u32 + 100);
+            u256_vec.push(ud256);
+
+            // Tier 512
+            let ud512 = lua.create_any_userdata(
+                Align512 {
+                    magic: 0x4444_5555_6666_7777,
+                    payload: [i as u64 * 1000; 32],
+                },
+                None,
+            )?;
+            let r512: mluau::TypedUserData<Align512> = ud512.clone().into::<Align512>().unwrap();
+            let ptr512 = &*r512 as *const Align512;
+            assert_eq!(ptr512 as usize % 512, 0, "Align512 pointer was not 512-byte aligned!");
+            assert_eq!(r512.magic, 0x4444_5555_6666_7777);
+            assert_eq!(r512.payload[7], i as u64 * 1000);
+            u512_vec.push(ud512);
+
+            // Tier 1024
+            let ud1024 = lua.create_any_userdata(
+                Align1024 {
+                    magic: 0x5555_6666_7777_8888,
+                    buffer: [0x5A; 512],
+                },
+                None,
+            )?;
+            let r1024: mluau::TypedUserData<Align1024> = ud1024.clone().into::<Align1024>().unwrap();
+            let ptr1024 = &*r1024 as *const Align1024;
+            assert_eq!(ptr1024 as usize % 1024, 0, "Align1024 pointer was not 1024-byte aligned!");
+            assert_eq!(r1024.magic, 0x5555_6666_7777_8888);
+            assert_eq!(r1024.buffer[255], 0x5A);
+            u1024_vec.push(ud1024);
+
+            // Tier 4096 (4KB page alignment)
+            let ud4096 = lua.create_any_userdata(
+                Align4096 {
+                    magic: 0x6666_7777_8888_9999,
+                    page_chunk: [i as u64; 256],
+                },
+                None,
+            )?;
+            let r4096: mluau::TypedUserData<Align4096> = ud4096.clone().into::<Align4096>().unwrap();
+            let ptr4096 = &*r4096 as *const Align4096;
+            assert_eq!(ptr4096 as usize % 4096, 0, "Align4096 pointer was not 4096-byte aligned!");
+            assert_eq!(r4096.magic, 0x6666_7777_8888_9999);
+            assert_eq!(r4096.page_chunk[128], i as u64);
+            u4096_vec.push(ud4096);
+        }
+
+        // Test passing extreme-aligned userdata across Lua function boundary
+        let check_fn = lua.create_function(|_, ud: mluau::AnyUserData| {
+            let r4096: mluau::TypedUserData<Align4096> = ud.into::<Align4096>().unwrap();
+            let ptr = &*r4096 as *const Align4096;
+            assert_eq!(ptr as usize % 4096, 0);
+            assert_eq!(r4096.magic, 0x6666_7777_8888_9999);
+            Ok(true)
+        })?;
+
+        for ud in &u4096_vec {
+            let res: bool = check_fn.call(ud.clone())?;
+            assert!(res);
+        }
+    }
+
+    // Run garbage collection and ensure every single boxed high-alignment object is cleanly dropped
+    lua.gc_collect()?;
+    lua.gc_collect()?;
+
+    assert_eq!(DROP_COUNT_64.load(Ordering::SeqCst), COUNT_PER_TIER);
+    assert_eq!(DROP_COUNT_128.load(Ordering::SeqCst), COUNT_PER_TIER);
+    assert_eq!(DROP_COUNT_256.load(Ordering::SeqCst), COUNT_PER_TIER);
+    assert_eq!(DROP_COUNT_512.load(Ordering::SeqCst), COUNT_PER_TIER);
+    assert_eq!(DROP_COUNT_1024.load(Ordering::SeqCst), COUNT_PER_TIER);
+    assert_eq!(DROP_COUNT_4096.load(Ordering::SeqCst), COUNT_PER_TIER);
+
+    Ok(())
+}

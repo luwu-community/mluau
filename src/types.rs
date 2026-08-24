@@ -129,87 +129,149 @@ impl<T: 'static, Backer: 'static + Clone, const TAG: c_int> TypedRef<T, Backer, 
     }
 }
 
+const MAX_GC_ALIGN: usize = 16; // max alignment allowed by luau
+
 #[repr(C)]
-pub(crate) struct ErasedHeader {
+/// Internal vtable used by mluau for all userdata, external buffers and strings
+/// 
+/// Outside of interop cases, you should never need to use this
+pub struct ErasedHeader {
     type_id: std::any::TypeId,
     drop_fn: unsafe fn(*mut std::ffi::c_void),
 }
 
 #[repr(C)]
-struct ErasedWrapper<T> {
+pub struct ErasedInlineWrapper<T> {
     header: ErasedHeader,
     data: T,
 }
 
+#[repr(C)]
+pub struct ErasedBoxedWrapper<T> {
+    header: ErasedHeader,
+    data: *mut T,
+}
+
 impl ErasedHeader {
+    /// Always returns true if T will be boxed on the heap.
     #[inline]
-    /// Converts T into a ErasedWrapper pointer to ErasedWrapper<T>
-    pub(crate) fn into_raw<T: 'static>(data: T) -> *mut std::ffi::c_void {
-        let wrapper = Box::new(ErasedWrapper {
-            header: ErasedHeader {
-                type_id: std::any::TypeId::of::<T>(),
-                drop_fn: |ptr| unsafe {
-                    let _ = Box::from_raw(ptr as *mut ErasedWrapper<T>);
+    pub const fn is_boxed<T>() -> bool {
+        std::mem::align_of::<T>() > MAX_GC_ALIGN
+    }
+
+    #[inline]
+    /// Converts T into a ErasedWrapper pointer via rust global allocator
+    pub fn into_raw<T: 'static>(data: T) -> *mut std::ffi::c_void {
+        if const { Self::is_boxed::<T>() } {
+            let boxed = Box::into_raw(Box::new(data));
+            let wrapper = Box::new(ErasedBoxedWrapper {
+                header: ErasedHeader {
+                    type_id: std::any::TypeId::of::<T>(),
+                    drop_fn: |ptr| unsafe {
+                        let wrapper = Box::from_raw(ptr as *mut ErasedBoxedWrapper<T>);
+                        let _ = Box::from_raw(wrapper.data);
+                    },
                 },
-            },
-            data,
-        });
-        Box::into_raw(wrapper) as *mut std::ffi::c_void
+                data: boxed,
+            });
+            Box::into_raw(wrapper) as *mut std::ffi::c_void
+        } else {
+            let wrapper = Box::new(ErasedInlineWrapper {
+                header: ErasedHeader {
+                    type_id: std::any::TypeId::of::<T>(),
+                    drop_fn: |ptr| unsafe {
+                        let _ = Box::from_raw(ptr as *mut ErasedInlineWrapper<T>);
+                    },
+                },
+                data,
+            });
+            Box::into_raw(wrapper) as *mut std::ffi::c_void
+        }
     }
 
     /// Returns the exact number of bytes needed to store the wrapper in the GC heap.
     #[inline]
-    pub(crate) const fn wrapper_size<T: 'static>() -> usize {
-        std::mem::size_of::<ErasedWrapper<T>>()
+    pub const fn wrapper_size<T: 'static>() -> usize {
+        if const { Self::is_boxed::<T>() } {
+            std::mem::size_of::<ErasedBoxedWrapper<T>>()
+        } else {
+            std::mem::size_of::<ErasedInlineWrapper<T>>()
+        }
     }
 
     /// Initializes uninitialized memory allocated by the Luau GC.
     /// 
     /// Note: Luau GC blocks are deallocated by GC itself so we use std::ptr::drop_in_place instead and avoid manual boxing
     #[inline]
-    pub(crate) unsafe fn place_into_gc_memory<T: 'static>(ptr: *mut std::ffi::c_void, data: T) {
-        std::ptr::write(ptr as *mut ErasedWrapper<T>, ErasedWrapper {
-            header: ErasedHeader {
-                type_id: std::any::TypeId::of::<T>(),
-                drop_fn: |p| unsafe {
-                    // SAFETY: Luau GC will handle freeing the actual memory block, we just need to drop_in_place
-                    std::ptr::drop_in_place(p as *mut ErasedWrapper<T>);
+    pub unsafe fn place_into_gc_memory<T: 'static>(ptr: *mut std::ffi::c_void, data: T) {
+        if const { Self::is_boxed::<T>() } {
+            let boxed = Box::into_raw(Box::new(data));
+            std::ptr::write(
+                ptr as *mut ErasedBoxedWrapper<T>,
+                ErasedBoxedWrapper {
+                    header: ErasedHeader {
+                        type_id: std::any::TypeId::of::<T>(),
+                        drop_fn: |p| unsafe {
+                            let wrapper = &mut *(p as *mut ErasedBoxedWrapper<T>);
+                            let _ = Box::from_raw(wrapper.data);
+                        },
+                    },
+                    data: boxed,
                 },
-            },
-            data,
-        });
+            );
+        } else {
+            std::ptr::write(
+                ptr as *mut ErasedInlineWrapper<T>,
+                ErasedInlineWrapper {
+                    header: ErasedHeader {
+                        type_id: std::any::TypeId::of::<T>(),
+                        drop_fn: |p| unsafe {
+                            let wrapper = &mut *(p as *mut ErasedInlineWrapper<T>);
+                            std::ptr::drop_in_place(&mut wrapper.data);
+                        },
+                    },
+                    data,
+                },
+            );
+        }
     }
 
     #[inline]
-    pub(crate) unsafe fn type_id(ptr: *const std::ffi::c_void) -> Option<TypeId> {
+    pub unsafe fn type_id(ptr: *const std::ffi::c_void) -> Option<TypeId> {
         if ptr.is_null() {
             return None;
         }
+        // SAFETY: The first field of a #[repr(C)] struct has an offset of 0.
         let header = &*(ptr as *const ErasedHeader);
         Some(header.type_id)
     }
 
     #[inline]
     /// # Safety
-    /// - `ptr` must be either null or point to a valid `ErasedHeader`-prefixed
+    /// - `ptr` must be either null or point to a valid (aligned) `ErasedHeader`-prefixed
     ///   allocation for reads.
     /// - The caller asserts the pointee is valid for the entire lifetime `'a`
     ///   and/or places the &'a T returned into an appropriate structure like TypedRef or UnbackedTypeRef
-    pub(crate) unsafe fn downcast_ref<'a, T: 'static>(ptr: *const std::ffi::c_void) -> Option<&'a T> {
+    pub unsafe fn downcast_ref<'a, T: 'static>(ptr: *const std::ffi::c_void) -> Option<&'a T> {
         if ptr.is_null() {
             return None;
         }
         let header = &*(ptr as *const ErasedHeader);
         if header.type_id == std::any::TypeId::of::<T>() {
-            let wrapper = &*(ptr as *const ErasedWrapper<T>);
-            Some(&wrapper.data)
+            if const { Self::is_boxed::<T>() } {
+                let wrapper = &*(ptr as *const ErasedBoxedWrapper<T>);
+                Some(&*wrapper.data)
+            } else {
+                let wrapper = &*(ptr as *const ErasedInlineWrapper<T>);
+                Some(&wrapper.data)
+            }
         } else {
             None
         }
     }
 
     #[inline]
-    pub(crate) unsafe fn drop(ptr: *mut std::ffi::c_void) {
+    pub unsafe fn drop(ptr: *mut std::ffi::c_void) {
         if !ptr.is_null() {
             let drop_fn = (*(ptr as *const ErasedHeader)).drop_fn;
             drop_fn(ptr);

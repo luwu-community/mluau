@@ -152,3 +152,7 @@ pub(crate) mod private {
     impl Sealed for Table {}
     impl Sealed for AnyUserData {}
 }
+
+pub mod interop {
+    pub use crate::types::{ErasedBoxedWrapper, ErasedHeader, ErasedInlineWrapper};
+}
