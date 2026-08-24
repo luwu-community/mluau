@@ -124,7 +124,6 @@ impl ExtraData {
             }
             (*extra).running_gc = prev_gc;
         }
-
         ffi::lua_registeruserdatadirectfieldget(state, TAG, S::C_STR.as_ptr(), userdata2_directfieldget::<TAG, S>);
     }
 

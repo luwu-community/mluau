@@ -297,10 +297,16 @@ pub trait DirectUserdataGetField {
 /// Defines a new direct_userdata_get_field
 #[macro_export]
 macro_rules! direct_userdata_get_field {
-    ($vis:vis $struct_name:ident, $name:expr) => {
+    ($vis:vis $struct_name:ident, $name:literal) => {
+        #[allow(non_camel_case_types)]
         $vis struct $struct_name;
         impl $crate::DirectUserdataGetField for $struct_name {
-            const C_STR: &'static ::std::ffi::CStr = ::std::ffi::CStr::from_bytes_with_nul(concat!($name, "\0").as_bytes()).unwrap();
+            const C_STR: &'static ::std::ffi::CStr = match ::std::ffi::CStr::from_bytes_with_nul(
+                concat!($name, "\0").as_bytes()
+            ) {
+                Ok(s) => s,
+                Err(_) => panic!("direct_userdata_get_field: field name must not contain a NUL byte"),
+            };
             const STR: &'static str = $name;
         }
     };

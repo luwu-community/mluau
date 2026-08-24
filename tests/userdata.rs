@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 
 use mluau::{
-    AnyUserData, Error, Function, Lua, LuaUserDataExt, LuaUserDataMutExt, MetaMethod, Result, String, TypedUserData as UserDataRef, UserData, UserDataMethods, UserDataMethodsMut, UserDataMut, UserDataMutBorrowExt, Value, Variadic
+    AnyUserData, Error, Function, Lua, LuaUserDataExt, LuaUserDataMutExt, MetaMethod, Result, String, TypedUserData as UserDataRef, UserData, UserDataMethods, UserDataMethodsMut, UserDataMut, UserDataMutBorrowExt, Value, Variadic, direct_userdata_get_field
 };
 
 #[test]
@@ -29,9 +29,36 @@ fn test_userdata() -> Result<()> {
             methods.add_method("get", |_, data, ()| Ok(data.0 + 1));
         }
     }
+
+    // Direct field access for Ud of dget
+    lua.set_userdata_direct_field_get_cb::<55, _>(|field, ud| {
+        let ud = match ud.borrow::<Ud>() {
+            Some(u) => u,
+            None => return mluau::UserDataDirectFieldGet::Nil
+        };
+
+        match field {
+            "dget" => mluau::UserDataDirectFieldGet::Number(123.0),
+            "uget" => mluau::UserDataDirectFieldGet::Integer(ud.0 as i64),
+            _ => mluau::UserDataDirectFieldGet::Nil
+        }
+    });
+    direct_userdata_get_field!(dget, "dget");
+    direct_userdata_get_field!(uget, "uget");
+    lua.register_userdata_direct_field_get::<55, dget>();
+    lua.register_userdata_direct_field_get::<55, uget>();
+
     let my_ud = lua.create_userdata(Ud(128))?;
     assert_eq!(my_ud.borrow_with_tag::<Ud, 55>().unwrap().0, 128);
-    assert_eq!(my_ud.get::<Function>("get")?.call::<i32>(my_ud)?, 129);
+    assert_eq!(my_ud.get::<Function>("get")?.call::<i32>(my_ud.clone())?, 129);
+
+    lua.globals().set("my_ud", my_ud)?;
+    lua.load("
+local ud = my_ud
+assert(ud.dget == 123, 'dget must be 123')
+assert(ud.uget == 128, 'uget must be 128')
+").call::<()>(())?;
+
     Ok(())
 }
 
