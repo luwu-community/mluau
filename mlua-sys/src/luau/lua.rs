@@ -119,6 +119,15 @@ pub type lua_StringFree =
 pub type lua_Alloc =
     unsafe extern "C" fn(ud: *mut c_void, ptr: *mut c_void, osize: usize, nsize: usize) -> *mut c_void;
 
+pub type lua_UserdataDirectAccess =
+    unsafe extern "C-unwind" fn(L: *mut lua_State, data: *mut c_void, atom: c_int, cachedslot: *mut u16, utag: c_int);
+pub type lua_UserdataDirectNamecall =
+    unsafe extern "C-unwind" fn(L: *mut lua_State, data: *mut c_void, atom: c_int, cachedslot: *mut u16, utag: c_int) -> c_int;
+
+/// Type for direct field getter handler (no unwinding).
+pub type lua_UserdataDirectFieldGet =
+    unsafe extern "C" fn(L: *mut lua_State, ud: *mut c_void, result: *mut c_void);
+
 /// Returns Luau release version (eg. `0.xxx`).
 pub const fn luau_version() -> Option<&'static str> {
     option_env!("LUAU_VERSION")
@@ -361,6 +370,36 @@ unsafe extern "C-unwind" {
     pub fn lua_getuserdatametatable(L: *mut lua_State, tag: c_int);
     pub fn lua_setlightuserdataname(L: *mut lua_State, tag: c_int, name: *const c_char);
     pub fn lua_getlightuserdataname(L: *mut lua_State, tag: c_int) -> *const c_char;
+    pub fn lua_getuserdataname(L: *mut lua_State, tag: c_int) -> *const c_char;
+    pub fn lua_registeruserdatadirectaccess(
+        L: *mut lua_State,
+        tag: c_int,
+        get: Option<lua_UserdataDirectAccess>,
+        set: Option<lua_UserdataDirectAccess>,
+        namecall: Option<lua_UserdataDirectNamecall>,
+    ) -> c_int;
+    pub fn lua_registeruserdatadirectfieldget(
+        L: *mut lua_State,
+        tag: c_int,
+        field: *const c_char,
+        fn_: lua_UserdataDirectFieldGet,
+    );
+
+    pub fn lua_userdatadirectfield_setnumber(result: *mut c_void, n: lua_Number);
+    #[cfg(not(feature = "luau-vector4"))]
+    pub fn lua_userdatadirectfield_setvector(result: *mut c_void, x: c_float, y: c_float, z: c_float);
+    #[cfg(feature = "luau-vector4")]
+    pub fn lua_userdatadirectfield_setvector(
+        result: *mut c_void,
+        x: c_float,
+        y: c_float,
+        z: c_float,
+        w: c_float,
+    );
+    pub fn lua_userdatadirectfield_setboolean(result: *mut c_void, b: c_int);
+    pub fn lua_userdatadirectfield_setinteger64(result: *mut c_void, n: i64);
+    pub fn lua_userdatadirectfield_setnil(result: *mut c_void);
+
     pub fn lua_clonefunction(L: *mut lua_State, idx: c_int);
     pub fn lua_cleartable(L: *mut lua_State, idx: c_int);
     pub fn lua_getallocf(L: *mut lua_State, ud: *mut *mut c_void) -> lua_Alloc;

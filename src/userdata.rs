@@ -1,6 +1,6 @@
-use std::{ffi::{c_int, c_void}, ptr::NonNull};
+use std::{any::TypeId, ffi::{c_int, c_void}, marker::PhantomData, ptr::NonNull};
 
-use crate::{FromLua, FromLuaMulti, Function, IntoLua, IntoLuaMulti, Lua, Result, Table, USERDATA2_TAG, Value, WeakLua, state::LuaGuard, types::{TypedRef, UnbackedTypedRef, ValueRef}, util::{StackGuard, assert_stack, check_stack, short_type_name}};
+use crate::{FromLua, FromLuaMulti, Function, Integer, IntoLua, IntoLuaMulti, Lua, Number, Result, Table, USERDATA2_TAG, Value, WeakLua, state::LuaGuard, types::{TypedRef, UnbackedTypedRef, ValueRef}, util::{StackGuard, assert_stack, check_stack, short_type_name}};
 
 pub(crate) const fn assert_ud_tag<const TAG: c_int>() {
     assert!(TAG > 0 && TAG < ffi::LUA_UTAG_LIMIT);
@@ -91,6 +91,30 @@ impl AnyUserData {
     pub fn borrow_with_tag<T: 'static, const TAG: c_int>(&self) -> Option<UnbackedTypedRef<'_, T>> {
         let (ptr, lua) = self.borrow_to_ptr::<T, TAG>();
         ptr.map(|p| UnbackedTypedRef::new(lua.0, p, &self.0))
+    }
+
+    /// `type_id_with_tag` but with default tag
+    #[inline(always)]
+    pub fn type_id(&self) -> Option<TypeId> {
+        self.type_id_with_tag::<USERDATA2_TAG>()
+    }
+
+    /// Same as `into` but returns a unbacked type ref. In most cases, into/into_with_tag is preferable
+    #[inline(always)]
+    pub fn type_id_with_tag<const TAG: c_int>(&self) -> Option<TypeId> {
+        const { assert_ud_tag::<TAG>() }
+
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+
+            // Push the userdata onto the stack
+            lua.push_ref_at(&self.0, state);
+
+            let res = ffi::lua_touserdatatagged(state, -1, TAG);
+            crate::types::ErasedHeader::type_id(res)
+        }
     }
 
     #[inline]
@@ -227,4 +251,77 @@ impl<T: 'static, const TAG: c_int> crate::FromLua for TypedRef<T, AnyUserData, T
 
         Err(err())
     }   
+}
+
+/// A untyped userdata pointer from a special Luau callback such as
+/// direct field access
+pub struct UntypedUserDataPtr<'a> {
+    data: *mut c_void,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl<'a> UntypedUserDataPtr<'a> {
+    /// Returns a new UntypedUserDataPtr
+    #[inline(always)]
+    pub(crate) fn new(data: *mut c_void) -> Self {
+        Self { data, _marker: PhantomData }
+    }
+
+    /// Returns if the underlying ptr is null or not
+    #[inline(always)]
+    pub fn is_null(&self) -> bool {
+        self.data.is_null()
+    }
+
+    /// Turns the userdata immutably into a &'a T handle if it is of type `T`
+    #[inline(always)]
+    pub fn borrow<T: 'static>(&self) -> Option<&'a T> {
+        unsafe { crate::types::ErasedHeader::downcast_ref(self.data) }
+    }
+
+    /// Returns the underlying TypeId of the underlying userdata data ptr
+    #[inline(always)]
+    pub fn type_id(&self) -> Option<TypeId> {
+        unsafe { crate::types::ErasedHeader::type_id(self.data) }
+    }
+}
+
+/// The result from a userdata direct field get callback
+/// 
+/// Note that not all types from LuaValue are supported here
+pub enum UserDataDirectFieldGet {
+    /// The Lua value `nil`.
+    Nil,
+    /// The Lua value `true` or `false`.
+    Boolean(bool),
+    /// A floating point number.
+    Number(Number),
+    /// An integer number.
+    ///
+    /// Any Lua number convertible to a `Integer` will be represented as this variant.
+    Integer(Integer),
+    /// A luau (64-bit) `integer` (not to be confused with number)
+    ///
+    /// Note that in `luau`, an 64-bit `integer` is a distinct (and completely unrelated type)
+    /// to a number (``Value::Number`` and ``Value::Integer``)
+    Int64(i64),
+    /// A Luau vector.
+    Vector(crate::Vector),
+}
+
+impl UserDataDirectFieldGet {
+    /* Places the result of the userdata direct field getter into the result TValue ptr */
+    pub(crate) unsafe fn finalize(self, result: *mut c_void) {
+        match self {
+            UserDataDirectFieldGet::Nil => ffi::lua_userdatadirectfield_setnil(result),
+            UserDataDirectFieldGet::Boolean(b) => ffi::lua_userdatadirectfield_setboolean(result, b as c_int),
+            UserDataDirectFieldGet::Number(n) => ffi::lua_userdatadirectfield_setnumber(result, n),
+            UserDataDirectFieldGet::Integer(i) => ffi::lua_userdatadirectfield_setnumber(result, i as Number),
+            #[cfg(not(feature = "luau-vector4"))]
+            UserDataDirectFieldGet::Vector(v) => ffi::lua_userdatadirectfield_setvector(result, v.x(), v.y(), v.z()),
+            #[cfg(feature = "luau-vector4")]
+            UserDataDirectFieldGet::Vector(v) => ffi::lua_userdatadirectfield_setvector(result, v.x(), v.y(), v.z(), v.w()),
+            UserDataDirectFieldGet::Int64(i) => ffi::lua_userdatadirectfield_setinteger64(result, i),
+        }
+    }
 }

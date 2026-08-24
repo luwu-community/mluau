@@ -23,7 +23,8 @@ pub static ENABLED_FFLAGS: &[&str] = &[
     "LuauAutoStack", // lets mluau avoid calls to lua_checkstack (avoids ffi calls)
     "LuauFatCClosure",
     "LuauManagedReferences2",
-    "LuauPcallMulti"
+    "LuauPcallMulti",
+    "LuauDirectFieldGet"
 ];
 
 pub static RESTRICTED_FFLAGS: &[&str] = &[
@@ -41,7 +42,8 @@ pub static RESTRICTED_FFLAGS: &[&str] = &[
     "LuauAutoStack",
     "LuauFatCClosure",
     "LuauManagedReferences2",
-    "LuauPcallMulti"
+    "LuauPcallMulti",
+    "LuauDirectFieldGet"
 ];
 
 // Since Luau has some missing standard functions, we re-implement them here

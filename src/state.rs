@@ -1,4 +1,4 @@
-use crate::{CallbackFinalizeAction, IntoCallbackResult};
+use crate::{CallbackFinalizeAction, DirectUserdataGetField, IntoCallbackResult, UntypedUserDataPtr};
 use crate::buffer::{ExternalBuffer, ExternalBufferMut};
 use crate::chunk::{AsChunk, Chunk};
 use crate::debug::Debug;
@@ -13,7 +13,7 @@ use crate::stdlib::StdLib;
 use crate::string::String;
 use crate::table::Table;
 use crate::thread::Thread;
-use crate::userdata::{AnyUserData, assert_ud_tag};
+use crate::userdata::{AnyUserData, UserDataDirectFieldGet, assert_ud_tag};
 use std::cell::{BorrowError, BorrowMutError};
 use std::ffi::CStr;
 
@@ -1237,10 +1237,34 @@ impl Lua {
         f(atom_slice)
     }
 
-    /// Create a Lua userdata "proxy" object from a custom userdata type.
-    ///
-    /// Proxy object is an empty userdata object that has `T` metatable attached.
-    /// The main purpose of this object is to provide access to static fields and functions
+    /// Sets a userdata direct field get callback for a tag. Note that you must also then call register_userdata_direct_field_get
+    /// for every field you want direct fielded for said tag
+    /// 
+    /// Note: The resulting callback should return the same thing as `__index` would for said field
+    /// and may not panic
+    pub fn set_userdata_direct_field_get_cb<const TAG: c_int, F>(&self, f: F) 
+    where 
+        F: for<'a> Fn(&'static str, UntypedUserDataPtr<'a>) -> UserDataDirectFieldGet + 'static
+    {
+        const { assert_ud_tag::<TAG>(); }
+
+        let lua = self.lock();
+        unsafe {
+            (*lua.extra()).registered_directfieldgetters[TAG as usize] = Some(Box::new(f));
+        }
+    }
+
+    /// Registers field `F` for a tag to take part in direct field get optimization
+    pub fn register_userdata_direct_field_get<const TAG: c_int, F: DirectUserdataGetField>(&self) {
+        const { assert_ud_tag::<TAG>(); }
+
+        let lua = self.lock();
+        let state = lua.state();
+        unsafe {
+            ExtraData::set_userdata_directfieldget::<TAG, F>(state);
+        }
+    }
+
     /// Gets the metatable of a Lua built-in (primitive) type.
     ///
     /// The metatable is shared by all values of the given type.
