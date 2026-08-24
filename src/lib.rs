@@ -108,17 +108,18 @@ pub use crate::traits::{
 };
 pub use crate::types::{
     AppDataRef, AppDataRefMut, Either, Integer, LightUserData, TypedRef, UnbackedTypedRef, Number, VmState, CallbackResult, CallbackFinalizeAction, Yield, CustomError, Ok,
-    ErrorWithTraceback
+    ErrorWithTraceback, DirectUserdataGetField
 };
 pub use crate::state::extra::USERDATA2_TAG; // embedders should not use this tag
 pub use crate::auxlib::*;
-pub use crate::userdata::{AnyUserData, TypedUserData, TypedUserData as UserDataRef};
+pub use crate::userdata::{AnyUserData, TypedUserData, TypedUserData as UserDataRef, UntypedUserDataPtr, UserDataDirectFieldGet};
 pub use crate::value::{Nil, Value};
 pub use crate::memory::{DefaultAllocator, LuaAllocator};
 #[cfg(feature = "bumpalo")]
 pub use crate::memory::BumpAllocator;
 pub use crate::{
-    buffer::Buffer,
+    buffer::{Buffer, ExternalBuffer, ExternalBufferMut},
+    string::ExternalString,
     chunk::{CompileConstant, Compiler},
     function::CoverageInfo,
     luau::{HeapDump, NavigateError, Require, TextRequirer},

@@ -1,7 +1,9 @@
+use std::any::TypeId;
+use std::ffi::CStr;
 use std::os::raw::{c_int, c_void};
 use std::ptr::NonNull;
 
-use crate::{IntoLua, IntoLuaMulti, MultiValue, Value};
+use crate::{IntoLua, IntoLuaMulti, MultiValue, UntypedUserDataPtr, UserDataDirectFieldGet, Value};
 use crate::error::Result;
 use crate::state::{Lua, RawLua};
 use std::ops::Deref;
@@ -35,10 +37,12 @@ impl<'a, T: 'static> Deref for UnbackedTypedRef<'a, T> {
 }
 
 impl<'a, T: 'static> UnbackedTypedRef<'a, T> {
+    /// SAFETY: data must be backed/kept alive by vref
     pub(crate) fn new(lua: XRc<RawLua>, data: NonNull<T>, vref: &'a ValueRef) -> Self {
         Self { lua, ptr: data, _ud: vref }
     }
 
+    /// SAFETY: data must be backed/kept alive by vref
     pub(crate) fn new_opt(lua: XRc<RawLua>, data: Option<&'a T>, vref: &'a ValueRef) -> Option<Self> {
         let ptr = data.map(|x| NonNull::from(x))?;
         Some(Self::new(lua, ptr, vref))
@@ -98,10 +102,12 @@ impl<T: 'static, Backer: 'static + Clone, const TAG: c_int> Deref for TypedRef<T
 }
 
 impl<T: 'static, Backer: 'static + Clone, const TAG: c_int> TypedRef<T, Backer, TAG> {
+    /// SAFETY: data must be backed/kept alive by Backer
     pub(crate) fn new(lua: XRc<RawLua>, data: NonNull<T>, ud: Backer) -> Self {
         Self { lua, ptr: data, ud }
     }
 
+    /// SAFETY: data must be backed/kept alive by Backer
     pub(crate) fn new_opt(lua: XRc<RawLua>, data: Option<&T>, ud: Backer) -> Option<Self> {
         let ptr = data.map(|x| NonNull::from(x))?;
         Some(Self::new(lua, ptr, ud))
@@ -175,6 +181,20 @@ impl ErasedHeader {
     }
 
     #[inline]
+    pub(crate) unsafe fn type_id(ptr: *const std::ffi::c_void) -> Option<TypeId> {
+        if ptr.is_null() {
+            return None;
+        }
+        let header = &*(ptr as *const ErasedHeader);
+        Some(header.type_id)
+    }
+
+    #[inline]
+    /// # Safety
+    /// - `ptr` must be either null or point to a valid `ErasedHeader`-prefixed
+    ///   allocation for reads.
+    /// - The caller asserts the pointee is valid for the entire lifetime `'a`
+    ///   and/or places the &'a T returned into an appropriate structure like TypedRef or UnbackedTypeRef
     pub(crate) unsafe fn downcast_ref<'a, T: 'static>(ptr: *const std::ffi::c_void) -> Option<&'a T> {
         if ptr.is_null() {
             return None;
@@ -266,6 +286,26 @@ pub struct CustomError<T: IntoLua>(pub T);
 /// Helper to allow returning a custom Ok value
 pub struct Ok<T: IntoLuaMulti>(pub T);
 
+/// Trait to define direct userdata fields
+pub trait DirectUserdataGetField {
+    /// the cstr to pass to luau
+    const C_STR: &'static CStr;
+    /// the internal rust str
+    const STR: &'static str;
+}
+
+/// Defines a new direct_userdata_get_field
+#[macro_export]
+macro_rules! direct_userdata_get_field {
+    ($vis:vis $struct_name:ident, $name:expr) => {
+        $vis struct $struct_name;
+        impl $crate::DirectUserdataGetField for $struct_name {
+            const C_STR: &'static ::std::ffi::CStr = ::std::ffi::CStr::from_bytes_with_nul(concat!($name, "\0").as_bytes()).unwrap();
+            const STR: &'static str = $name;
+        }
+    };
+}
+
 pub(crate) type InterruptCallback = XRc<dyn Fn(&Lua) -> Result<VmState>>;
 
 pub(crate) type GcInterruptCallback = XRc<dyn Fn(&Lua, c_int) -> ()>;
@@ -274,6 +314,7 @@ pub(crate) type ThreadCreationCallback = XRc<dyn Fn(&Lua, crate::Thread) -> Resu
 pub(crate) type ThreadStateChangeCallback = XRc<dyn Fn(&Lua, crate::Thread, crate::ThreadStatus, crate::MultiValue) -> Result<()>>;
 
 pub(crate) type ThreadCollectionCallback = XRc<dyn Fn(crate::LightUserData)>;
+pub(crate) type UserDataDirectFieldGetCallback = Box<dyn for<'a> Fn(&'static str, UntypedUserDataPtr<'a>) -> UserDataDirectFieldGet + 'static>;
 
 pub(crate) trait LuaType {
     const TYPE_ID: c_int;

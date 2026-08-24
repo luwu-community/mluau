@@ -1,11 +1,12 @@
 use std::cell::{Cell, UnsafeCell};
 use std::mem::MaybeUninit;
-use std::os::raw::c_int;
+use std::os::raw::{c_int};
 
+use crate::{DirectUserdataGetField, UntypedUserDataPtr};
 use crate::error::Result;
 use crate::state::RawLua;
 use crate::stdlib::StdLib;
-use crate::types::{AppData, ErasedHeader};
+use crate::types::{AppData, ErasedHeader, UserDataDirectFieldGetCallback};
 use std::rc::Rc as XRc;
 
 use crate::chunk::Compiler;
@@ -65,6 +66,7 @@ pub(crate) struct ExtraData {
     pub(crate) mem_categories: Vec<std::ffi::CString>,
 
     pub(crate) registered_tags: [Cell<bool>; ffi::LUA_UTAG_LIMIT as usize],
+    pub(crate) registered_directfieldgetters: [Option<UserDataDirectFieldGetCallback>; ffi::LUA_UTAG_LIMIT as usize],
 }
 
 impl Drop for ExtraData {
@@ -97,6 +99,33 @@ impl ExtraData {
             (*extra).running_gc = prev_gc;
         }
         ffi::lua_setuserdatadtor(state, tag, Some(userdata2_dtor));
+    }
+
+    pub(crate) unsafe fn set_userdata_directfieldget<const TAG: c_int, S: DirectUserdataGetField>(state: *mut ffi::lua_State) {
+        // Set global dtor for userdata v2, the data `ud` is guaranteed to be a ErasedHeader vtable
+        //
+        // All mluau owned userdata v2 will use this dtor for cleanup
+        unsafe extern "C" fn userdata2_directfieldget<const TAG: c_int, S: DirectUserdataGetField>(
+            state: *mut ffi::lua_State,
+            ud: *mut std::os::raw::c_void,
+            result: *mut std::os::raw::c_void,
+        ) {
+            // Almost none Lua operations are allowed when direct field getter is running,
+            // so we need to set a flag to prevent calling any Lua functions
+            let extra = ExtraData::get(state);
+            let prev_gc = (*extra).running_gc;
+            (*extra).running_gc = true;
+            // Note: panicking in the direct field get for a userdata is not allowed and will call abort() bc this is a extern "C"
+            if let Some(ref func) = (*extra).registered_directfieldgetters[TAG as usize] {
+                let cb_ud = UntypedUserDataPtr::new(ud);
+                func(S::STR, cb_ud).finalize(result);
+            } else {
+                ffi::lua_userdatadirectfield_setnil(result);
+            }
+            (*extra).running_gc = prev_gc;
+        }
+
+        ffi::lua_registeruserdatadirectfieldget(state, TAG, S::C_STR.as_ptr(), userdata2_directfieldget::<TAG, S>);
     }
 
     pub(super) unsafe fn init(state: *mut ffi::lua_State, owned: bool) -> XRc<UnsafeCell<Self>> {
@@ -184,7 +213,11 @@ impl ExtraData {
                 let tags = [const { Cell::new(false) }; _];
                 tags[USERDATA2_TAG as usize].set(true); // USERDATA2_TAG is a default registered tag
                 tags
-            }
+            },
+            registered_directfieldgetters: {
+                let tags = [const { None }; _];
+                tags
+            },
         }));
 
         // Store it in the registry
