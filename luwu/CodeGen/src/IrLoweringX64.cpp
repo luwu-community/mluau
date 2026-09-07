@@ -1941,12 +1941,25 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
     case IrCmd::CLASS_ISINSTANCE:
     {
         // result = (tag == object) && (value->lclass == class); the deref is guarded by the tag check
+        // constant propagation can replace the tag with a known constant (e.g. after CHECKSELFCLASS
+        // has already established that the value is an object), in which case the guard folds away
+        CODEGEN_ASSERT(OP_A(inst).kind == IrOpKind::Inst || OP_A(inst).kind == IrOpKind::Constant);
+        bool knownTag = OP_A(inst).kind == IrOpKind::Constant;
+
         inst.regX64 = regs.allocReg(SizeX64::dword, index);
         build.xor_(inst.regX64, inst.regX64);
 
+        // a value that is statically known not to be an object is never an instance
+        if (knownTag && tagOp(OP_A(inst)) != LUA_TOBJECT)
+            break;
+
         Label done;
-        build.cmp(regOp(OP_A(inst)), LUA_TOBJECT);
-        build.jcc(ConditionX64::NotEqual, done);
+
+        if (!knownTag)
+        {
+            build.cmp(regOp(OP_A(inst)), LUA_TOBJECT);
+            build.jcc(ConditionX64::NotEqual, done);
+        }
 
         build.cmp(regOp(OP_C(inst)), qword[regOp(OP_B(inst)) + offsetof(LuauObject, lclass)]);
         build.setcc(ConditionX64::Equal, byteReg(inst.regX64));
@@ -2662,6 +2675,28 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
             build.ud2();
             build.setLabel(skip);
         }
+        break;
+    }
+    case IrCmd::OBJECT_MEMBER_ADDR:
+    {
+        // Luau Classes (rfcx/classes.md): the receiver's class is proven (see LOP_GETOBJECTMEMBER), so
+        // the member's offset is a constant and nothing about the class needs re-checking here. Only
+        // the bounds check remains, and only to keep malformed bytecode memory-safe.
+        inst.regX64 = regs.allocReg(SizeX64::qword, index);
+
+        uint32_t offset = uintOp(OP_B(inst));
+
+        // the guard target is an ordinary deopt (a VM exit, a block, or undef), so it goes through the
+        // shared guard helper rather than labelOp -- a VM exit is not a block
+        build.cmp(dword[regOp(OP_A(inst)) + offsetof(LuauObject, numberofmembers)], offset);
+        jumpOrAbortOnUndef(ConditionX64::BelowEqual, OP_C(inst), index, next);
+
+        // address = self->members + offset * sizeof(TValue)
+        build.mov(inst.regX64, qword[regOp(OP_A(inst)) + offsetof(LuauObject, members)]);
+
+        if (offset != 0)
+            build.add(inst.regX64, offset * sizeof(TValue));
+
         break;
     }
     case IrCmd::TRY_CLASS_MEMBER_ADDR:

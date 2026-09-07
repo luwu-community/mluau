@@ -53,8 +53,9 @@
 // Version 10: Adds LBC_CONSTANT_CLASS_SHAPE and NEWCLASSMEMBER for use with Luau Classes. Experimental.
 // Version 11: Adds CALLFB, CMPPROTO and feedback vector description. Experimental.
 // Version 12: Adds cost function serialized for proto and prepend each proto with size in bytes. Experimental.
-// Version 13: Adds CHECKSELFCLASS for Luau Classes 'self' validation fast path. Experimental.
-// Version 14: Adds JUMPXISA for fused class.isinstance test-and-branch. Experimental.
+// Version 13: Adds CHECKSELFCLASS, SELFCLASSERROR, JUMPXISA, NEWOBJECT, GETOBJECTMEMBER and
+//   SETOBJECTMEMBER for Luau Classes, and constant field defaults and primary constructors
+//   (LBC_CLASSMEMBER_PRIMARYINIT) in LBC_CONSTANT_CLASS_SHAPE. Experimental.
 
 // # Bytecode type information history
 // Version 1: (from bytecode version 4) Type information for function signature. Currently supported.
@@ -458,7 +459,7 @@ enum LuauOpcode
     // through when it does; used for Luau Classes 'self' validation in place of a class.isinstance() call
     // A: self register
     // B: class register
-    // C: jump offset to skip past the fallback error-raising code when the check passes
+    // C: jump offset to skip past the SELFCLASSERROR that follows when the check passes
     LOP_CHECKSELFCLASS,
 
     // JUMPXISA: fused class.isinstance(value, class) test-and-branch (see rfcx/classes.md), emitted
@@ -469,6 +470,55 @@ enum LuauOpcode
     // AUX: class register in the low 8 bits; bit 31 is the polarity flag -- when set, jump if value
     //      IS an instance of the class; when clear, jump if it is NOT (see LUAU_INSN_AUX_NOT)
     LOP_JUMPXISA,
+
+    // SELFCLASSERROR: raise the 'self' mismatch error for Luau Classes; emitted as the cold path a
+    // failing CHECKSELFCLASS falls into, and never reached otherwise. Raising here rather than
+    // through an inline `error(...)` call keeps the message out of the constant table and lets it
+    // name the receiver's *actual* class or type, which is only known at runtime.
+    // A: self register (the value that failed the check)
+    // B: class register (the class the method belongs to)
+    // C: 1 if the call site used `:` syntax, 0 for `.` syntax
+    // AUX: string constant index of the method's name
+    LOP_SELFCLASSERROR,
+
+    // NEWOBJECT: allocate an instance of a class, with every field set to its constant default.
+    // Emitted for a call whose callee is a statically resolved class (see isKnownClassExpr), in place
+    // of the `__call` metamethod dispatch and C constructor frame a generic CALL would go through.
+    // A: destination register, which holds the instance afterwards
+    // B: register holding the class
+    // C: how the instance is initialized, and what AUX counts:
+    //   0 - default constructor; AUX is the argument count, and the table of field values, if AUX is
+    //       1, is in A + 1. The instance is complete afterwards.
+    //   1 - user-defined `__init`; AUX is its argument count. Only the call frame is prepared --
+    //       A + 1 gets `__init`, A + 2 gets the instance again as `self`, and the arguments are
+    //       already in A + 3 onwards -- and CALL A+1, AUX+2, 1 always follows, after which A holds
+    //       the instance.
+    //   2 - default constructor with the fields supplied positionally: AUX is the class's instance
+    //       member count, and A + 1 onwards hold one value per member in declaration order, with nil
+    //       meaning "keep this member's default". Emitted for `ClassName { field = value }` when every
+    //       key names a declared field, so no argument table is built at all.
+    LOP_NEWOBJECT,
+
+    // GETOBJECTMEMBER: read an instance member at a known offset, for a receiver whose class the
+    // compiler has *proven* -- today that is a method's own `self`, which the prologue's
+    // CHECKSELFCLASS has already established is an instance of the method's class, and which the
+    // method never reassigns. Because the class is known, the member's offset is known too (it is the
+    // member's index in declaration order, fixed when the class statement runs), so none of
+    // GETTABLEKS's per-access work is needed: no slot cache, no bounds check against the class, no
+    // `offsettomember[slot]` name compare, and no private-access check (a method of the class is
+    // always authorized). The checks that remain exist only to keep malformed bytecode memory-safe.
+    // A: target register
+    // B: register holding the object
+    // AUX: member offset
+    LOP_GETOBJECTMEMBER,
+
+    // SETOBJECTMEMBER: the write counterpart of GETOBJECTMEMBER, under the same proof. Only ever
+    // emitted for a non-`const` member: a `const` member's write has to keep going through
+    // SETTABLEKS, where luaR_checkconstassign decides whether this closure is allowed to write it.
+    // A: register holding the value to store
+    // B: register holding the object
+    // AUX: member offset
+    LOP_SETOBJECTMEMBER,
 
     // Enum entry for number of opcodes, not a valid opcode by itself!
     LOP__COUNT
@@ -518,7 +568,7 @@ enum LuauBytecodeTag
 {
     // Bytecode version; runtime supports [MIN, MAX], compiler emits TARGET by default but may emit a higher version when flags are enabled
     LBC_VERSION_MIN = 3,
-    LBC_VERSION_MAX = 14,
+    LBC_VERSION_MAX = 13,
     LBC_VERSION_TARGET = 9,
     // Type encoding version
     LBC_TYPE_VERSION_MIN = 1,
@@ -549,6 +599,16 @@ enum LuauBytecodeTag
 #define LBC_CLASSMEMBER_CONST (1 << 1)
 // Set on properties that have a default value expression (see AstClassProperty::defaultValue).
 #define LBC_CLASSMEMBER_HASDEFAULT (1 << 2)
+// Set on an instance member whose default value is a compile-time constant: the value is serialized
+// inline in LBC_CONSTANT_CLASS_SHAPE (a constant table index follows the flags byte) and copied
+// straight into each new instance, instead of being produced by the synthesized `__defaults` closure.
+// Implies LBC_CLASSMEMBER_HASDEFAULT.
+#define LBC_CLASSMEMBER_CONSTDEFAULT (1 << 3)
+// Set on the `__init` a primary constructor implies (`class Cat(name: string)`). Such an `__init`
+// only assigns fields from its parameters, which is what lets a construction site initialize the
+// instance positionally (LOP_NEWOBJECT's FIELDS form) instead of calling it: the VM checks this bit
+// before honoring that form on a class that has a custom `__init`.
+#define LBC_CLASSMEMBER_PRIMARYINIT (1 << 4)
 
 // Type table tags
 enum LuauBytecodeType
