@@ -114,7 +114,7 @@ enum class IrCmd : uint8_t
     // to (`Closure::l.p->ownerclass`), or NULL when it belongs to none. Backs the
     // LBC_SELFCLASS_OWNER form of CHECKSELFCLASS, where a method validates `self` against its own
     // class without that class occupying a register or forcing an upvalue capture. Loop-invariant
-    // within a frame, so it is worth hoisting/CSE-ing.
+    // within a frame.
     // No operands.
     LOAD_OWNER_CLASS,
 
@@ -731,8 +731,8 @@ enum class IrCmd : uint8_t
     TRY_OBJECT_MEMBER_ADDR,
 
     // Address of an instance member at a *known* offset on a Luwu Classes object, for a receiver whose
-    // class the compiler has proven (a method's own `self`, or a local in a `class.isinstance` branch; see
-    // rfcs/classes.md and LOP_GETOBJECTMEMBER).
+    // class the compiler has proven (a method's or inlined method's `self`, or a local in a `class.isinstance`
+    // branch; see LOP_GETOBJECTMEMBER).
     // Nothing is re-checked here -- no slot cache, no name compare, no private/const authorization, and
     // no bounds check either: the offset is inside the instance for any bytecode the compiler produced,
     // and invalid bytecode is the embedder's contract to keep. Not a guard, so it never branches.
@@ -970,10 +970,11 @@ enum class IrCmd : uint8_t
     // C: block
     FALLBACK_FORGPREP,
 
-    // Luwu Classes (rfcs/classes.md): construct an instance of a statically resolved class.
-    // Construction has no machine code lowering; it runs through the same C fallback the interpreter
-    // uses, which keeps native execution going afterwards instead of abandoning the rest of the
-    // function to the interpreter (and, unlike a bare exit, keeps the register liveness honest).
+    // Luwu Classes (rfcs/classes.md): construct an instance of a statically resolved class. Forms the
+    // native lowering doesn't handle, and its guard misses, run through the same C implementation the
+    // interpreter uses, which keeps native execution going afterwards instead of abandoning the rest
+    // of the function to the interpreter (and, unlike a bare exit, keeps the register liveness
+    // honest).
     // A: unsigned int (bytecode instruction index)
     // B: Rn (instance destination, also the base of the constructor's register window)
     // C: Rn (class)

@@ -783,8 +783,8 @@ uint8_t getRegTag(std::array<uint8_t, 256>& regTags, BytecodeTypeInfo& bcTypeInf
 }
 
 // Luwu Classes (rfcs/classes.md): for each bytecode block, the register that a `class.isinstance(x, C)`
-// branch into it proves holds an object, or -1. Recognizes the fused same-module form
-// (`JUMPXISA x ...`) and the builtin form an imported class compiles to (`FASTCALL2 isinstance x C`,
+// branch into it proves holds an object, or -1. Recognizes the fused form
+// (`JUMPXISA x ...`, with or without CHECKCLASS) and the unfused builtin form (`FASTCALL2 isinstance x C`,
 // `CALL`, then `JUMPIF`/`JUMPIFNOT` on its result). Only a block whose single predecessor is that branch
 // qualifies. The result is a type hint like any other: codegen guards the tag, so a wrong hint costs a VM
 // exit, never correctness -- it just lets field accesses and method calls on `x` take the object path
@@ -834,8 +834,9 @@ static std::vector<int> findIsinstanceProvenObjectRegs(const IrFunction& functio
             int callReg = LUAU_INSN_A(call);
             int nparams = LUAU_INSN_B(call) - 1;
 
-            bool shapeMatches = LUAU_INSN_OP(call) == LOP_CALL && LUAU_INSN_C(call) == 2 && (jumpop == LOP_JUMPIF || jumpop == LOP_JUMPIFNOT) &&
-                                LUAU_INSN_A(jump) == callReg;
+            bool callMatches = LUAU_INSN_OP(call) == LOP_CALL && LUAU_INSN_C(call) == 2;
+            bool jumpMatches = (jumpop == LOP_JUMPIF || jumpop == LOP_JUMPIFNOT) && int(LUAU_INSN_A(jump)) == callReg;
+            bool shapeMatches = callMatches && jumpMatches;
             // the argument register must survive the call's frame setup and its result
             bool argSurvives = nparams >= 0 && (argReg < callReg || argReg > callReg + nparams);
 

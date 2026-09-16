@@ -53,12 +53,12 @@ IrLoweringX64::IrLoweringX64(LogBuilder* logger, AssemblyBuilderX64& build, Modu
 // Luwu Classes (rfcs/classes.md): authorize private/const access to the member at `slotReg` on
 // class `classReg` (an object's lclass, or a class object directly) without bailing to the
 // interpreter. A member with no access bits is unrestricted. A private/const member takes the fast
-// path only when the executing closure is one of the owning class's own methods -- i.e.
-// `classReg == currentClosure->l.p->ownerclass`, which is exactly luaR_closureownsprivateaccess
-// (method closures are unique per class). For writes, a const member additionally requires the
-// closure to be the class's __init (luaR_closureisinit). Everything else jumps to `mismatch`, where
-// the interpreter fallback raises the correct error. `slotReg` holds the raw member offset (before
-// it's scaled into a byte address) and must stay live across this call.
+// path only when `classReg == currentClosure->l.p->ownerclass`, which is exactly
+// luaR_closureownsprivateaccess (the class's methods and closures nested in them). For writes, a
+// const member additionally requires the closure to be the class's __init (luaR_closureisinit).
+// Everything else jumps to `mismatch`, where the interpreter fallback raises the correct error.
+// `slotReg` holds the raw member offset (before it's scaled into a byte address) and must stay live
+// across this call.
 static void emitClassMemberAuthX64(
     AssemblyBuilderX64& build,
     IrRegAllocX64& regs,
@@ -84,7 +84,7 @@ static void emitClassMemberAuthX64(
     build.test(byteReg(flag.reg), restrictBits);
     build.jcc(ConditionX64::Zero, authorized); // unrestricted member: no check needed
 
-    // owner = currentClosure->l.p->ownerclass (NULL for non-method closures -> never matches)
+    // owner = currentClosure->l.p->ownerclass (NULL outside any class -> never matches)
     build.mov(owner.reg, sClosure);
     build.mov(owner.reg, qword[owner.reg + offsetof(Closure, l.p)]);
     build.mov(owner.reg, qword[owner.reg + offsetof(Proto, ownerclass)]);
@@ -2658,7 +2658,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         ScopedRegX64 slot{regs, SizeX64::qword};
         ScopedRegX64 key{regs, SizeX64::qword};
 
-        // slot = live cached member slot from the current bytecode instruction (self-patched by the interpreter)
+        // slot = live cached member slot from the current bytecode instruction (patched by the interpreter or the native fallbacks)
         build.mov(slot.reg, sCode);
         build.movzx(dwordReg(slot.reg), byte[slot.reg + uintOp(OP_B(inst)) * sizeof(Instruction) + kOffsetOfInstructionC]);
 
@@ -2695,7 +2695,8 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
     }
     case IrCmd::OBJECT_MEMBER_ADDR:
     {
-        // Luwu Classes (rfcs/classes.md): the receiver's class is proven (see LOP_GETOBJECTMEMBER), so
+        // Luwu Classes (rfcs/classes.md): the receiver's class is proven (see LOP_GETOBJECTMEMBER) or it was
+        // just allocated (NEW_OBJECT), so
         // the member's offset is a constant and nothing needs re-checking here -- not the class, and
         // not the offset against numberofmembers either. A single lea, with no load and no branch.
         inst.regX64 = regs.allocReg(SizeX64::qword, index);
@@ -2772,7 +2773,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         ScopedRegX64 tmp{regs, SizeX64::qword};
         ScopedRegX64 key{regs, SizeX64::qword};
 
-        // slot = live cached member slot from the current bytecode instruction (self-patched by the interpreter)
+        // slot = live cached member slot from the current bytecode instruction (patched by the interpreter or the native fallbacks)
         build.mov(slot.reg, sCode);
         build.movzx(dwordReg(slot.reg), byte[slot.reg + uintOp(OP_B(inst)) * sizeof(Instruction) + kOffsetOfInstructionC]);
 

@@ -483,12 +483,12 @@ static void computeCfgLiveInOutRegSets(IrFunction& function)
             // This is because fallback blocks define an alternative implementation of the same operations
             // This can cause the current block to define more registers that actually were available at fallback entry
             //
-            // Luwu Classes (rfcs/classes.md): the same holds between two fallbacks of one instruction. An untyped
-            // field access or method call has an object path in a fallback block whose own guards lead to the
-            // instruction's generic fallback (see translateInstGetTableKS). Counting that edge would make the
-            // object path's successors disagree about pending varargs: `a:m(b:n())` resolves `m` after `b:n()`
-            // left its results on the stack, and the generic NAMECALL fallback redefines the register they
-            // start at.
+            // Luwu Classes (rfcs/classes.md): an edge between two fallback blocks of the same instruction is skipped
+            // too. A field access or method call on an untyped receiver puts its object path in a fallback block,
+            // and a failed check there jumps to the instruction's generic fallback (see translateInstGetTableKS).
+            // Counting that edge breaks on pending call results. In `a:m(b:n())`, the results of `b:n()` are still
+            // on the stack when `m` is resolved, and the generic NAMECALL fallback overwrites the register where
+            // they start.
             bool sameInstructionFallback = curr.kind == IrBlockKind::Fallback && succ.kind == IrBlockKind::Fallback && curr.startpc == succ.startpc;
 
             if ((curr.kind != IrBlockKind::Fallback && succ.kind == IrBlockKind::Fallback) || sameInstructionFallback)

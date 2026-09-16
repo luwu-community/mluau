@@ -3828,7 +3828,7 @@ reentry:
 
             VM_CASE(LOP_NEWOBJECT)
             {
-                // Luwu Classes (rfcs/classes.md): construct an instance of a POD class directly.
+                // Luwu Classes (rfcs/classes.md): construct an instance of a statically resolved class directly.
                 Instruction insn = *pc++;
                 uint32_t aux = *pc++;
                 StkId ra = VM_REG(LUAU_INSN_A(insn));
@@ -3953,16 +3953,14 @@ reentry:
                 // check. That is only sound under what the compiler guarantees at every emit site (see
                 // provenSelfMemberOffset in Compiler.cpp). The receiver is one of:
                 //
-                //   - the executing method's own `self` parameter, after a CHECKSELFCLASS on that exact
-                //     value in this frame, in a method that never reassigns `self`; the class is the one the
-                //     method is lexically declared in
-                //   - a local of this function inside the then-branch of `if class.isinstance(local, C)`,
-                //     compiled to JUMPXISA against a class `C` declared in this module, where the local is
-                //     never reassigned anywhere in the function; the class is `C`
+                //   - the executing method's own `self`, after its CHECKSELFCLASS prologue
+                //   - an inlined method's `self`, after the CHECKSELFCLASS emitted at the inline site
+                //   - a local inside the then-branch of `if class.isinstance(local, C)`, compiled to JUMPXISA
+                //     against a class `C` declared in this module
                 //
-                // Either way the class is known from a runtime check, never from a type annotation (which
-                // can lie), member offsets are that class's declaration order, and a private member is only
-                // accessed this way from the class's own methods.
+                // In every case the value is never reassigned and its class comes from a runtime check, never
+                // from a type annotation. A private member is only read this way through a proven `self` or
+                // from inside one of the class's methods.
                 //
                 // A member's offset is therefore a compile-time constant, and the receiver is an object
                 // of that class. Both are asserted rather than checked, the way VM_REG asserts its

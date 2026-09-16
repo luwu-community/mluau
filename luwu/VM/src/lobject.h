@@ -641,8 +641,8 @@ typedef struct LuauClass
     // instead of the default POD table-copy constructor.
     bool hascustominit;
 
-    // The offset of `__init` in `staticmembers`, only meaningful when `hascustominit` is set.
-    // Used to find `__init`'s closure for the `const`-write brand check below.
+    // The member offset of `__init` (index `staticmembers` with it minus `numberofinstancemembers`),
+    // only meaningful when `hascustominit` is set. Used by construction and the `const`-write check.
     uint32_t initoffset;
 
     // Set when this class's `__init` is the one a primary constructor implies (`class Cat(name)`),
@@ -653,29 +653,22 @@ typedef struct LuauClass
     bool hasprimaryinit;
 
     // Per-member attribute bits, indexed by the same offset as `offsettomember` (see
-    // LUAU_CLASSMEMBER_PRIVATE / LUAU_CLASSMEMBER_CONST in lclass.h). Owned by this class object;
-    // freed in luaR_freeclass.
+    // LBC_CLASSMEMBER_* in Luau/Bytecode.h). Owned by this class object; freed in luaR_freeclass.
     uint8_t* memberflags;
 
-    // True if any entry in `memberflags` has LUAU_CLASSMEMBER_PRIVATE set. Lets the interpreter
-    // skip the private-access brand check entirely for classes with no private members, so public
-    // (the common case) access from outside the class costs nothing extra.
+    // True if any entry in `memberflags` has LBC_CLASSMEMBER_PRIVATE set, or the class has a `const`
+    // member (which blocks reading `__init`, see LBC_CLASSMEMBER_INITBLOCKED). Lets the interpreter
+    // skip the private-access brand check entirely for classes without either.
     bool hasprivatemembers;
 
-    // True if any entry in `memberflags` has LUAU_CLASSMEMBER_CONST set. Same idea as
+    // True if any entry in `memberflags` has LBC_CLASSMEMBER_CONST set. Same idea as
     // `hasprivatemembers`, but for skipping the const-write check on SETTABLEKS.
     bool hasconstmembers;
 
-    // True if any instance member has a default value expression (LBC_CLASSMEMBER_HASDEFAULT).
-    // Classes with a user-defined `__init` have their defaults inlined directly into `__init`'s
-    // bytecode by the compiler, so this flag goes unused on that path -- it's meaningful together
-    // with haspoddefaultsfn below, for the POD (no custom `__init`) constructor path.
-    bool hasdefaultmembers;
-
     // True if this class has a synthesized `__defaults` static member: a niladic function,
     // compiled alongside POD classes with at least one field default, that returns every field's
-    // default value (nil where unset) in declaration order. Only ever set when hasdefaultmembers
-    // is set and there's no custom `__init` (see hascustominit).
+    // default value (nil where unset) in declaration order. Only ever set when some field has a
+    // default and there's no custom `__init` (see hascustominit).
     bool haspoddefaultsfn;
 
     // The offset of `__defaults` in `staticmembers`, only meaningful when haspoddefaultsfn is set.

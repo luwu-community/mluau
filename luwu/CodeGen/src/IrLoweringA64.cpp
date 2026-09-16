@@ -333,7 +333,7 @@ static void emitClassMemberAuthA64(
     build.tst(flagw, maskw);
     build.b(ConditionA64::Equal, authorized); // Z set: unrestricted member, no check needed
 
-    // owner = currentClosure->l.p->ownerclass (NULL for non-method closures -> never matches)
+    // owner = currentClosure->l.p->ownerclass (NULL outside any class -> never matches)
     build.ldr(owner, mem(rClosure, offsetof(Closure, l.p)));
     build.ldr(owner, mem(owner, offsetof(Proto, ownerclass)));
     build.cmp(owner, classReg);
@@ -2821,7 +2821,7 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         RegisterA64 tempw = regs.allocTemp(KindA64::w);
         RegisterA64 tempx = castReg(KindA64::x, tempw);
 
-        // slotw = live cached member slot from the current bytecode instruction (self-patched by the interpreter)
+        // slotw = live cached member slot from the current bytecode instruction (patched by the interpreter or the native fallbacks)
         if (uintOp(OP_B(inst)) <= AddressA64::kMaxOffset)
             build.ldr(tempw, mem(rCode, uintOp(OP_B(inst)) * sizeof(Instruction)));
         else
@@ -2863,7 +2863,7 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
     }
     case IrCmd::OBJECT_MEMBER_ADDR:
     {
-        // See the X64 lowering: proven class, constant offset, no check of any kind and no branch.
+        // See the X64 lowering: proven or freshly allocated object, constant offset, no check of any kind and no branch.
         inst.regA64 = regs.allocReg(KindA64::x, index);
 
         uint32_t offset = uintOp(OP_B(inst));
@@ -2947,7 +2947,7 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         RegisterA64 tempw = regs.allocTemp(KindA64::w);
         RegisterA64 tempx = castReg(KindA64::x, tempw);
 
-        // slotw = live cached member slot from the current bytecode instruction (self-patched by the interpreter)
+        // slotw = live cached member slot from the current bytecode instruction (patched by the interpreter or the native fallbacks)
         if (uintOp(OP_B(inst)) <= AddressA64::kMaxOffset)
             build.ldr(tempw, mem(rCode, uintOp(OP_B(inst)) * sizeof(Instruction)));
         else

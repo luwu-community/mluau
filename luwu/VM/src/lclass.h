@@ -40,10 +40,6 @@ LUAI_FUNC LuauClass* luaR_newclass(
 );
 
 /**
- * Returns true if `cl` is `classdef`'s own `__init` closure specifically (stricter than
- * luaR_closureownsprivateaccess, which accepts any method of the class).
- */
-/**
  * Hands `classdef` ownership of `defaults`, an array of `numberofinstancemembers` TValues holding
  * each instance member's constant default (nil where a member has none). Set at load time from
  * LBC_CONSTANT_CLASS_SHAPE; see LuauClass::memberdefaults.
@@ -73,13 +69,16 @@ LUAI_FUNC void luaR_applyobjectfields(lua_State* L, LuauClass* classdef, LuauObj
  */
 LUAI_FUNC void luaR_applyobjectfieldsslow(lua_State* L, LuauClass* classdef, LuauObject* object, const TValue* arg);
 
+/**
+ * Returns true if `cl` is `classdef`'s own `__init` closure specifically (stricter than
+ * luaR_closureownsprivateaccess, which accepts any method of the class).
+ */
 LUAI_FUNC bool luaR_closureisinit(const LuauClass* classdef, const Closure* cl);
 
 /**
  * Returns true if `cl` is one of `classdef`'s own method closures (including `__init`), or a
  * closure lexically nested anywhere inside one -- ie code that is lexically part of the class's
- * own definition block. Used to allow private-member access, and (via luaR_closureisinit)
- * const-member writes.
+ * own definition block. Used to authorize private-member access and private constructors.
  *
  * We check `cl`'s Proto::ownerclass rather than source location because a class's method protos
  * (and everything nested inside them) are stamped with the owning class exactly once, when the
@@ -157,11 +156,11 @@ LUAI_FUNC void luaR_freeclass(lua_State* L, LuauClass* classdef, lua_Page* page)
  *
  *  [ BASE ]
  *  - A class value
- *  - An optional indexable value
+ *  - The constructor arguments (for the POD constructor, an optional indexable value)
  *
- * This function will allocate a new object, iterate over the instance members of the class value,
- * initialize each of the object's members with the result of indexing into the value, and then assign the
- * value to the top of the stack. If the indexable is not present, all members are initialized to `nil`.
+ * This function checks a private constructor, allocates a new object and then either calls a custom
+ * `__init` with the arguments (yieldably) or applies the indexable's fields over the members' defaults.
+ * The object is the single result.
  */
 LUAI_FUNC int luaR_createobject(lua_State* L);
 

@@ -78,17 +78,15 @@ LuauClass* luaR_newclass(
     classdef->memberflags = memberflags;
     classdef->hasprivatemembers = false;
     classdef->hasconstmembers = false;
-    classdef->hasdefaultmembers = false;
     for (uint32_t i = 0; i < classdef->numberofallmembers; i++)
     {
         classdef->hasprivatemembers |= (memberflags[i] & LBC_CLASSMEMBER_PRIVATE) != 0;
         classdef->hasconstmembers |= (memberflags[i] & LBC_CLASSMEMBER_CONST) != 0;
-        classdef->hasdefaultmembers |= (memberflags[i] & LBC_CLASSMEMBER_HASDEFAULT) != 0;
     }
 
-    // Calling `__init` on a constructed object would reassign its `const` fields, so a class with any
-    // makes its `__init` unreadable as a member (see LBC_CLASSMEMBER_INITBLOCKED). Every class has an
-    // `__init` member by now: a custom or primary one from the shape, or the default one the loader
+    // Calling `__init` on a constructed object would reassign its `const` fields, so a class with a
+    // `const` field makes its `__init` unreadable as a member (see LBC_CLASSMEMBER_INITBLOCKED). Every
+    // class has an `__init` member by now: a custom or primary one from the shape, or the default one the loader
     // reserves. Setting `hasprivatemembers` routes every member read through luaR_checkprivateaccess,
     // which is where the bit is enforced.
     if (classdef->hasconstmembers)
@@ -255,7 +253,7 @@ void luaR_addclassmember(lua_State* L, LuauClass* classdef, TString* name, TValu
 
 // Initializes the object with the POD constructor, with L->base + 1 being the stack location we expect
 // the user-provided table matching expected fields to values to be. Since classes can have 0 fields that need to be
-// initialized we also allow Class() here as well (if class actually had fields they will be nill)
+// initialized we also allow Class() here as well (if class actually had fields they will be nil)
 //
 // Field defaults come from one of two places: constant defaults are serialized into the class shape
 // and copied straight out of classdef->memberdefaults, while a class with any non-constant default

@@ -479,7 +479,7 @@ enum LuauOpcode
     //      error; when clear, the compiler guarantees a class and the VM only asserts it
     LOP_JUMPXISA,
 
-    // NEWOBJECT: allocate an instance of a class, with every field set to its constant default.
+    // NEWOBJECT: allocate an instance of a class, initialized according to C (below).
     // Emitted for a call whose callee is a statically resolved class (see isKnownClassExpr), in place
     // of the `__call` metamethod dispatch and C constructor frame a generic CALL would go through.
     // A: destination register, which holds the instance afterwards
@@ -499,15 +499,15 @@ enum LuauOpcode
     LOP_NEWOBJECT,
 
     // GETOBJECTMEMBER: read an instance member at a known offset, for a receiver whose class the
-    // compiler has *proven*: a method's own `self`, which the prologue's CHECKSELFCLASS has already
-    // established is an instance of the method's class, or a local inside the then-branch of
-    // `if class.isinstance(local, C)` (JUMPXISA against a class declared in this module). In both cases
-    // the value is never reassigned in the function. Because the class is known, the member's offset is
-    // known too (it is the member's index in declaration order, fixed when the class statement runs), so
-    // none of GETTABLEKS's per-access work is needed: no slot cache, no bounds check against the class, no
-    // `offsettomember[slot]` name compare, and no private-access check (only emitted for private members
-    // from the class's own methods). The checks that remain exist only to keep malformed bytecode
-    // memory-safe.
+    // compiler has *proven* with a runtime check and never reassigns:
+    //   - a method's own `self`, checked by the method's CHECKSELFCLASS prologue;
+    //   - an inlined method's `self`, checked by the CHECKSELFCLASS emitted at the inline site;
+    //   - a local in the then-branch of `if class.isinstance(local, C)` (JUMPXISA against a class declared
+    //     in this module).
+    // The member's offset is its index in declaration order, so none of GETTABLEKS's per-access work is
+    // needed: no slot cache, no bounds check, no name compare and no private-access check. A private member
+    // is only emitted this way through a proven `self` (whose body is the class's own code) or from inside
+    // one of the class's methods. The remaining checks only keep malformed bytecode memory-safe.
     // A: target register
     // B: register holding the object
     // AUX: member offset

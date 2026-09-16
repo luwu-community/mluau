@@ -1453,7 +1453,8 @@ struct ConstPropState
     // The same, for the proven-class direct form: keyed by object pointer (OP_A) and constant member
     // offset (OP_B), with no guard strength to reconcile.
     std::vector<NumberedInstruction> objectMemberCache;
-    // Maps a TRY_OBJECT_MEMBER_ADDR SSA index to the last instruction producing the value there
+    // Maps an object member address (TRY_OBJECT_MEMBER_ADDR or OBJECT_MEMBER_ADDR) SSA index to the last
+    // instruction producing the value there
     DenseHashMap<uint32_t, uint32_t> objectValueCache{kInvalidInstIdx};
 
     std::vector<uint32_t> getArrAddrCache;
@@ -2741,10 +2742,10 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
     }
     case IrCmd::OBJECT_MEMBER_ADDR:
     {
-        // Luwu Classes (rfcs/classes.md): a proven `self.field` address depends only on the object and
-        // a constant offset, and carries no guard at all, so a repeat of the same pair is the same
+        // Luwu Classes (rfcs/classes.md): an OBJECT_MEMBER_ADDR depends only on the object and a
+        // constant offset, and carries no guard at all, so a repeat of the same pair is the same
         // address. Reusing it is what lets the value cache above forward a load or a store
-        // to a later read of the same field -- the second `self.x` in a method costs nothing.
+        // to a later read of the same member.
         for (size_t i = 0; i < state.objectMemberCache.size(); i++)
         {
             auto&& [prevIdx, num, lastNum] = state.objectMemberCache[i];

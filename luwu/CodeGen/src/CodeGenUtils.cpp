@@ -971,8 +971,8 @@ const Instruction* executeFORGPREP(lua_State* L, const Instruction* pc, StkId ba
     return pc;
 }
 
-// Luwu Classes (rfcs/classes.md): the native lowering of LOP_NEWOBJECT. Construction is not lowered
-// to machine code, but it must not be a bare exit to the interpreter either: an unconditional
+// Luwu Classes (rfcs/classes.md): LOP_NEWOBJECT for native code -- the non-FIELDS forms, and FIELDS-form
+// guard misses. This must not be a bare exit to the interpreter: an unconditional
 // `JUMP vmExit` carries no register liveness, so the analysis would let stores to registers the rest
 // of the bytecode still reads (a numeric for loop's limit/step/index, say) be eliminated, and the
 // interpreter would resume on top of garbage. Running it as an ordinary fallback keeps the register
