@@ -14,8 +14,8 @@ use crate::util::{check_stack, StackGuard};
 /// opaque reference, the same way [`Thread`](crate::Thread) or [`Function`](crate::Function) are.
 ///
 /// This is part of Luau's (experimental) user-defined classes support, gated behind the
-/// `luau-classes` feature.
-#[cfg_attr(docsrs, doc(cfg(feature = "luau-classes")))]
+/// `luwu-classes` feature.
+#[cfg_attr(docsrs, doc(cfg(feature = "luwu-classes")))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Class(pub(crate) ValueRef);
 
@@ -52,7 +52,7 @@ impl Class {
     }
 }
 
-#[cfg(feature = "luau-classes")]
+#[cfg(feature = "luwu-classes")]
 impl crate::types::LuaType for Class {
     const TYPE_ID: std::os::raw::c_int = ffi::LUA_TCLASS;
 }
@@ -64,8 +64,8 @@ impl crate::types::LuaType for Class {
 /// code inspects or constructs instances directly.
 ///
 /// This is part of Luau's (experimental) user-defined classes support, gated behind the
-/// `luau-classes` feature.
-#[cfg_attr(docsrs, doc(cfg(feature = "luau-classes")))]
+/// `luwu-classes` feature.
+#[cfg_attr(docsrs, doc(cfg(feature = "luwu-classes")))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Object(pub(crate) ValueRef);
 
@@ -125,7 +125,7 @@ impl Object {
     }
 }
 
-#[cfg(feature = "luau-classes")]
+#[cfg(feature = "luwu-classes")]
 impl crate::types::LuaType for Object {
     const TYPE_ID: std::os::raw::c_int = ffi::LUA_TOBJECT;
 }

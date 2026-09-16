@@ -8,7 +8,7 @@
 
 #include "Luau/Common.h"
 
-LUAU_FASTFLAG(LuauNonePrimitive)
+LUAU_FASTFLAG(LuwuNonePrimitive)
 
 static int class_isinstance(lua_State* L)
 {
@@ -22,7 +22,7 @@ static int class_isinstance(lua_State* L)
     return 1;
 }
 
-static int class_classof(lua_State* L)
+static int class_of(lua_State* L)
 {
     luaL_checkany(L, 1);
     if (!lua_isobject(L, 1))
@@ -72,7 +72,7 @@ static int class_fields(lua_State* L)
         const TValue* value = object ? &object->members[offset] : NULL;
         if (value && !ttisnil(value))
             luaA_pushvalue(L, value);
-        else if (FFlag::LuauNonePrimitive)
+        else if (FFlag::LuwuNonePrimitive)
             lua_pushsymnone(L);
         else
             lua_pushnil(L);
@@ -84,9 +84,18 @@ static int class_fields(lua_State* L)
     return 2;
 }
 
+static int class_name(lua_State* L)
+{
+    const char* name = lua_getclassname(L, 1);
+    luaL_argexpected(L, name, 1, "class or object");
+    lua_pushstring(L, name);
+    return 1;
+}
+
 static const luaL_Reg classlib[] = {
     {"isinstance", class_isinstance},
-    {"classof", class_classof},
+    {"of", class_of},
+    {"name", class_name},
     {"fields", class_fields},
     {nullptr, nullptr},
 };

@@ -25,9 +25,9 @@ members = ["mlua-sys"]
 default = ["dynamic-userdata", "bytes", "none-primitive", "serde"]
 luau-jit = ["ffi/luau-codegen"]
 luau-vector4 = ["ffi/luau-vector4"]
-# Luau's user-defined classes support is experimental upstream (gated behind
-# fastflags prefixed `Debug*`) and its shape may still change, so this is opt-in.
-luau-classes = ["ffi/luau-classes"]
+# Luwu's user-defined classes (luwu rfcs/classes.md), which diverge from upstream Luau's. Still
+# experimental (gated behind fastflags prefixed `Debug*`) and its shape may still change, so this is opt-in.
+luwu-classes = ["ffi/luwu-classes"]
 # Custom `none` primitive in mluau/luau
 none-primitive = ["ffi/none-primitive"]
 

@@ -527,9 +527,9 @@ impl RawLua {
 
             Value::Buffer(buf) => self.push_ref_at(&buf.0, state),
 
-            #[cfg(any(feature = "luau-classes", doc))]
+            #[cfg(any(feature = "luwu-classes", doc))]
             Value::Class(c) => self.push_ref_at(&c.0, state),
-            #[cfg(any(feature = "luau-classes", doc))]
+            #[cfg(any(feature = "luwu-classes", doc))]
             Value::Object(o) => self.push_ref_at(&o.0, state),
             Value::Other(vref) => self.push_ref_at(vref, state),
         }
@@ -612,12 +612,12 @@ impl RawLua {
                 Value::Buffer(crate::Buffer(self.new_value_ref_from(state, idx)))
             }
 
-            #[cfg(feature = "luau-classes")]
+            #[cfg(feature = "luwu-classes")]
             ffi::LUA_TCLASS => {
                 Value::Class(crate::Class(self.new_value_ref_from(state, idx)))
             }
 
-            #[cfg(feature = "luau-classes")]
+            #[cfg(feature = "luwu-classes")]
             ffi::LUA_TOBJECT => {
                 Value::Object(crate::Object(self.new_value_ref_from(state, idx)))
             }

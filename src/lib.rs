@@ -66,7 +66,7 @@ mod macros;
 
 mod buffer;
 mod chunk;
-#[cfg(any(feature = "luau-classes", doc))]
+#[cfg(any(feature = "luwu-classes", doc))]
 mod class;
 mod conversion;
 mod debug;
@@ -125,8 +125,8 @@ pub use crate::{
     vector::Vector,
 };
 
-#[cfg(any(feature = "luau-classes", doc))]
-#[cfg_attr(docsrs, doc(cfg(feature = "luau-classes")))]
+#[cfg(any(feature = "luwu-classes", doc))]
+#[cfg_attr(docsrs, doc(cfg(feature = "luwu-classes")))]
 pub use crate::class::{Class, Object};
 
 #[cfg(feature = "serde")]

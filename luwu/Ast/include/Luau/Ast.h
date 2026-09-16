@@ -1210,6 +1210,41 @@ struct AstClassMethod
 
 using AstClassMember = Variant<AstClassProperty, AstClassMethod>;
 
+// Luwu Classes (rfcs/classes.md): the access specifier and modifiers written directly on a primary
+// constructor parameter, Kotlin-style: `class SshKey(public const public_key: string)`. A parameter
+// that carries neither is described by a default-constructed instance of this.
+struct AstClassPrimaryConstructorParamQualifiers
+{
+    // Location of the `public`/`private` keyword in front of the parameter; nullopt when absent.
+    std::optional<Location> qualifierLocation = std::nullopt;
+    AstClassMemberVisibility visibility = AstClassMemberVisibility::Public;
+    // Location of the `const` modifier; nullopt when the parameter's field is not const.
+    std::optional<Location> constLocation = std::nullopt;
+    bool isConst = false;
+};
+
+// Luwu Classes (rfcs/classes.md): the primary constructor of a class, `class Cat(name: string, age = 0)`.
+// A class using the default (POD) table constructor has none of these at all; a class written as
+// `class Cat()` has one with zero parameters, which is what deliberately disables the table constructor.
+//
+// Parameters are ordinary function parameters -- annotations and default values both optional -- and
+// each one implicitly declares a field of the same name, public and non-const unless the parameter
+// says otherwise (see argsQualifiers) or the class body restates it. They are only in scope within
+// the class body's field initializer expressions, never within its methods.
+struct AstClassPrimaryConstructor
+{
+    // Location of the `public`/`private` keyword before the parameter list; nullopt when absent.
+    std::optional<Location> qualifierLocation = std::nullopt;
+    AstClassMemberVisibility visibility = AstClassMemberVisibility::Public;
+    AstArray<AstLocal*> args;
+    // Parallel to `args`; an entry is nullptr when that parameter has no default value.
+    AstArray<AstExpr*> argsDefaults;
+    // Parallel to `args`; the access specifier and modifiers written on each parameter, if any.
+    AstArray<AstClassPrimaryConstructorParamQualifiers> argsQualifiers;
+    // Location of the parameter list, parentheses included.
+    Location argLocation;
+};
+
 class AstStatClass : public AstStat
 {
 public:
@@ -1220,6 +1255,8 @@ public:
     bool exported;
     AstArray<AstGenericType*> generics;
     AstArray<AstGenericTypePack*> genericPacks;
+    // Null when the class has no primary constructor, i.e. it uses the default table constructor.
+    AstClassPrimaryConstructor* primaryConstructor = nullptr;
     // Set once the class's closing `end` has actually been matched, as opposed to being
     // synthesized by error recovery. Mirrors AstStatBlock::hasEnd.
     bool hasEnd = false;
@@ -1231,7 +1268,8 @@ public:
         bool exported,
         const Location& keywordLocation,
         const AstArray<AstGenericType*>& generics = {},
-        const AstArray<AstGenericTypePack*>& genericPacks = {}
+        const AstArray<AstGenericTypePack*>& genericPacks = {},
+        AstClassPrimaryConstructor* primaryConstructor = nullptr
     );
 
     void visit(AstVisitor* visitor) override;

@@ -419,7 +419,7 @@ impl FromLua for crate::Buffer {
     }
 }
 
-#[cfg(any(feature = "luau-classes", doc))]
+#[cfg(any(feature = "luwu-classes", doc))]
 impl IntoLua for crate::Class {
     #[inline]
     fn into_lua(self, _: &Lua) -> Result<Value> {
@@ -427,7 +427,7 @@ impl IntoLua for crate::Class {
     }
 }
 
-#[cfg(any(feature = "luau-classes", doc))]
+#[cfg(any(feature = "luwu-classes", doc))]
 impl IntoLua for &crate::Class {
     #[inline]
     fn into_lua(self, _: &Lua) -> Result<Value> {
@@ -441,7 +441,7 @@ impl IntoLua for &crate::Class {
     }
 }
 
-#[cfg(any(feature = "luau-classes", doc))]
+#[cfg(any(feature = "luwu-classes", doc))]
 impl FromLua for crate::Class {
     #[inline]
     fn from_lua(value: Value, _: &Lua) -> Result<Self> {
@@ -456,7 +456,7 @@ impl FromLua for crate::Class {
     }
 }
 
-#[cfg(any(feature = "luau-classes", doc))]
+#[cfg(any(feature = "luwu-classes", doc))]
 impl IntoLua for crate::Object {
     #[inline]
     fn into_lua(self, _: &Lua) -> Result<Value> {
@@ -464,7 +464,7 @@ impl IntoLua for crate::Object {
     }
 }
 
-#[cfg(any(feature = "luau-classes", doc))]
+#[cfg(any(feature = "luwu-classes", doc))]
 impl IntoLua for &crate::Object {
     #[inline]
     fn into_lua(self, _: &Lua) -> Result<Value> {
@@ -478,7 +478,7 @@ impl IntoLua for &crate::Object {
     }
 }
 
-#[cfg(any(feature = "luau-classes", doc))]
+#[cfg(any(feature = "luwu-classes", doc))]
 impl FromLua for crate::Object {
     #[inline]
     fn from_lua(value: Value, _: &Lua) -> Result<Self> {

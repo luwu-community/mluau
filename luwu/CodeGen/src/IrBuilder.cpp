@@ -681,12 +681,27 @@ void IrBuilder::translateInst(LuauOpcode op, const Instruction* pc, int i)
         inst(IrCmd::FALLBACK_FORGPREP, constUint(i), vmReg(LUAU_INSN_A(*pc)), loopStart);
         break;
     }
-    // We do not support classes in NCG at the moment, so if we see a class
-    // operation then unconditionally exit to the VM. CHECKSELFCLASS is the exception: it's the
-    // first instruction of every self-taking method, so leaving it as an unconditional exit would
-    // force every class method to interpret in full; see translateInstCheckSelfClass.
+    // Class declaration and construction have no machine code lowering yet, but neither can be a bare
+    // `JUMP vmExit`: such a jump carries no VM register operands, so nothing downstream knows which
+    // registers the interpreter will go on to read, and stores that are still needed get eliminated
+    // -- a numeric for loop's limit/step/index, say, sitting below these instructions' own operands
+    // and otherwise untouched by them. They run as ordinary C fallbacks instead, which also keeps the
+    // rest of the function native rather than abandoning it to the interpreter at the first
+    // construction. (CHECKSELFCLASS is lowered properly; see translateInstCheckSelfClass.)
     case LOP_NEWCLASSMEMBER:
-        inst(IrCmd::JUMP, vmExit(i));
+        inst(IrCmd::FALLBACK_NEWCLASSMEMBER, constUint(i), vmReg(LUAU_INSN_A(*pc)), vmReg(LUAU_INSN_C(*pc)));
+        break;
+
+    case LOP_NEWOBJECT:
+        translateInstNewObject(*this, pc, i);
+        break;
+
+    case LOP_GETOBJECTMEMBER:
+        translateInstGetObjectMember(*this, pc, i);
+        break;
+
+    case LOP_SETOBJECTMEMBER:
+        translateInstSetObjectMember(*this, pc, i);
         break;
 
     case LOP_CHECKSELFCLASS:

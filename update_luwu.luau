@@ -3,6 +3,7 @@ const fs = require("@std/fs")
 const args = require("@std/args")
 const process = require("@std/process")
 const colors = require("@std/colors")
+local env = require("@std/env")
 
 const REPO_URL = "https://github.com/luwu-community/luwu"
 
@@ -78,6 +79,11 @@ if use_local_path then
     replace_using_local_path()
 else
     replace_using_git_clone()
+end
+
+const mlua_sys_main_path = project:join("mlua-sys", "build", "main.rs")
+if env.os ~= "Windows" then
+    process.shell(`touch {mlua_sys_main_path}`):unwrap()
 end
 
 print(colors.green(`Done! Luwu source folders have been vendored to {vendored_path}!`))

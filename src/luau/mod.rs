@@ -12,36 +12,36 @@ pub static ENABLED_FFLAGS: &[&str] = &[
     "LuauIntegerType2",
     "LuauIntegerFastcalls",
     "LuauIntegerLibrary",
-    "LuauExternallyManagedBuffers",
-    "LuauExternalString",
-    #[cfg(feature = "luau-classes")]
+    "LuwuExternallyManagedBuffers",
+    "LuwuExternalString",
+    #[cfg(feature = "luwu-classes")]
     "DebugLuauUserDefinedClasses",
-    #[cfg(feature = "luau-classes")]
+    #[cfg(feature = "luwu-classes")]
     "DebugLuauUserDefinedClassesRuntime",
     #[cfg(feature = "none-primitive")]
-    "LuauNonePrimitive",
+    "LuwuNonePrimitive",
     "LuauAutoStack", // lets mluau avoid calls to lua_checkstack (avoids ffi calls)
-    "LuauFatCClosure",
-    "LuauManagedReferences2",
-    "LuauPcallMulti"
+    "LuwuFatCClosure",
+    "LuwuManagedReferences2",
+    "LuwuPcallMulti"
 ];
 
 pub static RESTRICTED_FFLAGS: &[&str] = &[
     "LuauIntegerType2",
     "LuauIntegerFastcalls",
     "LuauIntegerLibrary",
-    "LuauExternallyManagedBuffers",
-    "LuauExternalString",
-    // luau-classes
+    "LuwuExternallyManagedBuffers",
+    "LuwuExternalString",
+    // luwu-classes
     "DebugLuauUserDefinedClasses",
     "DebugLuauUserDefinedClassesRuntime",
     // none primitive
-    "LuauNonePrimitive",
+    "LuwuNonePrimitive",
     // internally needed
     "LuauAutoStack",
-    "LuauFatCClosure",
-    "LuauManagedReferences2",
-    "LuauPcallMulti"
+    "LuwuFatCClosure",
+    "LuwuManagedReferences2",
+    "LuwuPcallMulti"
 ];
 
 // Since Luau has some missing standard functions, we re-implement them here
@@ -117,11 +117,11 @@ impl Lua {
         // Register the `class` global table when the user-defined-classes runtime fastflag is
         // enabled, mirroring what Luau's own `luaL_openlibs` does internally when that flag is on.
 
-        // Register the `class` library if the luau-classes feature is enabled
+        // Register the `class` library if the luwu-classes feature is enabled
         // we know DebugLuauUserDefinedClassesRuntime is enabled because
         // - we just enabled it right above
-        // - it not allowed to be disabled while luau-classes is active
-        #[cfg(feature = "luau-classes")]
+        // - it not allowed to be disabled while luwu-classes is active
+        #[cfg(feature = "luwu-classes")]
         {
             let lua = self.lock();
             let state = lua.state();

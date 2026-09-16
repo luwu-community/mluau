@@ -299,7 +299,7 @@ static uint32_t getFloatBits(float value)
     return result;
 }
 
-// Luau Classes (rfcx/classes.md): a64 counterpart of emitClassMemberAuthX64 -- authorize
+// Luwu Classes (rfcs/classes.md): a64 counterpart of emitClassMemberAuthX64 -- authorize
 // private/const access to the member at `slotReg` on `classReg` (an object's lclass, or a class
 // object directly), or jump to `mismatch` (the interpreter fallback, which raises the error). A
 // member with no access bits is unrestricted; a private/const member takes the fast path only when
@@ -315,7 +315,8 @@ static void emitClassMemberAuthA64(
     Label& mismatch
 )
 {
-    uint32_t restrictBits = isWrite ? (LBC_CLASSMEMBER_PRIVATE | LBC_CLASSMEMBER_CONST) : LBC_CLASSMEMBER_PRIVATE;
+    // See emitClassMemberAuthX64 for why a read also stops on LBC_CLASSMEMBER_INITBLOCKED.
+    uint32_t restrictBits = isWrite ? (LBC_CLASSMEMBER_PRIVATE | LBC_CLASSMEMBER_CONST) : (LBC_CLASSMEMBER_PRIVATE | LBC_CLASSMEMBER_INITBLOCKED);
 
     Label authorized;
 
@@ -326,7 +327,10 @@ static void emitClassMemberAuthA64(
     build.ldr(owner, mem(classReg, offsetof(LuauClass, memberflags)));
     build.ldrb(flagw, mem(owner, slotReg));
 
-    build.tst(flagw, restrictBits);
+    // PRIVATE | INITBLOCKED (bits 0 and 7) has no logical-immediate encoding, so test against a register
+    RegisterA64 maskw = regs.allocTemp(KindA64::w);
+    build.mov(maskw, int(restrictBits));
+    build.tst(flagw, maskw);
     build.b(ConditionA64::Equal, authorized); // Z set: unrestricted member, no check needed
 
     // owner = currentClosure->l.p->ownerclass (NULL for non-method closures -> never matches)
@@ -334,6 +338,12 @@ static void emitClassMemberAuthA64(
     build.ldr(owner, mem(owner, offsetof(Proto, ownerclass)));
     build.cmp(owner, classReg);
     build.b(ConditionA64::NotEqual, mismatch); // access from outside the owning class
+
+    if (!isWrite)
+    {
+        build.tst(flagw, uint32_t(LBC_CLASSMEMBER_INITBLOCKED));
+        build.b(ConditionA64::NotEqual, mismatch); // Z clear: blocked `__init`, even from inside the class
+    }
 
     if (isWrite)
     {
@@ -527,6 +537,14 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         // note: this may clobber OP_A(inst), so it's important that we don't use it after this
         build.ldr(inst.regA64, mem(regOp(OP_A(inst)), offsetof(LuaTable, node)));
         build.add(inst.regA64, inst.regA64, temp2x, kLuaNodeSizeLog2); // "zero extend" temp2 to get a larger shift (top 32 bits are zero)
+        break;
+    }
+    case IrCmd::LOAD_OWNER_CLASS:
+    {
+        // currentClosure->l.p->ownerclass; NULL for a closure that is not a class member
+        inst.regA64 = regs.allocReg(KindA64::x, index);
+        build.ldr(inst.regA64, mem(rClosure, offsetof(Closure, l.p)));
+        build.ldr(inst.regA64, mem(inst.regA64, offsetof(Proto, ownerclass)));
         break;
     }
     case IrCmd::GET_CLOSURE_UPVAL_ADDR:
@@ -1901,12 +1919,25 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
     case IrCmd::CLASS_ISINSTANCE:
     {
         // result = (tag == object) && (value->lclass == class); the deref is guarded by the tag check
+        // constant propagation can replace the tag with a known constant (e.g. after CHECKSELFCLASS
+        // has already established that the value is an object), in which case the guard folds away
+        CODEGEN_ASSERT(OP_A(inst).kind == IrOpKind::Inst || OP_A(inst).kind == IrOpKind::Constant);
+        bool knownTag = OP_A(inst).kind == IrOpKind::Constant;
+
         inst.regA64 = regs.allocReg(KindA64::w, index);
         build.mov(inst.regA64, 0);
 
+        // a value that is statically known not to be an object is never an instance
+        if (knownTag && tagOp(OP_A(inst)) != LUA_TOBJECT)
+            break;
+
         Label done;
-        build.cmp(regOp(OP_A(inst)), uint16_t(LUA_TOBJECT));
-        build.b(ConditionA64::NotEqual, done);
+
+        if (!knownTag)
+        {
+            build.cmp(regOp(OP_A(inst)), uint16_t(LUA_TOBJECT));
+            build.b(ConditionA64::NotEqual, done);
+        }
 
         RegisterA64 temp = regs.allocTemp(KindA64::x);
         build.ldr(temp, mem(regOp(OP_B(inst)), offsetof(LuauObject, lclass)));
@@ -2822,12 +2853,86 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         build.cmp(tempx, key);
         build.b(ConditionA64::NotEqual, mismatch);
 
-        // address = self->members + slot * sizeof(TValue)
-        build.ldr(inst.regA64, mem(regOp(OP_A(inst)), offsetof(LuauObject, members)));
+        // address = self + LUAR_OBJECT_MEMBERS_OFFSET + slot * sizeof(TValue)
+        build.add(inst.regA64, regOp(OP_A(inst)), uint16_t(LUAR_OBJECT_MEMBERS_OFFSET));
         build.add(inst.regA64, inst.regA64, slotx, kTValueSizeLog2);
 
         if (OP_D(inst).kind == IrOpKind::Undef)
             emitAbort(build, abort);
+        break;
+    }
+    case IrCmd::OBJECT_MEMBER_ADDR:
+    {
+        // See the X64 lowering: proven class, constant offset, no check of any kind and no branch.
+        inst.regA64 = regs.allocReg(KindA64::x, index);
+
+        uint32_t offset = uintOp(OP_B(inst));
+
+        // address = self + LUAR_OBJECT_MEMBERS_OFFSET + offset * sizeof(TValue), with no load
+        size_t displacement = LUAR_OBJECT_MEMBERS_OFFSET + offset * sizeof(TValue);
+
+        if (displacement <= AssemblyBuilderA64::kMaxImmediate)
+        {
+            build.add(inst.regA64, regOp(OP_A(inst)), uint16_t(displacement));
+        }
+        else
+        {
+            RegisterA64 tempx = regs.allocTemp(KindA64::x);
+            build.mov(tempx, int(displacement));
+            build.add(inst.regA64, regOp(OP_A(inst)), tempx);
+        }
+
+        break;
+    }
+    case IrCmd::CHECK_CLASS_FIELDS_CONSTRUCTIBLE:
+    {
+        // See the X64 lowering.
+        Label fresh;
+        Label& fail = getTargetLabel(OP_C(inst), index, fresh);
+        RegisterA64 classReg = regOp(OP_A(inst));
+        RegisterA64 tempw = regs.allocTemp(KindA64::w);
+        RegisterA64 tempx = regs.allocTemp(KindA64::x);
+
+        build.ldr(tempw, mem(classReg, offsetof(LuauClass, numberofinstancemembers)));
+        build.cmp(tempw, uint16_t(uintOp(OP_B(inst))));
+        build.b(ConditionA64::NotEqual, fail);
+        build.ldr(tempx, mem(classReg, offsetof(LuauClass, memberdefaults)));
+        build.cbnz(tempx, fail);
+        build.ldrb(tempw, mem(classReg, offsetof(LuauClass, haspoddefaultsfn)));
+        build.cbnz(tempw, fail);
+
+        Label constructible;
+        build.ldrb(tempw, mem(classReg, offsetof(LuauClass, hascustominit)));
+        build.cbz(tempw, constructible);
+
+        build.ldrb(tempw, mem(classReg, offsetof(LuauClass, hasprimaryinit)));
+        build.cbz(tempw, fail);
+
+        build.ldr(tempx, mem(classReg, offsetof(LuauClass, memberflags)));
+        build.ldr(tempw, mem(classReg, offsetof(LuauClass, initoffset)));
+        build.ldrb(tempw, mem(tempx, castReg(KindA64::x, tempw)));
+        build.tst(tempw, uint32_t(LBC_CLASSMEMBER_PRIVATE));
+        build.b(ConditionA64::Equal, constructible);
+
+        // private: only from one of the class's own methods (or a closure nested in one)
+        build.ldr(tempx, mem(rClosure, offsetof(Closure, l.p)));
+        build.ldr(tempx, mem(tempx, offsetof(Proto, ownerclass)));
+        build.cmp(tempx, classReg);
+        build.b(ConditionA64::NotEqual, fail);
+
+        build.setLabel(constructible);
+        finalizeTargetLabel(OP_C(inst), index, fresh);
+        break;
+    }
+    case IrCmd::NEW_OBJECT:
+    {
+        RegisterA64 reg = regOp(OP_A(inst)); // note: we need to call regOp before spill so that we don't do redundant reloads
+        regs.spill(index, {reg});
+        build.mov(x1, reg);
+        build.mov(x0, rState);
+        build.ldr(x2, mem(rNativeContext, offsetof(NativeContext, luaR_newobjectuninit)));
+        build.blr(x2);
+        inst.regA64 = regs.takeReg(x0, index);
         break;
     }
     case IrCmd::TRY_CLASS_MEMBER_ADDR:
@@ -2934,8 +3039,8 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         build.cmp(slotw, ninstance);
         build.b(ConditionA64::CarrySet, isStatic);
 
-        // instance: address = self->members + slot * sizeof(TValue)
-        build.ldr(inst.regA64, mem(regOp(OP_A(inst)), offsetof(LuauObject, members)));
+        // instance: address = self + LUAR_OBJECT_MEMBERS_OFFSET + slot * sizeof(TValue)
+        build.add(inst.regA64, regOp(OP_A(inst)), uint16_t(LUAR_OBJECT_MEMBERS_OFFSET));
         build.add(inst.regA64, inst.regA64, slotx, kTValueSizeLog2);
         build.b(done);
 
@@ -3452,6 +3557,12 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
 
         regs.spill(index);
         emitFallback(build, offsetof(NativeContext, executeDUPCLOSURE), uintOp(OP_A(inst)));
+        break;
+    case IrCmd::FALLBACK_NEWOBJECT:
+        emitFallback(build, offsetof(NativeContext, executeNEWOBJECT), uintOp(OP_A(inst)));
+        break;
+    case IrCmd::FALLBACK_NEWCLASSMEMBER:
+        emitFallback(build, offsetof(NativeContext, executeNEWCLASSMEMBER), uintOp(OP_A(inst)));
         break;
     case IrCmd::FALLBACK_FORGPREP:
         regs.spill(index);

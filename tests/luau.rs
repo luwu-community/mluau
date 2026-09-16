@@ -375,7 +375,7 @@ fn test_fflags() {
 // `DebugLuauUserDefinedClasses` is on, and mluau's own bootstrap chunk (loaded during
 // `configure_luau`) got misclassified as text by a byte-sniffing heuristic that assumed
 // bytecode version numbers would never collide with common leading whitespace bytes.
-#[cfg(feature = "luau-classes")]
+#[cfg(feature = "luwu-classes")]
 #[test]
 fn test_classes_fflag_does_not_panic() -> Result<()> {
     // This used to panic with:
@@ -389,10 +389,10 @@ fn test_classes_fflag_does_not_panic() -> Result<()> {
     Ok(())
 }
 
-// With the `luau-classes` feature enabled and the runtime fastflag on, mluau should
+// With the `luwu-classes` feature enabled and the runtime fastflag on, mluau should
 // register Luau's `class` global table (mirroring what Luau's own `luaL_openlibs` does
-// internally), so `class.isinstance`/`class.classof` are available to scripts.
-#[cfg(feature = "luau-classes")]
+// internally), so `class.isinstance`/`class.of` are available to scripts.
+#[cfg(feature = "luwu-classes")]
 #[test]
 fn test_classes_lib_registered_when_fflag_enabled() -> Result<()> {
     let lua = Lua::new();
@@ -401,9 +401,9 @@ fn test_classes_lib_registered_when_fflag_enabled() -> Result<()> {
     assert!(has_class, "expected `class` global to be registered");
 
     let has_functions: bool = lua
-        .load("return type(class.isinstance) == 'function' and type(class.classof) == 'function'")
+        .load("return type(class.isinstance) == 'function' and type(class.of) == 'function'")
         .eval()?;
-    assert!(has_functions, "expected class.isinstance/classof to be functions");
+    assert!(has_functions, "expected class.isinstance/of to be functions");
 
     Ok(())
 }
@@ -412,9 +412,9 @@ fn test_classes_lib_registered_when_fflag_enabled() -> Result<()> {
 // with `__call` set to a constructor that builds a new object (see `luaR_createobject` in
 // Luau's VM). This test creates a class and an instance entirely in Luau, round-trips both
 // through Rust functions (typed as `mluau::Class`/`mluau::Object`), and checks that identity,
-// `class.isinstance`/`classof`, and field access all still work afterwards -- i.e. that our
+// `class.isinstance`/`class.of`, and field access all still work afterwards -- i.e. that our
 // `LUA_TCLASS`/`LUA_TOBJECT` push/pop plumbing doesn't corrupt or misidentify the values.
-#[cfg(feature = "luau-classes")]
+#[cfg(feature = "luwu-classes")]
 #[test]
 fn test_classes_instantiate_and_roundtrip_through_rust() -> Result<()> {
     let lua = Lua::new();
@@ -446,7 +446,7 @@ fn test_classes_instantiate_and_roundtrip_through_rust() -> Result<()> {
             assert(roundtripped_object == point, "object identity was not preserved across the roundtrip")
 
             assert(class.isinstance(roundtripped_object, roundtripped_class), "isinstance failed after roundtrip")
-            assert(class.classof(roundtripped_object) == roundtripped_class, "classof mismatch after roundtrip")
+            assert(class.of(roundtripped_object) == roundtripped_class, "class.of mismatch after roundtrip")
 
             return roundtripped_object.x == 1 and roundtripped_object.y == 2
             "#,
@@ -461,7 +461,7 @@ fn test_classes_instantiate_and_roundtrip_through_rust() -> Result<()> {
 // Same roundtrip as above, but going through the untyped `Value` enum instead of the typed
 // `Class`/`Object` wrappers, exercising `Value::is_class`/`as_class`/`is_object`/`as_object`
 // and `Value::type_name` along the way.
-#[cfg(feature = "luau-classes")]
+#[cfg(feature = "luwu-classes")]
 #[test]
 fn test_classes_value_enum_roundtrip() -> Result<()> {
     let lua = Lua::new();
@@ -531,7 +531,7 @@ fn test_classes_value_enum_roundtrip() -> Result<()> {
 // is visible back in Luau, then read it back through `Object::get`. Also checks that indexing
 // a member that doesn't exist on the class raises a Lua error rather than returning nil (unlike
 // tables), and that mluau surfaces that as `Err` instead of panicking.
-#[cfg(feature = "luau-classes")]
+#[cfg(feature = "luwu-classes")]
 #[test]
 fn test_classes_get_set_object_field_from_rust() -> Result<()> {
     let lua = Lua::new();

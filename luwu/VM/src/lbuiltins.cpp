@@ -981,7 +981,7 @@ static int luauF_rawequal(lua_State* L, StkId res, TValue* arg0, int nresults, S
     return -1;
 }
 
-// Luau Classes (rfcx/classes.md): class.isinstance(value, class) -> value is an instance of class.
+// Luwu Classes (rfcs/classes.md): class.isinstance(value, class) -> value is an instance of class.
 // arg0 is the value under test; args[0] is the class. Only fast-pathed when the second argument is
 // actually a class; otherwise fall back to the library function to raise the usual argument error.
 static int luauF_class_isinstance(lua_State* L, StkId res, TValue* arg0, int nresults, StkId args, int nparams)
@@ -1236,6 +1236,8 @@ static int luauF_getmetatable(lua_State* L, StkId res, TValue* arg0, int nresult
             mt = hvalue(arg0)->metatable;
         else if (ttisuserdata(arg0))
             mt = uvalue(arg0)->metatable;
+        else if (ttisobject(arg0) || ttisclass(arg0))
+            mt = NULL; // Luwu Classes (rfcs/classes.md): never exposed, see lua_getmetatable
         else
             mt = L->global->mt[ttype(arg0)];
 

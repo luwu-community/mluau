@@ -540,6 +540,7 @@ struct BytecodeGraphParser
                     addImmInput(node, static_cast<bool>(aux >> 31));
                     addJumpInput(node, jumpTarget);
                     addVmRegInput(node, aux & 0xff);
+                    addImmInput(node, static_cast<bool>(aux & LBC_JUMPXISA_CHECKCLASS));
                     break;
 
                 case LOP_JUMPIF:
@@ -1010,8 +1011,32 @@ struct BytecodeGraphParser
 
             case LOP_CHECKSELFCLASS:
                 addVmRegInput(node, LUAU_INSN_A(insn));
+                // operand B is a register, or LBC_SELFCLASS_OWNER meaning "take the class from
+                // Proto::ownerclass". Only a real register takes part in renaming, so the sentinel
+                // rides along as an immediate and the register slot is a placeholder in that case.
+                addVmRegInput(node, LUAU_INSN_B(insn) == LBC_SELFCLASS_OWNER ? 0 : LUAU_INSN_B(insn));
+                addImmInput(node, static_cast<int32_t>(LUAU_INSN_B(insn) == LBC_SELFCLASS_OWNER ? 1 : 0));
+                addImmInput(node, static_cast<int32_t>(LUAU_INSN_C(insn)));
+                addVmConstInput(node, aux);
+                break;
+
+            case LOP_GETOBJECTMEMBER:
+                addVmRegInput(node, LUAU_INSN_B(insn));
+                addImmInput(node, static_cast<int32_t>(aux));
+                addProducer(LUAU_INSN_A(insn), nodeOp);
+                break;
+
+            case LOP_SETOBJECTMEMBER:
+                addVmRegInput(node, LUAU_INSN_A(insn));
+                addVmRegInput(node, LUAU_INSN_B(insn));
+                addImmInput(node, static_cast<int32_t>(aux));
+                break;
+
+            case LOP_NEWOBJECT:
+                addVmRegInput(node, LUAU_INSN_A(insn));
                 addVmRegInput(node, LUAU_INSN_B(insn));
                 addImmInput(node, static_cast<int32_t>(LUAU_INSN_C(insn)));
+                addImmInput(node, static_cast<int32_t>(aux));
                 break;
 
             case LOP_NEWCLASSMEMBER:

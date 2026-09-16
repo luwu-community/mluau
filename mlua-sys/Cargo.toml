@@ -25,7 +25,7 @@ luau-vector4 = []
 # Luau's user-defined classes support is experimental upstream (gated behind
 # fastflags prefixed `Debug*`) and its shape may still change, so bindings for it
 # are opt-in.
-luau-classes = []
+luwu-classes = []
 none-primitive = []
 external = []
 module = []

@@ -15,7 +15,7 @@ pub const LUA_MATHLIBNAME: *const c_char = cstr!("math");
 pub const LUA_DBLIBNAME: *const c_char = cstr!("debug");
 pub const LUA_VECLIBNAME: *const c_char = cstr!("vector");
 pub const LUA_INTLIBNAME: *const c_char = cstr!("integer");
-#[cfg(feature = "luau-classes")]
+#[cfg(feature = "luwu-classes")]
 pub const LUA_CLASSLIBNAME: *const c_char = cstr!("class");
 
 unsafe extern "C-unwind" {
@@ -31,7 +31,7 @@ unsafe extern "C-unwind" {
     pub fn luaopen_debug(L: *mut lua_State) -> c_int;
     pub fn luaopen_vector(L: *mut lua_State) -> c_int;
     pub fn luaopen_integer(L: *mut lua_State) -> c_int;
-    #[cfg(feature = "luau-classes")]
+    #[cfg(feature = "luwu-classes")]
     pub fn luaopen_class(L: *mut lua_State) -> c_int;
 
     // open all builtin libraries

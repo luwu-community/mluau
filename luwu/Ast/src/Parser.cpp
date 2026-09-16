@@ -27,16 +27,16 @@ LUAU_FLAGVERSION(LuauExportValueSyntax, 3)
 
 LUAU_FASTFLAGVARIABLE(DebugLuauNoInline)
 LUAU_FASTFLAGVARIABLE(DebugLuauUserDefinedClasses)
-LUAU_FASTFLAGVARIABLE(LuauBetterUserDefinedClasses)
+LUAU_FASTFLAGVARIABLE(LuwuBetterUserDefinedClasses)
 LUAU_FASTFLAGVARIABLE(LuauAllowGlobalDeclarationToBeCalledClass)
 LUAU_FASTFLAGVARIABLE(LuauDisallowExternClassInTypeDefinitions)
 LUAU_FASTFLAGVARIABLE(LuauTableEntriesDontNeedToMatchIndent)
 LUAU_FASTFLAGVARIABLE(LuauCstAttr)
 LUAU_FASTFLAGVARIABLE(LuauStoreConstKeywordBegin)
 LUAU_FASTFLAGVARIABLE(LuauTrackPrefixLocal)
-LUAU_FASTFLAGVARIABLE(LuauDefaultArguments)
-LUAU_FASTFLAGVARIABLE(LuauExternTypeGenericMethods)
-LUAU_FASTFLAGVARIABLE(LuauGenericNominals)
+LUAU_FASTFLAGVARIABLE(LuwuDefaultArguments)
+LUAU_FASTFLAGVARIABLE(LuwuExternTypeGenericMethods)
+LUAU_FASTFLAGVARIABLE(LuwuGenericNominals)
 LUAU_FASTFLAGVARIABLE(LuauNoDuplicateBinaryPrefix)
 
 // Clip with DebugLuauReportReturnTypeVariadicWithTypeSuffix
@@ -1593,6 +1593,165 @@ const std::unordered_set<std::string> EXPLICITLY_DISALLOWED_METAMETHODS{
 // classStatement ::= `class` Name classProps `end`
 // classProps ::= classProp [classProps]
 // classProp ::= name [: classQualifier* type]
+// Luwu Classes (rfcs/classes.md): parse the parameter list of a class's primary constructor, e.g. the
+// `(name: string, age = 0)` of `class Cat(name: string, age = 0)`. Each parameter implicitly declares
+// a public field of the same name, and the whole list is compiled into a synthesized `__init`.
+LUAU_NOINLINE AstClassPrimaryConstructor* Parser::parseClassPrimaryConstructor(
+    const std::optional<Location>& qualifierLocation,
+    AstClassMemberVisibility visibility
+)
+{
+    LUAU_ASSERT(FFlag::DebugLuauUserDefinedClasses && FFlag::LuwuBetterUserDefinedClasses);
+
+    Lexeme matchParen = lexer.current();
+    Location start = lexer.current().location;
+    expectAndConsume('(', "class primary constructor");
+
+    TempVector<Binding> args(scratchBinding);
+    TempVector<AstClassPrimaryConstructorParamQualifiers> argQualifiers(scratchClassParamQualifiers);
+    DenseHashSet<AstName> argNames{{}};
+
+    // The parameters, and the default value expressions attached to them, are compiled into the
+    // class's synthesized `__init`, which is one function scope deeper than the class declaration
+    // itself. Parse them at that depth so references to outer locals are correctly marked as
+    // upvalues -- the same dummyFunction push class field default values use.
+    static Function dummyFunction;
+    functionStack.emplace_back(dummyFunction);
+
+    while (lexer.current().type != ')')
+    {
+        if (lexer.current().type == Lexeme::Dot3)
+        {
+            report(lexer.current().location, "A class's primary constructor cannot be variadic");
+            nextLexeme();
+        }
+        else
+        {
+            // Luwu Classes (rfcs/classes.md): a parameter may carry the access specifier and the
+            // `const` modifier of the field it declares, Kotlin-style: `class SshKey private (public
+            // const public_key: string, private const private_key: string)`. A qualifier is only a
+            // qualifier when another name follows it, so a parameter may still be *named* `public`,
+            // `private` or `const`.
+            AstClassPrimaryConstructorParamQualifiers qualifiers;
+
+            // `const public x` is the wrong order; the modifier follows the access specifier.
+            if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const" && lexer.lookahead().type == Lexeme::Name &&
+                (AstName(lexer.lookahead().name) == "public" || AstName(lexer.lookahead().name) == "private"))
+            {
+                report(
+                    lexer.current().location, "The 'const' modifier must come after the access specifier, e.g. '%s const'", lexer.lookahead().name
+                );
+                nextLexeme(); // skip the misplaced 'const' and let the access specifier parse normally
+            }
+
+            if (lexer.current().type == Lexeme::Name && lexer.lookahead().type == Lexeme::Name &&
+                (AstName(lexer.current().name) == "public" || AstName(lexer.current().name) == "private"))
+            {
+                qualifiers.qualifierLocation = lexer.current().location;
+
+                if (AstName(lexer.current().name) == "private")
+                    qualifiers.visibility = AstClassMemberVisibility::Private;
+
+                nextLexeme();
+            }
+
+            if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const" && lexer.lookahead().type == Lexeme::Name)
+            {
+                qualifiers.constLocation = lexer.current().location;
+                qualifiers.isConst = true;
+                nextLexeme();
+            }
+
+            // a primary constructor's parameters are function parameters that happen to belong to a
+            // class, so their defaults ride on the same flag function parameter defaults do
+            Binding binding = parseBinding(/* isConst= */ false, /* allowDefault= */ FFlag::LuwuDefaultArguments);
+
+            if (argNames.contains(binding.name.name))
+                report(binding.name.location, "Duplicate primary constructor parameter '%s'", binding.name.name.value);
+            else
+                argNames.insert(binding.name.name);
+
+            args.push_back(binding);
+            argQualifiers.push_back(qualifiers);
+        }
+
+        if (lexer.current().type != ',')
+            break;
+
+        Location commaLocation = lexer.current().location;
+        nextLexeme();
+
+        // Parameters follow the same rules as function parameters, which do not allow a trailing
+        // comma either -- but say so, rather than reporting a missing parameter name.
+        if (lexer.current().type == ')')
+        {
+            report(commaLocation, "A class's primary constructor cannot have a trailing comma");
+            break;
+        }
+    }
+
+    // The locals are created inside the dummy scope, so the synthesized `__init` sees them as its
+    // own parameters, and then immediately taken back out of scope: they are only visible to field
+    // initializer expressions, which push them again (see pushClassPrimaryConstructorParams).
+    unsigned int localsBegin = saveLocals();
+
+    TempVector<AstLocal*> vars(scratchLocal);
+    TempVector<AstExpr*> varsDefaults(scratchExpr);
+
+    for (const Binding& binding : args)
+    {
+        vars.push_back(pushLocal(binding));
+        varsDefaults.push_back(binding.defaultValue);
+    }
+
+    restoreLocals(localsBegin);
+    functionStack.pop_back();
+
+    Location end = lexer.current().location;
+    expectMatchAndConsume(')', matchParen);
+
+    AstClassPrimaryConstructor* primaryConstructor = allocator.alloc<AstClassPrimaryConstructor>();
+    primaryConstructor->qualifierLocation = qualifierLocation;
+    primaryConstructor->visibility = visibility;
+    primaryConstructor->args = copy(vars);
+    primaryConstructor->argsDefaults = copy(varsDefaults);
+    primaryConstructor->argsQualifiers = copy(argQualifiers);
+    primaryConstructor->argLocation = Location(start, end);
+
+    return primaryConstructor;
+}
+
+// Luwu Classes (rfcs/classes.md): does the token the class body is sitting on read as a statement
+// rather than as a member declaration? A member is `name`, `name: T`, `name = expr` or a `function`;
+// anything that starts a statement outright, or a name followed by a call/index/comma, is a sign the
+// class was never closed and we are now eating the code that follows it.
+bool Parser::classBodyLooksLikeStatement()
+{
+    if (lexer.current().type == '(')
+        return true;
+
+    switch (lexer.current().type)
+    {
+    case Lexeme::ReservedLocal:
+    case Lexeme::ReservedReturn:
+    case Lexeme::ReservedIf:
+    case Lexeme::ReservedFor:
+    case Lexeme::ReservedWhile:
+    case Lexeme::ReservedRepeat:
+    case Lexeme::ReservedDo:
+        return true;
+    case Lexeme::Name:
+        break;
+    default:
+        return false;
+    }
+
+    // `print(...)`, `t.field = x`, `a, b = 1, 2` -- none of which a class member can be. Note `name:`
+    // is deliberately absent: that is a member's type annotation.
+    Lexeme::Type next = lexer.lookahead().type;
+    return next == '(' || next == '.' || next == ',' || next == '[';
+}
+
 LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool exported, const Location& classKeywordLocation)
 {
     LUAU_ASSERT(FFlag::DebugLuauUserDefinedClasses);
@@ -1604,8 +1763,75 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
 
     AstArray<AstGenericType*> generics{};
     AstArray<AstGenericTypePack*> genericPacks{};
-    if (FFlag::LuauBetterUserDefinedClasses && FFlag::LuauGenericNominals)
+    if (FFlag::LuwuBetterUserDefinedClasses && FFlag::LuwuGenericNominals)
         std::tie(generics, genericPacks) = parseGenericTypeList(/* withDefaultValues= */ false);
+
+    // Luwu Classes (rfcs/classes.md): an optional primary constructor, which may carry an access
+    // specifier of its own: `class Cat(name: string)`, `class Account private (holder: User)`.
+    // The `(` lookahead is what keeps `public`/`private` here from being confused with the access
+    // specifier of the class's first member.
+    std::optional<Location> ctorQualifierLocation;
+    AstClassMemberVisibility ctorVisibility = AstClassMemberVisibility::Public;
+
+    if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == Lexeme::Name && lexer.lookahead().type == '(' &&
+        (AstName(lexer.current().name) == "public" || AstName(lexer.current().name) == "private"))
+    {
+        ctorQualifierLocation = lexer.current().location;
+
+        if (AstName(lexer.current().name) == "private")
+            ctorVisibility = AstClassMemberVisibility::Private;
+
+        nextLexeme();
+    }
+
+    AstClassPrimaryConstructor* primaryConstructor = nullptr;
+
+    if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == '(')
+        primaryConstructor = parseClassPrimaryConstructor(ctorQualifierLocation, ctorVisibility);
+
+    // Every parameter implicitly declares a field of the same name, so a *method* named after one
+    // collides with it. A *property* named after one does not: that's how the RFC spells applying an
+    // access specifier or modifier to a parameter's field, so those are left out of
+    // classMemberNamespace and checked against it only once, when restated.
+    DenseHashSet<AstName> primaryConstructorParams{{}};
+
+    if (primaryConstructor)
+    {
+        for (AstLocal* arg : primaryConstructor->args)
+            primaryConstructorParams.insert(arg->name);
+    }
+
+    // Luwu Classes (rfcs/classes.md): a parameter may carry its field's access specifier and `const`
+    // modifier directly (`class SshKey(public const public_key: string)`). Restating such a field in
+    // the class body is allowed, but the restatement has to agree with the parameter, and once
+    // *anything* in the class carries an access specifier, everything must.
+    bool sawQualifiedParam = false;
+    bool sawPrivateMember = false;
+
+    if (primaryConstructor)
+    {
+        for (const AstClassPrimaryConstructorParamQualifiers& qualifiers : primaryConstructor->argsQualifiers)
+        {
+            if (qualifiers.qualifierLocation)
+                sawQualifiedParam = true;
+
+            if (qualifiers.visibility == AstClassMemberVisibility::Private)
+                sawPrivateMember = true;
+        }
+    }
+
+    // Index of the primary constructor parameter a class body member restates, or -1.
+    auto findPrimaryConstructorParam = [&](const AstName& memberName) -> int
+    {
+        if (!primaryConstructor)
+            return -1;
+
+        for (size_t i = 0; i < primaryConstructor->args.size; ++i)
+            if (primaryConstructor->args.data[i]->name == memberName)
+                return int(i);
+
+        return -1;
+    };
 
     // Not pushed as a local: this is what makes hoisted classes work.
     AstLocal* nameLocal =
@@ -1626,21 +1852,46 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
     // slightly more performant here (e.g.: a "scratch" set).
     DenseHashSet<AstName> classMemberNamespace{{}};
 
-    // Under LuauBetterUserDefinedClasses, if any member is explicitly marked
-    // `private`, then every member must carry an explicit `public` or
-    // `private` qualifier to avoid ambiguity. We collect the locations of
-    // members that didn't have an explicit qualifier as we go, and only
-    // report them once we know whether the class ended up with a `private`
-    // member.
-    bool sawPrivateMember = false;
+    // Under LuwuBetterUserDefinedClasses, if *any* member carries an explicit
+    // access specifier -- `public` just as much as `private` -- then every
+    // member must carry one, so that a bare `x: number` never has to be read
+    // against the rest of the class to know how it is accessed. We collect the
+    // locations of members that didn't have an explicit qualifier as we go, and
+    // only report them once we know whether the class ended up with any
+    // qualifier at all (rfcs/classes.md).
     std::vector<std::pair<Location, bool>> unqualifiedMemberLocations; // (location, isFunction)
+    std::vector<Location> explicitPublicQualifierLocations;
+    // Primary constructor parameters whose field the class body restates with an explicit access
+    // specifier: that is the other place a parameter's field may be qualified.
+    DenseHashSet<AstName> paramsQualifiedInBody{{}};
+
+    // Set once we conclude the class was never closed, so the trailing `end` isn't reported missing a
+    // second time.
+    bool unterminated = false;
 
     while (lexer.current().type != Lexeme::ReservedEnd && lexer.current().type != Lexeme::Eof)
     {
+        // A class body and a statement list overlap enough (`const x = f()` is valid as either) that a
+        // class missing its `end` silently swallows the statements after it, and then reports a pile of
+        // nonsense at whatever token finally fails to be a member -- often many lines away. When the
+        // token we're looking at reads as a *statement* rather than a member, say what actually went
+        // wrong and hand the rest of the file back to the enclosing block.
+        if (FFlag::LuwuBetterUserDefinedClasses && classBodyLooksLikeStatement())
+        {
+            report(
+                lexer.current().location,
+                "Expected 'end' (to close 'class' at line %d), got %s",
+                classKeywordLocation.begin.line + 1,
+                lexer.current().toString().c_str()
+            );
+            unterminated = true;
+            break;
+        }
+
         std::optional<Location> qualifierLocation;
         AstClassMemberVisibility visibility = AstClassMemberVisibility::Public;
 
-        if (FFlag::LuauBetterUserDefinedClasses && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const")
+        if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const")
         {
             const Lexeme& next = lexer.lookahead();
             if (next.type == Lexeme::Name && (AstName(next.name) == "public" || AstName(next.name) == "private"))
@@ -1653,9 +1904,11 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
         if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "public")
         {
             qualifierLocation = lexer.current().location;
+            if (FFlag::LuwuBetterUserDefinedClasses)
+                explicitPublicQualifierLocations.push_back(*qualifierLocation);
             nextLexeme();
         }
-        else if (FFlag::LuauBetterUserDefinedClasses && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "private")
+        else if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "private")
         {
             qualifierLocation = lexer.current().location;
             visibility = AstClassMemberVisibility::Private;
@@ -1664,31 +1917,70 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
         }
 
         // If we saw a qualifier _and_ the current token is not `function`,
-        // assume this is a property. Under LuauBetterUserDefinedClasses, a
+        // assume this is a property. Under LuwuBetterUserDefinedClasses, a
         // property with no qualifier at all is also allowed as long as the
         // class doesn't have any private fields (implicit members are
         // implicitly public)
-        if ((qualifierLocation || FFlag::LuauBetterUserDefinedClasses) && lexer.current().type != Lexeme::ReservedFunction)
+        if ((qualifierLocation || FFlag::LuwuBetterUserDefinedClasses) && lexer.current().type != Lexeme::ReservedFunction)
         {
             std::optional<Location> constLocation;
             bool isConst = false;
-            if (FFlag::LuauBetterUserDefinedClasses && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const")
+            if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const")
             {
                 constLocation = lexer.current().location;
                 isConst = true;
                 nextLexeme();
             }
 
-            std::optional<Name> propName = parseNameOpt("class property name");
+            std::optional<Name> propName = parseNameOpt("class field name");
             if (!propName)
             {
-                if (FFlag::LuauBetterUserDefinedClasses)
+                if (FFlag::LuwuBetterUserDefinedClasses)
                     nextLexeme(); // skip the unexpected token to avoid an infinite loop
                 continue;
             }
 
-            if (FFlag::LuauBetterUserDefinedClasses && !qualifierLocation)
+            if (FFlag::LuwuBetterUserDefinedClasses && !qualifierLocation)
                 unqualifiedMemberLocations.push_back({propName->location, /* isFunction */ false});
+
+            // Luwu Classes (rfcs/classes.md): restating a primary constructor parameter's field is how
+            // an *unqualified* parameter list gets its access specifiers, but a parameter that already
+            // states its own may not be contradicted here -- reading `public text` in the header and
+            // `private text` in the body would leave neither one trustworthy.
+            if (FFlag::LuwuBetterUserDefinedClasses)
+            {
+                if (int paramIndex = findPrimaryConstructorParam(propName->name); paramIndex >= 0)
+                {
+                    const AstClassPrimaryConstructorParamQualifiers& param = primaryConstructor->argsQualifiers.data[paramIndex];
+
+                    if (qualifierLocation)
+                        paramsQualifiedInBody.insert(propName->name);
+
+                    if (param.qualifierLocation && qualifierLocation && param.visibility != visibility)
+                    {
+                        // Do not inline these into the report call: MSVC miscompiles inlined ternaries
+                        // feeding %s in Windows Debug CI (see the identical note further down).
+                        const char* declared = param.visibility == AstClassMemberVisibility::Private ? "private" : "public";
+                        const char* restated = visibility == AstClassMemberVisibility::Private ? "private" : "public";
+                        report(
+                            propName->location,
+                            "Field '%s' was explicitly marked as %s on line %d, cannot reassign it as %s",
+                            propName->name.value,
+                            declared,
+                            param.qualifierLocation->begin.line + 1,
+                            restated
+                        );
+                    }
+
+                    if (param.isConst && !isConst)
+                        report(
+                            propName->location,
+                            "Field '%s' was explicitly marked as const on line %d, cannot reassign it as mutable",
+                            propName->name.value,
+                            param.constLocation->begin.line + 1
+                        );
+                }
+            }
 
             AstType* propType = nullptr;
             std::optional<Location> typeColonLocation;
@@ -1702,7 +1994,7 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
 
             std::optional<Location> equalsLocation;
             AstExpr* defaultValue = nullptr;
-            if (FFlag::LuauBetterUserDefinedClasses && lexer.current().type == '=')
+            if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == '=')
             {
                 equalsLocation = lexer.current().location;
                 nextLexeme();
@@ -1715,16 +2007,24 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
                 static Function dummyFunction;
                 functionStack.emplace_back(dummyFunction);
 
+                // A field initializer is the only place a primary constructor's parameters are
+                // visible; they are not in scope for the class's methods.
+                unsigned int localsBegin = saveLocals();
+
+                if (primaryConstructor)
+                    pushClassPrimaryConstructorParams(primaryConstructor);
+
                 defaultValue = parseExpr();
 
+                restoreLocals(localsBegin);
                 functionStack.pop_back();
             }
 
             if (strncmp(propName->name.value, "__", 2) == 0)
-                report(propName->location, "Class properties cannot start with '__'");
+                report(propName->location, "Class fields cannot start with '__'");
 
             bool hasSemicolon = false;
-            if (FFlag::LuauBetterUserDefinedClasses && lexer.current().type == ';')
+            if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == ';')
             {
                 nextLexeme();
                 hasSemicolon = true;
@@ -1786,8 +2086,17 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
 
             if (strncmp(name.name.value, "__", 2) == 0)
             {
-                if (FFlag::LuauBetterUserDefinedClasses && name.name == "__init")
+                if (FFlag::LuwuBetterUserDefinedClasses && name.name == "__init")
                 {
+                    // The primary constructor already defines this class's `__init`.
+                    if (primaryConstructor)
+                        report(
+                            name.location,
+                            "Cannot define an '__init' constructor because this class defines a primary constructor on line %d; remove the "
+                            "primary constructor to define '__init' explicitly",
+                            primaryConstructor->argLocation.begin.line + 1
+                        );
+
                     // `__init` is not a metamethod (it applies to the class itself, not its
                     // instances), but it's a valid special method to define: it overrides the
                     // class's constructor. It must take `self` as its first parameter.
@@ -1801,7 +2110,7 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
             }
 
             bool hasSemicolon = false;
-            if (FFlag::LuauBetterUserDefinedClasses && lexer.current().type == ';')
+            if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == ';')
             {
                 // used by linter to explicitly ignore SameLineStatement with class prop decls
                 nextLexeme();
@@ -1810,7 +2119,7 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
 
             // TODO CLI-200853: We should support attributes, we do not need
             // to support them prior to the full launch.
-            if (classMemberNamespace.contains(name.name))
+            if (classMemberNamespace.contains(name.name) || primaryConstructorParams.contains(name.name))
             {
                 report(name.location, "Duplicate class member '%s'", name.name.value);
             }
@@ -1818,7 +2127,7 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
             {
                 classMemberNamespace.insert(name.name);
 
-                if (FFlag::LuauBetterUserDefinedClasses && !qualifierLocation)
+                if (FFlag::LuwuBetterUserDefinedClasses && !qualifierLocation)
                     unqualifiedMemberLocations.push_back({name.location, /* isFunction */ true});
 
                 declarations.push_back(
@@ -1836,23 +2145,77 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
         }
         else
         {
-            report(lexer.current().location, "Only class properties and functions can be declared within a class");
+            report(lexer.current().location, "Only class fields and functions can be declared within a class");
             nextLexeme(); // skip the unexpected token to avoid an infinite loop
         }
     }
 
-    if (FFlag::LuauBetterUserDefinedClasses && sawPrivateMember)
+    // Luwu Classes (rfcs/classes.md): access specifiers are all-or-nothing across a class. A class
+    // that writes none of them is entirely public, which is the POD case the RFC deliberately keeps
+    // terse; but the moment one member -- or one primary constructor parameter -- says `public` or
+    // `private`, every other member and parameter has to say which it is, so that the unqualified ones
+    // can never be mistaken for an oversight. Note the primary constructor's *own* qualifier (`class
+    // PositiveNumber private (...)`) is not a member qualifier and does not trigger any of this.
+    if (FFlag::LuwuBetterUserDefinedClasses && (sawPrivateMember || sawQualifiedParam || !explicitPublicQualifierLocations.empty()))
     {
-        for (const auto& [loc, isFunction] : unqualifiedMemberLocations)
+        if (sawPrivateMember || sawQualifiedParam)
         {
-            // Do not inline this ternary because doing so causes MSVC to miscompile in Windows Debug CI.
-            // It is some weird issue with format string %s specifically in MSVC RTC1 that will cause a segfault.
-            const char* memberKind = isFunction ? "function" : "field";
-            report(
-                loc,
-                "Class contains a 'private' member; put the 'public' or 'private' keyword in front of this %s to prevent ambiguity",
-                memberKind
-            );
+            for (const auto& [loc, isFunction] : unqualifiedMemberLocations)
+            {
+                // Do not inline these ternaries because doing so causes MSVC to miscompile in Windows Debug CI.
+                // It is some weird issue with format string %s specifically in MSVC RTC1 that will cause a segfault.
+                const char* memberKind = isFunction ? "function" : "field";
+
+                if (sawPrivateMember)
+                    report(
+                        loc,
+                        "This class contains non-public members; put the 'public' or 'private' keyword in front of this %s to prevent ambiguity",
+                        memberKind
+                    );
+                else
+                    report(
+                        loc,
+                        "This class mixes explicit and implicit 'public'; put the 'public' or 'private' keyword in front of this %s to prevent "
+                        "ambiguity",
+                        memberKind
+                    );
+            }
+        }
+        else if (!unqualifiedMemberLocations.empty())
+        {
+            // Everything qualified here is qualified `public`, which is the one case where deleting
+            // the qualifiers is as good a fix as adding the rest, so point at them instead.
+            for (const Location& loc : explicitPublicQualifierLocations)
+                report(
+                    loc,
+                    "This class mixes explicit and implicit 'public'; remove 'public' or add 'public' or 'private' to all other members to prevent "
+                    "ambiguity"
+                );
+        }
+
+        // A parameter's field is qualified either in the parameter list or by the class body member
+        // that restates it; a field qualified in neither is the same ambiguity as an unqualified
+        // member, and gets a message pointing at whichever of the two places is the natural fix.
+        if (primaryConstructor)
+        {
+            for (size_t i = 0; i < primaryConstructor->args.size; ++i)
+            {
+                AstLocal* arg = primaryConstructor->args.data[i];
+
+                if (primaryConstructor->argsQualifiers.data[i].qualifierLocation || paramsQualifiedInBody.contains(arg->name))
+                    continue;
+
+                if (sawQualifiedParam)
+                    report(arg->location, "Qualify this class field parameter as 'public' or 'private' to prevent ambiguity");
+                else
+                    report(
+                        arg->location,
+                        "Field '%s' at position %d of class field parameters must be explicitly marked as 'public' or 'private' in the class "
+                        "parameter list or the class body",
+                        arg->name.value,
+                        int(i + 1)
+                    );
+            }
         }
     }
 
@@ -1860,7 +2223,7 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
     // are treating "class" as a contextual keyword (and we must as we also)
     // plan to add a `class` library.
     Location end = lexer.current().location;
-    bool hasEnd = expectAndConsume(Lexeme::ReservedEnd, "class");
+    bool hasEnd = unterminated ? false : expectAndConsume(Lexeme::ReservedEnd, "class");
     Location location{start, end};
 
     // We only allow classes at the top level: we can make use of the
@@ -1868,7 +2231,9 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
     if (recursionCounter > 1)
         report(nameLocal->location, "Cannot declare class '%s' inside another statement or expression", nameLocal->name.value);
 
-    AstStatClass* cls = allocator.alloc<AstStatClass>(location, nameLocal, copy(declarations), exported, classKeywordLocation, generics, genericPacks);
+    AstStatClass* cls = allocator.alloc<AstStatClass>(
+        location, nameLocal, copy(declarations), exported, classKeywordLocation, generics, genericPacks, primaryConstructor
+    );
     cls->hasEnd = hasEnd;
     if (classesWithinModule.contains(nameLocal->name))
     {
@@ -1929,7 +2294,7 @@ AstDeclaredExternTypeProperty Parser::parseDeclaredExternTypeMethod(const AstArr
     AstArray<AstGenericType*> generics;
     AstArray<AstGenericTypePack*> genericPacks;
 
-    if (FFlag::LuauExternTypeGenericMethods)
+    if (FFlag::LuwuExternTypeGenericMethods)
     {
         std::tie(generics, genericPacks) = parseGenericTypeList(/* withDefaultValues= */ false);
     }
@@ -2094,7 +2459,7 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
         AstArray<AstGenericType*> classGenerics;
         AstArray<AstGenericTypePack*> classGenericPacks;
 
-        if (FFlag::LuauGenericNominals)
+        if (FFlag::LuwuGenericNominals)
         {
             std::tie(classGenerics, classGenericPacks) = parseGenericTypeList(/* withDefaultValues= */ false);
         }
@@ -2548,14 +2913,14 @@ std::pair<AstExprFunction*, AstLocal*> Parser::parseFunctionBody(
             std::tie(vararg, varargLocation, varargAnnotation) = parseBindingList(
                 args,
                 /* allowDot3= */ true,
-                /* allowDefault= */ FFlag::LuauDefaultArguments,
+                /* allowDefault= */ FFlag::LuwuDefaultArguments,
                 &cstNode->argsCommaPositions,
                 nullptr,
                 &cstNode->varargAnnotationColonPosition
             );
         else
             std::tie(vararg, varargLocation, varargAnnotation) =
-                parseBindingList(args, /* allowDot3= */ true, /* allowDefault= */ FFlag::LuauDefaultArguments);
+                parseBindingList(args, /* allowDot3= */ true, /* allowDefault= */ FFlag::LuwuDefaultArguments);
     }
 
     std::optional<Location> argLocation;
@@ -5294,6 +5659,26 @@ AstLocal* Parser::pushLocal(const Binding& binding)
     localStack.push_back(local);
 
     return local;
+}
+
+// Luwu Classes (rfcs/classes.md): bring a class's primary constructor parameters into scope for a
+// field initializer expression, the only place they are visible. Their AstLocals were created once,
+// at the depth of the synthesized `__init`, by parseClassPrimaryConstructor; this re-enters them into
+// the scope chain so restoreLocals can take them back out.
+unsigned int Parser::pushClassPrimaryConstructorParams(AstClassPrimaryConstructor* primaryConstructor)
+{
+    unsigned int localsBegin = saveLocals();
+
+    for (AstLocal* arg : primaryConstructor->args)
+    {
+        AstLocal*& local = localMap[arg->name];
+        arg->shadow = local;
+        local = arg;
+
+        localStack.push_back(arg);
+    }
+
+    return localsBegin;
 }
 
 unsigned int Parser::saveLocals()

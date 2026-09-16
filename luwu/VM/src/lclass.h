@@ -6,6 +6,14 @@
 #include "lobject.h"
 #include "lbytecode.h"
 
+// An instance's members are allocated inline, immediately after the LuauObject header, so a
+// construction costs one GC allocation rather than two. Everything that allocates, frees or
+// GC-accounts for an object must agree on this size.
+inline size_t luaR_objectsize(uint32_t nummembers)
+{
+    return sizeof(LuauObject) + size_t(nummembers) * sizeof(TValue);
+}
+
 // LuauClass::memberflags entries use LBC_CLASSMEMBER_PRIVATE / LBC_CLASSMEMBER_CONST (see
 // Luau/Bytecode.h), the same bits the compiler serializes into LBC_CONSTANT_CLASS_SHAPE.
 
@@ -35,6 +43,36 @@ LUAI_FUNC LuauClass* luaR_newclass(
  * Returns true if `cl` is `classdef`'s own `__init` closure specifically (stricter than
  * luaR_closureownsprivateaccess, which accepts any method of the class).
  */
+/**
+ * Hands `classdef` ownership of `defaults`, an array of `numberofinstancemembers` TValues holding
+ * each instance member's constant default (nil where a member has none). Set at load time from
+ * LBC_CONSTANT_CLASS_SHAPE; see LuauClass::memberdefaults.
+ */
+LUAI_FUNC void luaR_setmemberdefaults(lua_State* L, LuauClass* classdef, TValue* defaults);
+
+/**
+ * Allocates an instance of `classdef` with every member set to its constant default (or nil), ready
+ * for a constructor to apply arguments to. Does not run `__init` and does not check the GC threshold.
+ */
+LUAI_FUNC LuauObject* luaR_newobject(lua_State* L, LuauClass* classdef);
+
+// Allocates an instance without initializing its members, for a caller that is about to write every
+// one of them with nothing in between that could collect. See luaR_newobjectuninit's definition.
+LUAI_FUNC LuauObject* luaR_newobjectuninit(lua_State* L, LuauClass* classdef);
+
+/**
+ * Copies fields named by `classdef`'s instance members out of the table `arg` into `object`, leaving
+ * a member absent from the table (or explicitly nil) at whatever it already holds. This is the POD
+ * constructor's table-of-fields form, `ClassName { field = value }`.
+ */
+LUAI_FUNC void luaR_applyobjectfields(lua_State* L, LuauClass* classdef, LuauObject* object, LuaTable* arg);
+
+/**
+ * As luaR_applyobjectfields, for an argument that is not a plain table: each field is read with the
+ * generic indexing path, so an __index metamethod is honoured. May call back into Lua.
+ */
+LUAI_FUNC void luaR_applyobjectfieldsslow(lua_State* L, LuauClass* classdef, LuauObject* object, const TValue* arg);
+
 LUAI_FUNC bool luaR_closureisinit(const LuauClass* classdef, const Closure* cl);
 
 /**
@@ -54,12 +92,20 @@ LUAI_FUNC bool luaR_closureownsprivateaccess(const LuauClass* classdef, const Cl
 
 /**
  * Errors (via luaG_privateaccesserror) if the member at `offset` is private and `cl` is not one
- * of `classdef`'s own methods. `key` is only used for the error message.
+ * of `classdef`'s own methods, or (via luaG_blockedinitaccesserror) if it is an `__init` blocked by
+ * LBC_CLASSMEMBER_INITBLOCKED, whoever `cl` is. `key` is only used for the error message.
  *
  * Callers should only call this when `classdef->hasprivatemembers` is set, so that public
  * access from outside the class (the common case) costs nothing beyond that one flag check.
  */
 LUAI_FUNC void luaR_checkprivateaccess(lua_State* L, const TValue* key, const LuauClass* classdef, const Closure* cl, uint32_t offset);
+
+/**
+ * The private-constructor check construction performs: errors if `classdef`'s custom `__init` is
+ * private and `cl` is not one of `classdef`'s own methods. Unlike luaR_checkprivateaccess this ignores
+ * LBC_CLASSMEMBER_INITBLOCKED, which restricts reading `__init`, not constructing with it.
+ */
+LUAI_FUNC void luaR_checkprivateconstructor(lua_State* L, const LuauClass* classdef, const Closure* cl);
 
 /**
  * Errors (via luaG_constassignerror) if the member at `offset` is const and `cl` is not
@@ -68,6 +114,35 @@ LUAI_FUNC void luaR_checkprivateaccess(lua_State* L, const TValue* key, const Lu
  * Callers should only call this when `classdef->hasconstmembers` is set.
  */
 LUAI_FUNC void luaR_checkconstassign(lua_State* L, const TValue* key, const LuauClass* classdef, const Closure* cl, uint32_t offset);
+
+// A class with any private member sets `hasprivatemembers`, but most of its members are usually
+// public, and the accessing closure usually owns the class anyway -- so the interpreter used to make
+// an out-of-line authorization call for *every* member access on such a class. Testing the accessed
+// member's own bit here keeps that call off the common path entirely; only an actually private (or
+// const, when writing) member pays for it. Worth ~1.3ns per access, interpreted.
+LUAU_FORCEINLINE void luaR_checkprivateaccessfast(
+    lua_State* L,
+    const TValue* key,
+    const LuauClass* classdef,
+    const Closure* cl,
+    uint32_t offset
+)
+{
+    if (LUAU_UNLIKELY((classdef->memberflags[offset] & (LBC_CLASSMEMBER_PRIVATE | LBC_CLASSMEMBER_INITBLOCKED)) != 0))
+        luaR_checkprivateaccess(L, key, classdef, cl, offset);
+}
+
+LUAU_FORCEINLINE void luaR_checkconstassignfast(
+    lua_State* L,
+    const TValue* key,
+    const LuauClass* classdef,
+    const Closure* cl,
+    uint32_t offset
+)
+{
+    if (LUAU_UNLIKELY((classdef->memberflags[offset] & LBC_CLASSMEMBER_CONST) != 0))
+        luaR_checkconstassign(L, key, classdef, cl, offset);
+}
 
 /**
  * Add a new class member to `classdef` named `name` and with value `method`. As the naming implies
@@ -78,14 +153,14 @@ LUAI_FUNC void luaR_addclassmember(lua_State* L, LuauClass* classdef, TString* n
 LUAI_FUNC void luaR_freeclass(lua_State* L, LuauClass* classdef, lua_Page* page);
 
 /**
- * Callback for creating class instances. This is written as a Lua API function and expects the stack to be:
+ * Callback for creating objects. This is written as a Lua API function and expects the stack to be:
  *
  *  [ BASE ]
  *  - A class value
  *  - An optional indexable value
  *
- * This function will allocate a new class instance, iterate over the instance members of the class value,
- * initialize each class instance member with the result of indexing into the value, and then assign the
+ * This function will allocate a new object, iterate over the instance members of the class value,
+ * initialize each of the object's members with the result of indexing into the value, and then assign the
  * value to the top of the stack. If the indexable is not present, all members are initialized to `nil`.
  */
 LUAI_FUNC int luaR_createobject(lua_State* L);

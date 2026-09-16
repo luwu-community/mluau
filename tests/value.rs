@@ -281,9 +281,9 @@ fn test_value_exhaustive_match() {
         Value::UserData(_) => {}
 
         Value::Buffer(_) => {}
-        #[cfg(feature = "luau-classes")]
+        #[cfg(feature = "luwu-classes")]
         Value::Class(_) => {}
-        #[cfg(feature = "luau-classes")]
+        #[cfg(feature = "luwu-classes")]
         Value::Object(_) => {}
         Value::Other(_) => {}
     }

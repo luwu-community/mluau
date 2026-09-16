@@ -9,8 +9,8 @@
 
 LUAU_FASTFLAGVARIABLE(LuauIntegerFastcalls)
 LUAU_FASTFLAGVARIABLE(LuauIntegerBufferFastcalls)
-LUAU_FASTFLAG(LuauBufferIsFrozen)
 LUAU_FASTFLAG(DebugLuauUserDefinedClasses)
+LUAU_FASTFLAG(LuwuBufferIsFrozen)
 
 namespace Luau
 {
@@ -261,7 +261,7 @@ static int getBuiltinFunctionId(const Builtin& builtin, const CompileOptions& op
             return LBF_BUFFER_READINTEGER;
         if (FFlag::LuauIntegerFastcalls && FFlag::LuauIntegerBufferFastcalls && builtin.method == "writeinteger")
             return LBF_BUFFER_WRITEINTEGER;
-        if (FFlag::LuauBufferIsFrozen && builtin.method == "isfrozen")
+        if (FFlag::LuwuBufferIsFrozen && builtin.method == "isfrozen")
             return LBF_BUFFER_ISFROZEN;
     }
 
@@ -387,7 +387,7 @@ static int getBuiltinFunctionId(const Builtin& builtin, const CompileOptions& op
         }
     }
 
-    // Luau Classes (rfcx/classes.md): class.isinstance(value, class). Recognizing it as a fastcall
+    // Luwu Classes (rfcs/classes.md): class.isinstance(value, class). Recognizing it as a fastcall
     // turns the per-branch dispatch (`if class.isinstance(node, Foo)`) from a full call into an inline
     // object-class comparison. The FASTCALL safe-env guard falls back to the real call if `class`
     // isn't the class library, so this stays correct even when the classes feature is disabled.

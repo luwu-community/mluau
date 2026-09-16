@@ -129,6 +129,8 @@ const char* getCmdName(IrCmd cmd)
         return "GET_HASH_NODE_ADDR";
     case IrCmd::GET_CLOSURE_UPVAL_ADDR:
         return "GET_CLOSURE_UPVAL_ADDR";
+    case IrCmd::LOAD_OWNER_CLASS:
+        return "LOAD_OWNER_CLASS";
     case IrCmd::STORE_TAG:
         return "STORE_TAG";
     case IrCmd::STORE_EXTRA:
@@ -393,6 +395,12 @@ const char* getCmdName(IrCmd cmd)
         return "CHECK_OBJECT_CLASS";
     case IrCmd::TRY_OBJECT_MEMBER_ADDR:
         return "TRY_OBJECT_MEMBER_ADDR";
+    case IrCmd::OBJECT_MEMBER_ADDR:
+        return "OBJECT_MEMBER_ADDR";
+    case IrCmd::CHECK_CLASS_FIELDS_CONSTRUCTIBLE:
+        return "CHECK_CLASS_FIELDS_CONSTRUCTIBLE";
+    case IrCmd::NEW_OBJECT:
+        return "NEW_OBJECT";
     case IrCmd::TRY_OBJECT_NAMECALL_ADDR:
         return "TRY_OBJECT_NAMECALL_ADDR";
     case IrCmd::TRY_CLASS_MEMBER_ADDR:
@@ -459,6 +467,10 @@ const char* getCmdName(IrCmd cmd)
         return "FALLBACK_DUPCLOSURE";
     case IrCmd::FALLBACK_FORGPREP:
         return "FALLBACK_FORGPREP";
+    case IrCmd::FALLBACK_NEWOBJECT:
+        return "FALLBACK_NEWOBJECT";
+    case IrCmd::FALLBACK_NEWCLASSMEMBER:
+        return "FALLBACK_NEWCLASSMEMBER";
     case IrCmd::SUBSTITUTE:
         return "SUBSTITUTE";
     case IrCmd::MARK_USED:

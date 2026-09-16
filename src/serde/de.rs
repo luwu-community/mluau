@@ -213,7 +213,7 @@ impl<'de> serde::Deserializer<'de> for Deserializer {
                     visitor.visit_unit()
                 }
             }
-            #[cfg(any(feature = "luau-classes", doc))]
+            #[cfg(any(feature = "luwu-classes", doc))]
             Value::Class(_) | Value::Object(_) => {
                 if self.options.deny_unsupported_types {
                     let msg = format!("unsupported value type `{}`", self.value.type_name());

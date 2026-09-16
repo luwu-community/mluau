@@ -1028,6 +1028,7 @@ void BytecodeBuilder::writeClassShape(std::string& ss, const ClassShape& cs) con
 {
     LUAU_ASSERT(cs.propertyFlags.size() == cs.propertyNames.size());
     LUAU_ASSERT(cs.methodFlags.size() == cs.methodNames.size());
+    LUAU_ASSERT(cs.propertyDefaults.empty() || cs.propertyDefaults.size() == cs.propertyNames.size());
 
     writeVarInt(ss, cs.className);
     writeVarInt(ss, cs.propertyNames.size());
@@ -1038,6 +1039,11 @@ void BytecodeBuilder::writeClassShape(std::string& ss, const ClassShape& cs) con
     {
         writeVarInt(ss, cs.propertyNames[i]);
         writeVarInt(ss, cs.propertyFlags[i]);
+
+        // a constant default is stored with the member itself, so the reader can copy it into the
+        // class and skip the `__defaults` closure entirely
+        if (cs.propertyFlags[i] & LBC_CLASSMEMBER_CONSTDEFAULT)
+            writeVarInt(ss, cs.propertyDefaults[i]);
     }
     for (size_t i = 0; i < cs.methodNames.size(); i++)
     {
@@ -1962,14 +1968,29 @@ void BytecodeBuilder::validateInstructions() const
 
         case LOP_CHECKSELFCLASS:
             VREG(LUAU_INSN_A(insn));
-            VREG(LUAU_INSN_B(insn));
-            VJUMP(LUAU_INSN_C(insn));
+            // operand B is LBC_SELFCLASS_OWNER (the class comes from Proto::ownerclass) or a register
+            if (LUAU_INSN_B(insn) != LBC_SELFCLASS_OWNER)
+                VREG(LUAU_INSN_B(insn));
+            VCONST(insns[i + 1], String);
             break;
 
         case LOP_JUMPXISA:
             VREG(LUAU_INSN_A(insn));
             VJUMP(LUAU_INSN_D(insn));
             VREG(insns[i + 1] & 0xff); // class register lives in the low byte of aux
+            break;
+
+        case LOP_GETOBJECTMEMBER:
+        case LOP_SETOBJECTMEMBER:
+            VREG(LUAU_INSN_A(insn));
+            VREG(LUAU_INSN_B(insn));
+            break;
+
+        case LOP_NEWOBJECT:
+            // with a user __init the instruction lays out `__init`, `self` and the arguments above A;
+            // the other forms use one register per argument or per field
+            VREG(LUAU_INSN_A(insn) + (LUAU_INSN_C(insn) == 1 ? 2 : 0) + insns[i + 1]);
+            VREG(LUAU_INSN_B(insn));
             break;
 
         default:
@@ -2743,12 +2764,40 @@ void BytecodeBuilder::dumpInstruction(const uint32_t* code, std::string& result,
         break;
 
     case LOP_CHECKSELFCLASS:
-        formatAppend(result, "CHECKSELFCLASS R%d R%d L%d\n", LUAU_INSN_A(insn), LUAU_INSN_B(insn), targetLabel);
+        if (LUAU_INSN_B(insn) == LBC_SELFCLASS_OWNER)
+            formatAppend(result, "CHECKSELFCLASS R%d OWNER K%d [", LUAU_INSN_A(insn), *code);
+        else
+            formatAppend(result, "CHECKSELFCLASS R%d R%d K%d [", LUAU_INSN_A(insn), LUAU_INSN_B(insn), *code);
+        dumpConstant(result, int(*code++), false);
+        formatAppend(result, "]%s\n", LUAU_INSN_C(insn) ? " SELF" : "");
         break;
 
     case LOP_JUMPXISA:
-        formatAppend(result, "JUMPXISA R%d R%d L%d%s\n", LUAU_INSN_A(insn), *code & 0xff, targetLabel, (*code >> 31) ? "" : " NOT");
+        formatAppend(
+            result,
+            "JUMPXISA R%d R%d L%d%s%s\n",
+            LUAU_INSN_A(insn),
+            *code & 0xff,
+            targetLabel,
+            (*code >> 31) ? "" : " NOT",
+            (*code & LBC_JUMPXISA_CHECKCLASS) ? " CHECKCLASS" : ""
+        );
         break;
+
+    case LOP_GETOBJECTMEMBER:
+        formatAppend(result, "GETOBJECTMEMBER R%d R%d %d\n", LUAU_INSN_A(insn), LUAU_INSN_B(insn), *code++);
+        break;
+
+    case LOP_SETOBJECTMEMBER:
+        formatAppend(result, "SETOBJECTMEMBER R%d R%d %d\n", LUAU_INSN_A(insn), LUAU_INSN_B(insn), *code++);
+        break;
+
+    case LOP_NEWOBJECT:
+    {
+        const char* form = LUAU_INSN_C(insn) == 1 ? " INIT" : (LUAU_INSN_C(insn) == 2 ? " FIELDS" : "");
+        formatAppend(result, "NEWOBJECT R%d R%d %d%s\n", LUAU_INSN_A(insn), LUAU_INSN_B(insn), *code++, form);
+        break;
+    }
 
     default:
         LUAU_ASSERT(!"Unsupported opcode");

@@ -71,12 +71,12 @@ pub enum Value {
     /// A Luau buffer.
     Buffer(crate::Buffer),
     /// A Luau class (the "blueprint" produced by a `class ... end` declaration).
-    #[cfg(any(feature = "luau-classes", doc))]
-    #[cfg_attr(docsrs, doc(cfg(feature = "luau-classes")))]
+    #[cfg(any(feature = "luwu-classes", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luwu-classes")))]
     Class(crate::Class),
     /// An instance of a Luau [`Class`](crate::Class).
-    #[cfg(any(feature = "luau-classes", doc))]
-    #[cfg_attr(docsrs, doc(cfg(feature = "luau-classes")))]
+    #[cfg(any(feature = "luwu-classes", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luwu-classes")))]
     Object(crate::Object),
     /// Any other value not known to mlua (eg. LuaJIT CData).
     Other(#[doc(hidden)] ValueRef),
@@ -107,9 +107,9 @@ impl Value {
 
             Value::Buffer(_) => "buffer",
 
-            #[cfg(any(feature = "luau-classes", doc))]
+            #[cfg(any(feature = "luwu-classes", doc))]
             Value::Class(_) => "class",
-            #[cfg(any(feature = "luau-classes", doc))]
+            #[cfg(any(feature = "luwu-classes", doc))]
             Value::Object(_) => "object",
             Value::Other(_) => "other",
         }
@@ -163,7 +163,7 @@ impl Value {
 
             Value::Buffer(crate::Buffer(vref)) => vref.to_pointer(),
 
-            #[cfg(any(feature = "luau-classes", doc))]
+            #[cfg(any(feature = "luwu-classes", doc))]
             Value::Class(crate::Class(vref)) | Value::Object(crate::Object(vref)) => vref.to_pointer(),
             _ => ptr::null(),
         }
@@ -208,7 +208,7 @@ impl Value {
 
             Value::Buffer(crate::Buffer(vref)) => unsafe { invoke_to_string(vref) },
 
-            #[cfg(any(feature = "luau-classes", doc))]
+            #[cfg(any(feature = "luwu-classes", doc))]
             Value::Class(crate::Class(vref)) | Value::Object(crate::Object(vref)) => unsafe {
                 invoke_to_string(vref)
             },
@@ -500,8 +500,8 @@ impl Value {
     /// If the value is a [`Class`], returns it or `None` otherwise.
     ///
     /// [`Class`]: crate::Class
-    #[cfg(any(feature = "luau-classes", doc))]
-    #[cfg_attr(docsrs, doc(cfg(feature = "luau-classes")))]
+    #[cfg(any(feature = "luwu-classes", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luwu-classes")))]
     #[inline]
     pub fn as_class(&self) -> Option<&crate::Class> {
         match self {
@@ -513,8 +513,8 @@ impl Value {
     /// Returns `true` if the value is a [`Class`].
     ///
     /// [`Class`]: crate::Class
-    #[cfg(any(feature = "luau-classes", doc))]
-    #[cfg_attr(docsrs, doc(cfg(feature = "luau-classes")))]
+    #[cfg(any(feature = "luwu-classes", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luwu-classes")))]
     #[inline]
     pub fn is_class(&self) -> bool {
         self.as_class().is_some()
@@ -525,8 +525,8 @@ impl Value {
     /// If the value is an [`Object`], returns it or `None` otherwise.
     ///
     /// [`Object`]: crate::Object
-    #[cfg(any(feature = "luau-classes", doc))]
-    #[cfg_attr(docsrs, doc(cfg(feature = "luau-classes")))]
+    #[cfg(any(feature = "luwu-classes", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luwu-classes")))]
     #[inline]
     pub fn as_object(&self) -> Option<&crate::Object> {
         match self {
@@ -538,8 +538,8 @@ impl Value {
     /// Returns `true` if the value is an [`Object`].
     ///
     /// [`Object`]: crate::Object
-    #[cfg(any(feature = "luau-classes", doc))]
-    #[cfg_attr(docsrs, doc(cfg(feature = "luau-classes")))]
+    #[cfg(any(feature = "luwu-classes", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luwu-classes")))]
     #[inline]
     pub fn is_object(&self) -> bool {
         self.as_object().is_some()
@@ -644,11 +644,11 @@ impl Value {
             // Classes have no metatable at all (unlike objects), so `__tostring` never applies
             // and `luaL_tolstring`'s default is just "class: 0x...' -- skip the round-trip call
             // and format the pointer directly.
-            #[cfg(any(feature = "luau-classes", doc))]
+            #[cfg(any(feature = "luwu-classes", doc))]
             c @ Value::Class(_) => write!(fmt, "class: {:?}", c.to_pointer()),
             // Unlike classes, objects get their class's `instancemetatable`, so they can define
             // `__tostring` -- fall back to the default (pointer-only) format if they don't.
-            #[cfg(any(feature = "luau-classes", doc))]
+            #[cfg(any(feature = "luwu-classes", doc))]
             o @ Value::Object(_) => {
                 let s = o
                     .to_string()
@@ -686,9 +686,9 @@ impl fmt::Debug for Value {
 
             Value::Buffer(buf) => write!(fmt, "{buf:?}"),
 
-            #[cfg(any(feature = "luau-classes", doc))]
+            #[cfg(any(feature = "luwu-classes", doc))]
             Value::Class(c) => write!(fmt, "{c:?}"),
-            #[cfg(any(feature = "luau-classes", doc))]
+            #[cfg(any(feature = "luwu-classes", doc))]
             Value::Object(o) => write!(fmt, "{o:?}"),
             Value::Other(v) => write!(fmt, "Other({v:?})"),
         }
@@ -718,9 +718,9 @@ impl PartialEq for Value {
 
             (Value::Buffer(a), Value::Buffer(b)) => a == b,
 
-            #[cfg(any(feature = "luau-classes", doc))]
+            #[cfg(any(feature = "luwu-classes", doc))]
             (Value::Class(a), Value::Class(b)) => a == b,
-            #[cfg(any(feature = "luau-classes", doc))]
+            #[cfg(any(feature = "luwu-classes", doc))]
             (Value::Object(a), Value::Object(b)) => a == b,
             _ => false,
         }
@@ -857,7 +857,7 @@ impl Serialize for SerializableValue<'_> {
                     serializer.serialize_unit()
                 }
             }
-            #[cfg(any(feature = "luau-classes", doc))]
+            #[cfg(any(feature = "luwu-classes", doc))]
             Value::Class(_) | Value::Object(_) => {
                 if self.options.deny_unsupported_types {
                     let msg = format!("cannot serialize <{}>", self.value.type_name());

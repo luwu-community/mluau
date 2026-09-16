@@ -68,6 +68,7 @@ inline bool isNonTerminatingJump(IrCmd cmd)
     case IrCmd::CHECK_NODE_NO_NEXT:
     case IrCmd::CHECK_NODE_VALUE:
     case IrCmd::CHECK_OBJECT_CLASS:
+    case IrCmd::CHECK_CLASS_FIELDS_CONSTRUCTIBLE:
     case IrCmd::TRY_OBJECT_MEMBER_ADDR:
     case IrCmd::TRY_CLASS_MEMBER_ADDR:
     case IrCmd::TRY_OBJECT_NAMECALL_ADDR:
@@ -108,6 +109,8 @@ inline bool canInvalidateSafeEnv(IrCmd cmd)
     case IrCmd::FALLBACK_SETTABLEKS:
     case IrCmd::FALLBACK_NAMECALL:
     case IrCmd::FALLBACK_FORGPREP:
+    case IrCmd::FALLBACK_NEWOBJECT:
+    case IrCmd::FALLBACK_NEWCLASSMEMBER:
         return true;
     default:
         break;
