@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/BytecodeAnalysis.h"
 
 #include "Luau/CodeGenOptions.h"
@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <array>
 
-LUAU_FASTFLAG(DebugLuauUserDefinedClassesRuntime)
+LUAU_FASTFLAG(LuwuClasses)
 
 namespace Luau
 {
@@ -175,24 +175,6 @@ static BytecodeRegTypeInfo* findRegType(BytecodeTypeInfo& info, uint8_t reg, int
     }
 
     return nullptr;
-}
-
-static void refineRegType(BytecodeTypeInfo& info, uint8_t reg, int pc, uint8_t ty)
-{
-    if (ty != LBC_TYPE_ANY)
-    {
-        if (BytecodeRegTypeInfo* regType = findRegType(info, reg, pc))
-        {
-            // Right now, we only refine register types that were unknown
-            if (regType->type == LBC_TYPE_ANY)
-                regType->type = ty;
-        }
-        else if (reg < info.argumentTypes.size())
-        {
-            if (info.argumentTypes[reg] == LBC_TYPE_ANY)
-                info.argumentTypes[reg] = ty;
-        }
-    }
 }
 
 static void refineUpvalueType(BytecodeTypeInfo& info, int up, uint8_t ty)
@@ -782,13 +764,16 @@ uint8_t getRegTag(std::array<uint8_t, 256>& regTags, BytecodeTypeInfo& bcTypeInf
     return regTags[reg];
 }
 
-// Luwu Classes (rfcs/classes.md): for each bytecode block, the register that a `class.isinstance(x, C)`
-// branch into it proves holds an object, or -1. Recognizes the fused form
-// (`JUMPXISA x ...`, with or without CHECKCLASS) and the unfused builtin form (`FASTCALL2 isinstance x C`,
-// `CALL`, then `JUMPIF`/`JUMPIFNOT` on its result). Only a block whose single predecessor is that branch
-// qualifies. The result is a type hint like any other: codegen guards the tag, so a wrong hint costs a VM
-// exit, never correctness -- it just lets field accesses and method calls on `x` take the object path
-// directly instead of missing the table path first.
+// Luwu Classes (rfcs/classes): finds registers that a `class.isinstance(x, C)` branch proves hold
+// an object. For each bytecode block, the result is the register `x` if the block is entered through
+// such a branch, or -1. Only a block whose single predecessor is that branch qualifies.
+//
+// Two shapes are recognized: the fused `JUMPXISA x ...` (with or without CHECKCLASS), and the unfused
+// builtin call (`FASTCALL2 isinstance x C`, `CALL`, then `JUMPIF`/`JUMPIFNOT` on its result).
+//
+// The result is a type hint like any other. Codegen still guards the tag, so a wrong hint costs a VM
+// exit and never correctness. A right one lets field accesses and method calls on `x` go straight to
+// the object path instead of missing the table path first.
 static std::vector<int> findIsinstanceProvenObjectRegs(const IrFunction& function)
 {
     Proto* proto = function.proto;
@@ -877,23 +862,24 @@ static std::vector<int> findIsinstanceProvenObjectRegs(const IrFunction& functio
     return provenReg;
 }
 
-void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
+// One pass of local type tracking over every block, filling in function.bcTypes from scratch. `callResultTypes`
+// receives, per CALL pc, the type of the first result when a FASTCALL or a namecall hook knows it.
+static void analyzeBytecodeTypesPass(
+    IrFunction& function,
+    const HostIrHooks& hostHooks,
+    const std::vector<int>& isinstanceProvenRegs,
+    std::vector<uint8_t>& callResultTypes
+)
 {
     Proto* proto = function.proto;
-    CODEGEN_ASSERT(proto);
-
-    std::vector<int> isinstanceProvenRegs =
-        FFlag::DebugLuauUserDefinedClassesRuntime ? findIsinstanceProvenObjectRegs(function) : std::vector<int>();
-
     BytecodeTypeInfo& bcTypeInfo = function.bcTypeInfo;
-
-    prepareRegTypeInfoLookups(bcTypeInfo);
 
     // Setup our current knowledge of type tags based on arguments
     std::array<uint8_t, 256> regTags{};
     regTags.fill(LBC_TYPE_ANY);
 
-    function.bcTypes.resize(proto->sizecode);
+    function.bcTypes.assign(proto->sizecode, BytecodeTypes{});
+    callResultTypes.assign(proto->sizecode, LBC_TYPE_ANY);
 
     // Now that we have VM basic blocks, we can attempt to track register type tags locally
     for (const BytecodeBlock& block : function.bcBlocks)
@@ -943,8 +929,6 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 int ra = LUAU_INSN_A(*pc);
                 regTags[ra] = LBC_TYPE_BOOLEAN;
                 bcType.result = regTags[ra];
-
-                refineRegType(bcTypeInfo, ra, i, bcType.result);
                 break;
             }
             case LOP_LOADN:
@@ -952,8 +936,6 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 int ra = LUAU_INSN_A(*pc);
                 regTags[ra] = LBC_TYPE_NUMBER;
                 bcType.result = regTags[ra];
-
-                refineRegType(bcTypeInfo, ra, i, bcType.result);
                 break;
             }
             case LOP_LOADK:
@@ -963,8 +945,6 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 bcType.a = getBytecodeConstantTag(proto, kb);
                 regTags[ra] = bcType.a;
                 bcType.result = regTags[ra];
-
-                refineRegType(bcTypeInfo, ra, i, bcType.result);
                 break;
             }
             case LOP_LOADKX:
@@ -974,8 +954,6 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 bcType.a = getBytecodeConstantTag(proto, kb);
                 regTags[ra] = bcType.a;
                 bcType.result = regTags[ra];
-
-                refineRegType(bcTypeInfo, ra, i, bcType.result);
                 break;
             }
             case LOP_MOVE:
@@ -985,8 +963,6 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 bcType.a = getRegTag(regTags, bcTypeInfo, rb, i);
                 regTags[ra] = bcType.a;
                 bcType.result = regTags[ra];
-
-                refineRegType(bcTypeInfo, ra, i, bcType.result);
                 break;
             }
             case LOP_GETTABLE:
@@ -1353,8 +1329,7 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 regTags[ra + 2] = bcType.b;
                 regTags[ra + 3] = bcType.c;
                 regTags[ra] = bcType.result;
-
-                refineRegType(bcTypeInfo, ra, i, bcType.result);
+                callResultTypes[i + skip + 1] = bcType.result;
 
                 // Fastcall failure fallback is skipped from result propagation
                 i += skip;
@@ -1374,8 +1349,7 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
 
                 regTags[LUAU_INSN_B(*pc)] = bcType.a;
                 regTags[ra] = bcType.result;
-
-                refineRegType(bcTypeInfo, ra, i, bcType.result);
+                callResultTypes[i + skip + 1] = bcType.result;
 
                 // Fastcall failure fallback is skipped from result propagation
                 i += skip;
@@ -1395,8 +1369,7 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 regTags[LUAU_INSN_B(*pc)] = bcType.a;
                 regTags[int(pc[1])] = bcType.b;
                 regTags[ra] = bcType.result;
-
-                refineRegType(bcTypeInfo, ra, i, bcType.result);
+                callResultTypes[i + skip + 1] = bcType.result;
 
                 // Fastcall failure fallback is skipped from result propagation
                 i += skip;
@@ -1418,8 +1391,7 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 regTags[LUAU_INSN_AUX_A(aux)] = bcType.b;
                 regTags[LUAU_INSN_AUX_B(aux)] = bcType.c;
                 regTags[ra] = bcType.result;
-
-                refineRegType(bcTypeInfo, ra, i, bcType.result);
+                callResultTypes[i + skip + 1] = bcType.result;
 
                 // Fastcall failure fallback is skipped from result propagation
                 i += skip;
@@ -1433,9 +1405,6 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 regTags[ra + 1] = LBC_TYPE_NUMBER;
                 regTags[ra + 2] = LBC_TYPE_NUMBER;
 
-                refineRegType(bcTypeInfo, ra, i, regTags[ra]);
-                refineRegType(bcTypeInfo, ra + 1, i, regTags[ra + 1]);
-                refineRegType(bcTypeInfo, ra + 2, i, regTags[ra + 2]);
                 break;
             }
             case LOP_FORNLOOP:
@@ -1502,9 +1471,8 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                     knownNextCallResult = LBC_TYPE_ANY;
 
                     regTags[ra] = bcType.result;
+                    callResultTypes[i] = bcType.result;
                 }
-
-                refineRegType(bcTypeInfo, ra, i, bcType.result);
                 break;
             }
             case LOP_GETUPVAL:
@@ -1584,7 +1552,9 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 bcType.a = getRegTag(regTags, bcTypeInfo, rb, i);
                 bcType.b = getRegTag(regTags, bcTypeInfo, rc, i);
 
-                regTags[ra] = LBC_TYPE_ANY;
+                // Luwu: the result is one of the operands, so operands of one type give that type (upstream: any).
+                // A local reassigned `x = x or default` keeps its type this way (see updateLocalTypeCandidates).
+                regTags[ra] = bcType.a == bcType.b ? bcType.a : uint8_t(LBC_TYPE_ANY);
                 bcType.result = regTags[ra];
                 break;
             }
@@ -1598,7 +1568,8 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 bcType.a = getRegTag(regTags, bcTypeInfo, rb, i);
                 bcType.b = getBytecodeConstantTag(proto, kc);
 
-                regTags[ra] = LBC_TYPE_ANY;
+                // Luwu: see LOP_AND/LOP_OR
+                regTags[ra] = bcType.a == bcType.b ? bcType.a : uint8_t(LBC_TYPE_ANY);
                 bcType.result = regTags[ra];
                 break;
             }
@@ -1619,10 +1590,30 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
             case LOP_NEWCLASSMEMBER:
             case LOP_CHECKSELFCLASS:
             case LOP_JUMPXISA:
-            case LOP_NEWOBJECT:
-            case LOP_GETOBJECTMEMBER:
             case LOP_SETOBJECTMEMBER:
                 break;
+            case LOP_GETOBJECTMEMBER:
+            {
+                // Luwu Classes (rfcs/classes): the member's type is unknown here, like GETTABLEKS's result
+                int ra = LUAU_INSN_A(*pc);
+                int rb = LUAU_INSN_B(*pc);
+
+                bcType.a = getRegTag(regTags, bcTypeInfo, rb, i);
+
+                regTags[ra] = LBC_TYPE_ANY;
+                bcType.result = regTags[ra];
+                break;
+            }
+            case LOP_NEWOBJECT:
+            {
+                // Luwu Classes (rfcs/classes): every form leaves the new object in A (the INIT form's
+                // `__init` frame above it is consumed by the CALL that follows)
+                int ra = LUAU_INSN_A(*pc);
+
+                regTags[ra] = LBC_TYPE_OBJECT;
+                bcType.result = regTags[ra];
+                break;
+            }
             default:
                 CODEGEN_ASSERT(!"Unknown instruction");
             }
@@ -1630,6 +1621,224 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
             i += getOpLength(op);
         }
     }
+}
+
+// Calls `visit(reg, type)` for every register the instruction at `pc` writes, with the type the value written
+// is known to have (LBC_TYPE_ANY when unknown). A register captured by reference counts as written with an
+// unknown type too: the closure can assign it while the local is live.
+template<typename F>
+static void visitBytecodeRegWrites(const IrFunction& function, const std::vector<uint8_t>& callResultTypes, int pc, F&& visit)
+{
+    const Proto* proto = function.proto;
+    const Instruction* code = &proto->code[pc];
+    LuauOpcode op = LuauOpcode(LUAU_INSN_OP(*code));
+    int ra = LUAU_INSN_A(*code);
+
+    auto visitRange = [&](int first, int count)
+    {
+        for (int reg = first; reg < first + count && reg < proto->maxstacksize; reg++)
+            visit(reg, uint8_t(LBC_TYPE_ANY));
+    };
+
+    switch (int(op))
+    {
+    case LOP_LOADNIL:
+    case LOP_LOADB:
+    case LOP_LOADN:
+    case LOP_LOADK:
+    case LOP_LOADKX:
+    case LOP_MOVE:
+    case LOP_GETGLOBAL:
+    case LOP_GETUPVAL:
+    case LOP_GETIMPORT:
+    case LOP_GETTABLE:
+    case LOP_GETTABLEKS:
+    case LOP_GETTABLEN:
+    case LOP_GETUDATAKS:
+    case LOP_NEWCLOSURE:
+    case LOP_DUPCLOSURE:
+    case LOP_NEWTABLE:
+    case LOP_DUPTABLE:
+    case LOP_ADD:
+    case LOP_SUB:
+    case LOP_MUL:
+    case LOP_DIV:
+    case LOP_IDIV:
+    case LOP_MOD:
+    case LOP_POW:
+    case LOP_ADDK:
+    case LOP_SUBK:
+    case LOP_MULK:
+    case LOP_DIVK:
+    case LOP_IDIVK:
+    case LOP_MODK:
+    case LOP_POWK:
+    case LOP_SUBRK:
+    case LOP_DIVRK:
+    case LOP_AND:
+    case LOP_OR:
+    case LOP_ANDK:
+    case LOP_ORK:
+    case LOP_CONCAT:
+    case LOP_NOT:
+    case LOP_MINUS:
+    case LOP_LENGTH:
+    case LOP_GETOBJECTMEMBER:
+        visit(ra, function.bcTypes[pc].result);
+        break;
+    case LOP_NEWOBJECT:
+        visit(ra, function.bcTypes[pc].result);
+        if (LUAU_INSN_C(*code) == LBC_NEWOBJECT_INIT)
+            visitRange(ra + 1, 2);
+        break;
+    case LOP_NAMECALL:
+    case LOP_NAMECALLUDATA:
+        visitRange(ra, 2);
+        break;
+    case LOP_CALL:
+    case LOP_CALLFB:
+    {
+        int results = LUAU_INSN_C(*code) - 1;
+
+        visit(ra, callResultTypes[pc]);
+        visitRange(ra + 1, results < 0 ? proto->maxstacksize : results - 1);
+        break;
+    }
+    case LOP_GETVARARGS:
+    {
+        int results = LUAU_INSN_B(*code) - 1;
+        visitRange(ra, results < 0 ? proto->maxstacksize : results);
+        break;
+    }
+    case LOP_FORNPREP:
+        visit(ra, uint8_t(LBC_TYPE_NUMBER));
+        visit(ra + 1, uint8_t(LBC_TYPE_NUMBER));
+        visit(ra + 2, uint8_t(LBC_TYPE_NUMBER));
+        break;
+    case LOP_FORNLOOP:
+        visit(ra + 2, uint8_t(LBC_TYPE_NUMBER));
+        break;
+    case LOP_FORGPREP:
+    case LOP_FORGPREP_NEXT:
+    case LOP_FORGPREP_INEXT:
+        visitRange(ra, 3);
+        break;
+    case LOP_FORGLOOP:
+        // the iteration state in A+2, then one register per loop variable
+        visitRange(ra + 2, 1 + int(code[1] & 0xff));
+        break;
+    case LOP_CAPTURE:
+        if (LUAU_INSN_A(*code) == LCT_REF)
+            visit(LUAU_INSN_B(*code), uint8_t(LBC_TYPE_ANY));
+        break;
+    default:
+        // everything else writes no register (stores, jumps, returns, SETLIST, fastcalls, class members...)
+        break;
+    }
+}
+
+enum class LocalTypeCandidate : uint8_t
+{
+    Untried,
+    Assumed,
+    Dropped,
+};
+
+// Luwu: gives each local whose declared type is unknown the type that every write to its register within the
+// local's live range agrees on.
+//
+// Upstream refines a local's range from the first typed write it meets in the pass (a MOVE, a constant load,
+// a fastcall result), and a parameter's type from any write to its register. The type then holds for the
+// whole range, so `local t = self; t = self.nxt; return t.x` guards `t.x` as an object while `t` holds
+// whatever `self.nxt` is, and the guard exits to the VM on every call. Luwu refines only when all writes
+// agree, and never refines a parameter from a write in the body (its incoming value is unknown). A local
+// reassigned values of one type keeps it; this is a type hint either way, so runtime results are unchanged.
+//
+// The join is optimistic: a type the typed writes agree on is assumed while the next pass runs (so
+// `x = x + 1` can prove `x` stays a number), and dropped for good if any write then disagrees. Each local is
+// assumed at most once and dropped at most once, so the passes terminate. Returns whether anything changed.
+static bool updateLocalTypeCandidates(
+    IrFunction& function,
+    const std::vector<uint8_t>& callResultTypes,
+    std::vector<LocalTypeCandidate>& state
+)
+{
+    constexpr uint8_t kNoWrite = 0xff;
+
+    BytecodeTypeInfo& bcTypeInfo = function.bcTypeInfo;
+
+    // per local: the join of its typed writes, and whether every write (typed or not) produced that type
+    std::vector<uint8_t> typedJoin(bcTypeInfo.regTypes.size(), kNoWrite);
+    std::vector<bool> untypedWrite(bcTypeInfo.regTypes.size(), false);
+
+    for (int pc = 0; pc < function.proto->sizecode; pc += getOpLength(LuauOpcode(LUAU_INSN_OP(function.proto->code[pc]))))
+    {
+        visitBytecodeRegWrites(
+            function,
+            callResultTypes,
+            pc,
+            [&](int reg, uint8_t type)
+            {
+                BytecodeRegTypeInfo* regType = findRegType(bcTypeInfo, uint8_t(reg), pc);
+                if (!regType)
+                    return;
+
+                size_t index = regType - bcTypeInfo.regTypes.data();
+
+                if (type == LBC_TYPE_ANY)
+                    untypedWrite[index] = true;
+                else if (typedJoin[index] == kNoWrite || typedJoin[index] == type)
+                    typedJoin[index] = type;
+                else
+                    typedJoin[index] = LBC_TYPE_ANY;
+            }
+        );
+    }
+
+    bool changed = false;
+
+    for (size_t i = 0; i < state.size(); i++)
+    {
+        BytecodeRegTypeInfo& regType = bcTypeInfo.regTypes[i];
+        bool typedWritesAgree = typedJoin[i] != kNoWrite && typedJoin[i] != LBC_TYPE_ANY;
+
+        if (state[i] == LocalTypeCandidate::Untried && regType.type == LBC_TYPE_ANY && typedWritesAgree)
+        {
+            state[i] = LocalTypeCandidate::Assumed;
+            regType.type = typedJoin[i];
+            changed = true;
+        }
+        else if (state[i] == LocalTypeCandidate::Assumed && (untypedWrite[i] || typedJoin[i] != regType.type))
+        {
+            // an assumed local was declared `any`, which is what it goes back to
+            state[i] = LocalTypeCandidate::Dropped;
+            regType.type = LBC_TYPE_ANY;
+            changed = true;
+        }
+    }
+
+    return changed;
+}
+
+void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
+{
+    Proto* proto = function.proto;
+    CODEGEN_ASSERT(proto);
+
+    std::vector<int> isinstanceProvenRegs =
+        FFlag::LuwuClasses ? findIsinstanceProvenObjectRegs(function) : std::vector<int>();
+
+    BytecodeTypeInfo& bcTypeInfo = function.bcTypeInfo;
+
+    prepareRegTypeInfoLookups(bcTypeInfo);
+
+    std::vector<uint8_t> callResultTypes;
+    std::vector<LocalTypeCandidate> state(bcTypeInfo.regTypes.size(), LocalTypeCandidate::Untried);
+
+    // the last pass runs under assumptions every write confirmed
+    do
+        analyzeBytecodeTypesPass(function, hostHooks, isinstanceProvenRegs, callResultTypes);
+    while (updateLocalTypeCandidates(function, callResultTypes, state));
 }
 
 } // namespace CodeGen

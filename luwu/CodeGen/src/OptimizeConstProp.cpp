@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/OptimizeConstProp.h"
 
 #include "Luau/DenseHash.h"
@@ -286,6 +286,7 @@ struct ConstPropState
 
         hashValueCache.clear();
         arrayValueCache.clear();
+        objectValueCache.clear();
 
         // While other map clears already prevent instValue keys from matching again, this saves memory and map size
         instValue.clear();
@@ -1266,13 +1267,15 @@ struct ConstPropState
         }
         else if (targetAddr.cmd == IrCmd::TRY_OBJECT_MEMBER_ADDR || targetAddr.cmd == IrCmd::OBJECT_MEMBER_ADDR)
         {
-            // A write to one member can't affect a cached load of a different member, but the same
-            // member of a possibly-aliasing object must be invalidated. Which operand identifies the
-            // member differs: TRY_OBJECT_MEMBER_ADDR is keyed by name constant (OP_C), while
-            // OBJECT_MEMBER_ADDR is keyed by the constant offset (OP_B). A cached load through one form
-            // is only compared against a write through the same form, and a write through the other form
-            // invalidates it outright: one function can reach the same object through both (a proven
-            // `class.isinstance` local next to an untyped receiver, or a freshly constructed object).
+            // A write to one member can't change a cached load of a different member. It does
+            // invalidate cached loads of the same member on any object that might alias this one.
+            //
+            // The two address forms identify a member differently: TRY_OBJECT_MEMBER_ADDR by its name
+            // constant (OP_C), and OBJECT_MEMBER_ADDR by its constant offset (OP_B). So a cached load is
+            // compared only against a write through the same form. A write through the other form
+            // invalidates it unconditionally, because one function can reach the same object through
+            // both forms. Examples: a local proven by `class.isinstance` next to an untyped receiver, or
+            // a freshly constructed object.
             for (auto& [pointerIdx, loadedValueIdx] : objectValueCache)
             {
                 IrInst& address = function.instructions[pointerIdx];
@@ -1446,9 +1449,13 @@ struct ConstPropState
     std::vector<NumberedInstruction> getSlotNodeCache; // Additionally, pcpos argument might be different
     std::vector<NodeSlotState> checkSlotMatchCache;    // Additionally, fallback block argument might be different
 
-    // Luwu Classes object member access (rfcs/classes.md). TRY_OBJECT_MEMBER_ADDR is a fused
-    // guard+address op, so we CSE the address directly. pcpos (OP_B) and fallback (OP_D) may differ;
-    // write bit (OP_E) is tracked so a read may reuse a dominating write's guard, but not vice versa.
+    // Luwu Classes (rfcs/classes): earlier TRY_OBJECT_MEMBER_ADDR instructions, for reuse. The
+    // instruction both checks the member and computes its address, so a repeat on the same object
+    // (OP_A) and member name (OP_C) is replaced by the earlier result. The two may have a different
+    // pcpos (OP_B) and fallback (OP_D).
+    //
+    // A write's check (OP_E set) is stronger than a read's, because a write also checks `const`. So a
+    // read may reuse an earlier write's result, but a write may not reuse an earlier read's.
     std::vector<NumberedInstruction> tryObjectMemberCache;
     // The same, for the proven-class direct form: keyed by object pointer (OP_A) and constant member
     // offset (OP_B), with no guard strength to reconcile.
@@ -2742,7 +2749,7 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
     }
     case IrCmd::OBJECT_MEMBER_ADDR:
     {
-        // Luwu Classes (rfcs/classes.md): an OBJECT_MEMBER_ADDR depends only on the object and a
+        // Luwu Classes (rfcs/classes): an OBJECT_MEMBER_ADDR depends only on the object and a
         // constant offset, and carries no guard at all, so a repeat of the same pair is the same
         // address. Reusing it is what lets the value cache above forward a load or a store
         // to a later read of the same member.
@@ -2774,12 +2781,11 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
     case IrCmd::GET_CLOSURE_UPVAL_ADDR:
         break;
     case IrCmd::LOAD_OWNER_CLASS:
-        // Proto::ownerclass is fixed for the executing closure, so this is loop-invariant; nothing to
-        // propagate, but it is a candidate for CSE if a frame ever loads it more than once.
+        // Proto::ownerclass is fixed for the executing closure; there is nothing to propagate
         break;
     case IrCmd::TRY_CLASS_MEMBER_ADDR:
     case IrCmd::TRY_OBJECT_NAMECALL_ADDR:
-        // TODO(rfcs/classes.md): no reuse cache yet, unlike TRY_OBJECT_MEMBER_ADDR above
+        // TODO(rfcs/classes): no reuse cache yet, unlike TRY_OBJECT_MEMBER_ADDR above
         break;
     case IrCmd::ADD_INT64:
     case IrCmd::SUB_INT64:
@@ -3095,6 +3101,13 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
     case IrCmd::BUFFER_ISFROZEN:
         break;
     case IrCmd::CLASS_ISINSTANCE:
+        // a value whose tag is known not to be an object is never an instance, so the branch on it folds
+        if (OP_A(inst).kind == IrOpKind::Constant && function.tagOp(OP_A(inst)) != LUA_TOBJECT)
+        {
+            substitute(function, inst, build.constInt(0));
+            break;
+        }
+
         // Pure function of (tag, value ptr, class ptr); two identical checks in a block can be CSE'd
         state.substituteOrRecord(inst, index);
         break;
@@ -3463,7 +3476,7 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
         break;
 
     case IrCmd::CHECK_OBJECT_CLASS:
-        // TODO(rfcs/classes.md): no redundant-check elimination yet, unlike CHECK_SLOT_MATCH above
+        // TODO(rfcs/classes): no redundant-check elimination yet, unlike CHECK_SLOT_MATCH above
         break;
 
     case IrCmd::ADD_VEC:
@@ -3658,7 +3671,7 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
     case IrCmd::FALLBACK_NEWOBJECT:
         // Construction writes the instance (and, for a user __init, the frame it lays out above it),
         // and applying fields can run an __index metamethod, i.e. arbitrary Lua.
-        state.invalidateRegisterRange(vmRegOp(OP_B(inst)), function.intOp(OP_D(inst)) == 1 ? 3 : 1);
+        state.invalidateRegisterRange(vmRegOp(OP_B(inst)), function.intOp(OP_D(inst)) == LBC_NEWOBJECT_INIT ? 3 : 1);
         state.invalidateUserCall();
         break;
     }

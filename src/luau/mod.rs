@@ -15,9 +15,7 @@ pub static ENABLED_FFLAGS: &[&str] = &[
     "LuwuExternallyManagedBuffers",
     "LuwuExternalString",
     #[cfg(feature = "luwu-classes")]
-    "DebugLuauUserDefinedClasses",
-    #[cfg(feature = "luwu-classes")]
-    "DebugLuauUserDefinedClassesRuntime",
+    "LuwuClasses",
     #[cfg(feature = "none-primitive")]
     "LuwuNonePrimitive",
     "LuauAutoStack", // lets mluau avoid calls to lua_checkstack (avoids ffi calls)
@@ -33,8 +31,7 @@ pub static RESTRICTED_FFLAGS: &[&str] = &[
     "LuwuExternallyManagedBuffers",
     "LuwuExternalString",
     // luwu-classes
-    "DebugLuauUserDefinedClasses",
-    "DebugLuauUserDefinedClassesRuntime",
+    "LuwuClasses",
     // none primitive
     "LuwuNonePrimitive",
     // internally needed
@@ -118,7 +115,7 @@ impl Lua {
         // enabled, mirroring what Luau's own `luaL_openlibs` does internally when that flag is on.
 
         // Register the `class` library if the luwu-classes feature is enabled
-        // we know DebugLuauUserDefinedClassesRuntime is enabled because
+        // we know LuwuClasses is enabled because
         // - we just enabled it right above
         // - it not allowed to be disabled while luwu-classes is active
         #[cfg(feature = "luwu-classes")]

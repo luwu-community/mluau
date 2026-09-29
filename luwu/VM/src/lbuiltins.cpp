@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 // This code is based on Lua 5.x implementation licensed under MIT License; see lua_LICENSE.txt for details
 #include "lbuiltins.h"
 
@@ -793,7 +793,12 @@ static int luauF_type(lua_State* L, StkId res, TValue* arg0, int nresults, StkId
         int tt = ttype(arg0);
         if (tt == LUA_TSYMNONE)
             return -1;
+
         TString* ttname = L->global->ttname[tt];
+
+        // Luwu Traits (rfcs/classes/traits.md): a trait is tagged as a class, but its type is "trait"
+        if (tt == LUA_TCLASS && classvalue(arg0)->istrait)
+            ttname = L->global->traittypename;
 
         setsvalue(L, res, ttname);
         return 1;
@@ -981,7 +986,7 @@ static int luauF_rawequal(lua_State* L, StkId res, TValue* arg0, int nresults, S
     return -1;
 }
 
-// Luwu Classes (rfcs/classes.md): class.isinstance(value, class) -> value is an instance of class.
+// Luwu Classes (rfcs/classes): class.isinstance(value, class) -> value is an instance of class.
 // arg0 is the value under test; args[0] is the class. Only fast-pathed when the second argument is
 // actually a class; otherwise fall back to the library function to raise the usual argument error.
 static int luauF_class_isinstance(lua_State* L, StkId res, TValue* arg0, int nresults, StkId args, int nparams)
@@ -1237,7 +1242,8 @@ static int luauF_getmetatable(lua_State* L, StkId res, TValue* arg0, int nresult
         else if (ttisuserdata(arg0))
             mt = uvalue(arg0)->metatable;
         else if (ttisobject(arg0) || ttisclass(arg0))
-            mt = NULL; // Luwu Classes (rfcs/classes.md): never exposed, see lua_getmetatable
+            // Luwu Classes (rfcs/classes): never exposed, see lua_getmetatable; upstream reads the type's global metatable
+            mt = NULL;
         else
             mt = L->global->mt[ttype(arg0)];
 

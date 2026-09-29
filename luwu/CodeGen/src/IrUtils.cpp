@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/IrUtils.h"
 
 #include "Luau/CodeGenCommon.h"
@@ -108,7 +108,6 @@ bool isSkipC(LuauOpcode op)
     switch (int(op))
     {
     case LOP_LOADB:
-    case LOP_CHECKSELFCLASS:
         return true;
 
     default:

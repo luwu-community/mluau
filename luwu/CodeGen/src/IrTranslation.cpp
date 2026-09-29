@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "IrTranslation.h"
 
 #include "Luau/Bytecode.h"
@@ -15,7 +15,7 @@
 LUAU_FASTFLAG(LuauCodegenInteger3)
 LUAU_FASTFLAGVARIABLE(LuauCodegenBuilinDeadRange)
 LUAU_FASTFLAG(LuauBackedgeHeapCheck)
-LUAU_FASTFLAG(DebugLuauUserDefinedClassesRuntime)
+LUAU_FASTFLAG(LuwuClasses)
 
 namespace Luau
 {
@@ -1778,18 +1778,18 @@ void translateInstGetTableKS(IrBuilder& build, const Instruction* pc, int pcpos)
         return;
     }
 
-    // Luwu Classes (rfcs/classes.md): instance field access on an object, and static member access
-    // on a class. Gated strictly on the register's known bytecode type -- only a value the compiler
-    // has actually typed as an object/class takes these paths; anything else takes the table path
-    // below (for LBC_TYPE_ANY, see the comment there). For a known object/class the
-    // tag is hard-guarded (deopt on miss) and the single relevant member path taken directly. Object access is
-    // the hot path (`self.field` inside a method); class access serves static members
-    // (`ClassName.method`). Both share the ordinary interpreter fallback for a stale slot cache.
+    // Luwu Classes (rfcs/classes): instance field access on an object, and static member access on
+    // a class. These two paths run only when the compiler typed the register as an object or a class.
+    // Anything else takes the table path below (for LBC_TYPE_ANY, see the comment there).
     //
-    // The three paths here are mutually exclusive (object and class return early), so `next` -- the
-    // continuation block for the following instruction -- is computed within whichever one runs
-    // rather than once up front; computing it up front would allocate a block the table path doesn't
-    // use, shifting every later block id.
+    // On these paths the tag is guarded with a VM exit on a miss, and then the one relevant member
+    // path runs directly. Object access is the hot case (`self.field` inside a method). Class access
+    // serves static members (`ClassName.method`). Both share the ordinary interpreter fallback for a
+    // stale slot cache.
+    //
+    // Only one of the three paths runs, because the object and class paths return early. So each path
+    // creates `next`, the block for the following instruction, itself. Creating it once up front would
+    // allocate a block the table path doesn't use, and shift every later block id.
     if (bcTypes.a == LBC_TYPE_OBJECT)
     {
         IrOp next = build.blockAtInst(pcpos + 2);
@@ -1846,7 +1846,7 @@ void translateInstGetTableKS(IrBuilder& build, const Instruction* pc, int pcpos)
     // When a check in the object path fails, it jumps to the instruction's generic fallback. Liveness
     // analysis ignores that fallback-to-fallback edge because both blocks belong to the same instruction
     // (see computeCfgLiveInOutRegSets).
-    bool objectSpeculation = FFlag::DebugLuauUserDefinedClassesRuntime && bcTypes.a == LBC_TYPE_ANY;
+    bool objectSpeculation = FFlag::LuwuClasses && bcTypes.a == LBC_TYPE_ANY;
 
     IrOp fallback = build.fallbackBlock(pcpos);
     IrOp objBlock = objectSpeculation ? build.fallbackBlock(pcpos) : fallback;
@@ -1883,17 +1883,14 @@ void translateInstGetTableKS(IrBuilder& build, const Instruction* pc, int pcpos)
     build.inst(IrCmd::JUMP, next);
 }
 
-// Luwu Classes (rfcs/classes.md): read a member at a constant offset on a receiver whose class the
-// compiler proved. The tag guard only keeps malformed bytecode from dereferencing a non-object; nothing
-// about the class is re-derived.
+// Luwu Classes (rfcs/classes): read a member at a constant offset on a receiver whose class the
+// compiler proved. Nothing is checked: the receiver is an object of that class in valid bytecode (see
+// VM_CASE(LOP_GETOBJECTMEMBER), which asserts it).
 void translateInstGetObjectMember(IrBuilder& build, const Instruction* pc, int pcpos)
 {
     int ra = LUAU_INSN_A(*pc);
     int rb = LUAU_INSN_B(*pc);
     uint32_t offset = pc[1];
-
-    IrOp tb = build.inst(IrCmd::LOAD_TAG, build.vmReg(rb));
-    build.inst(IrCmd::CHECK_TAG, tb, build.constTag(LUA_TOBJECT), build.vmExit(pcpos));
 
     IrOp vb = build.inst(IrCmd::LOAD_POINTER, build.vmReg(rb));
     IrOp addr = build.inst(IrCmd::OBJECT_MEMBER_ADDR, vb, build.constUint(offset));
@@ -1901,14 +1898,16 @@ void translateInstGetObjectMember(IrBuilder& build, const Instruction* pc, int p
     build.inst(IrCmd::STORE_TVALUE, build.vmReg(ra), tv);
 }
 
-// Luwu Classes (rfcs/classes.md): construction. The FIELDS form (a primary constructor, or a POD class
-// constructed with every field) is lowered natively when the class passes the same shape rules the
-// interpreter checks: allocate uninitialized, then copy each argument register into its member. The copies
-// are ordinary IR stores, so const prop can forward a value that is still unboxed (the `self.x + o.x`
-// computed just before) straight into the member. Every other case -- the INIT form, the table form, a
-// class with defaults, a private constructor used from outside its class, or a value that isn't a class
-// -- runs executeNEWOBJECT as a fallback, as all construction used to. Nothing can collect between the
-// allocation and the last store, and a freshly allocated object is white, so no barrier is needed.
+// Luwu Classes (rfcs/classes): construction. The FIELDS form (a primary constructor, or a POD class
+// constructed with every field) is lowered natively: allocate uninitialized, then copy each argument
+// register into its member. The copies are ordinary IR stores, so const prop can forward a value that is
+// still unboxed (the `self.x + o.x` computed just before) straight into the member.
+// In valid bytecode, B holds a class with the shape the compiler picked (VM_CASE(LOP_NEWOBJECT) asserts
+// this), so only the runtime conditions need a guard. Every other case -- the INIT form, the table form,
+// a class with constant defaults, a private constructor used from outside its class -- runs
+// executeNEWOBJECT as a fallback.
+// Nothing can collect between the allocation and the last store, and a freshly allocated object is white,
+// so no barrier is needed.
 void translateInstNewObject(IrBuilder& build, const Instruction* pc, int pcpos)
 {
     int ra = LUAU_INSN_A(*pc);
@@ -1921,7 +1920,7 @@ void translateInstNewObject(IrBuilder& build, const Instruction* pc, int pcpos)
         build.inst(IrCmd::FALLBACK_NEWOBJECT, build.constUint(pcpos), build.vmReg(ra), build.vmReg(rb), build.constInt(form), build.constInt(int(aux)));
     };
 
-    if (form != 2)
+    if (form != LBC_NEWOBJECT_FIELDS)
     {
         emitFallback();
         return;
@@ -1930,9 +1929,8 @@ void translateInstNewObject(IrBuilder& build, const Instruction* pc, int pcpos)
     IrOp fallback = build.fallbackBlock(pcpos);
     IrOp next = build.blockAtInst(pcpos + getOpLength(LuauOpcode(LOP_NEWOBJECT)));
 
-    build.loadAndCheckTag(build.vmReg(rb), LUA_TCLASS, fallback);
     IrOp classPtr = build.inst(IrCmd::LOAD_POINTER, build.vmReg(rb));
-    build.inst(IrCmd::CHECK_CLASS_FIELDS_CONSTRUCTIBLE, classPtr, build.constUint(aux), fallback);
+    build.inst(IrCmd::CHECK_CLASS_FIELDS_CONSTRUCTIBLE, classPtr, fallback);
 
     build.inst(IrCmd::SET_SAVEDPC, build.constUint(pcpos + getOpLength(LuauOpcode(LOP_NEWOBJECT))));
     IrOp object = build.inst(IrCmd::NEW_OBJECT, classPtr);
@@ -1961,9 +1959,6 @@ void translateInstSetObjectMember(IrBuilder& build, const Instruction* pc, int p
     int rb = LUAU_INSN_B(*pc);
     uint32_t offset = pc[1];
 
-    IrOp tb = build.inst(IrCmd::LOAD_TAG, build.vmReg(rb));
-    build.inst(IrCmd::CHECK_TAG, tb, build.constTag(LUA_TOBJECT), build.vmExit(pcpos));
-
     IrOp vb = build.inst(IrCmd::LOAD_POINTER, build.vmReg(rb));
     IrOp addr = build.inst(IrCmd::OBJECT_MEMBER_ADDR, vb, build.constUint(offset));
     IrOp tv = build.inst(IrCmd::LOAD_TVALUE, build.vmReg(ra));
@@ -1991,15 +1986,15 @@ void translateInstSetTableKS(IrBuilder& build, const Instruction* pc, int pcpos)
         return;
     }
 
-    // Luwu Classes (rfcs/classes.md): writing an instance field on an object, e.g. `self.x = ...`.
+    // Luwu Classes (rfcs/classes): writing an instance field on an object, e.g. `self.x = ...`.
     //
-    // This path fires only when the compiler has typed the receiver as an object. We guard against tag
-    // here; if wrong we deopt. Every other receiver type takes the table path below (for LBC_TYPE_ANY,
-    // see translateInstGetTableKS).
+    // This path runs only when the compiler typed the receiver as an object. The receiver's tag is
+    // still checked, and a value that isn't an object exits to the VM. Every other receiver type takes
+    // the table path below (for LBC_TYPE_ANY, see translateInstGetTableKS).
     //
-    // Only one of these paths runs (the object path returns early), so we don't allocate the
-    // continuation block `next` until we're inside the path that needs it. Allocating it up front
-    // would reserve a block the table path never uses and renumber every block after it.
+    // Only one of the two paths runs, because the object path returns early. So `next`, the block for
+    // the following instruction, is created inside the path that uses it. Creating it up front would
+    // allocate a block the table path never uses, and shift the id of every block after it.
     if (bcTypes.a == LBC_TYPE_OBJECT)
     {
         IrOp next = build.blockAtInst(pcpos + 2);
@@ -2022,7 +2017,7 @@ void translateInstSetTableKS(IrBuilder& build, const Instruction* pc, int pcpos)
     }
 
     // Unknown receiver (ANY): same layout as translateInstGetTableKS, see the comment there.
-    bool objectSpeculation = FFlag::DebugLuauUserDefinedClassesRuntime && bcTypes.a == LBC_TYPE_ANY;
+    bool objectSpeculation = FFlag::LuwuClasses && bcTypes.a == LBC_TYPE_ANY;
 
     IrOp fallback = build.fallbackBlock(pcpos);
     IrOp objBlock = objectSpeculation ? build.fallbackBlock(pcpos) : fallback;
@@ -2208,7 +2203,7 @@ bool translateInstNamecall(IrBuilder& build, const Instruction* pc, int pcpos)
     IrOp next = build.blockAtInst(pcpos + getOpLength(LuauOpcode(LOP_NAMECALL)));
     IrOp fallback = build.fallbackBlock(pcpos);
 
-    // Luwu Classes (rfcs/classes.md): method resolution on an object receiver (`self:method()`).
+    // Luwu Classes (rfcs/classes): method resolution on an object receiver (`self:method()`).
     // Resolve the method address inline from the class members using the cached slot, store method
     // into ra and self into ra+1, then fall through to CALL -- avoiding an interpreter trampoline.
     auto emitObjectNamecall = [&]()
@@ -2240,7 +2235,7 @@ bool translateInstNamecall(IrBuilder& build, const Instruction* pc, int pcpos)
 
     // Unknown receiver (ANY): same layout as translateInstGetTableKS, see the comment there. Many method
     // calls on objects have receivers the compiler can't type, such as a value read out of a table.
-    bool objectSpeculation = FFlag::DebugLuauUserDefinedClassesRuntime && bcTypes.a == LBC_TYPE_ANY;
+    bool objectSpeculation = FFlag::LuwuClasses && bcTypes.a == LBC_TYPE_ANY;
     IrOp objBlock = objectSpeculation ? build.fallbackBlock(pcpos) : fallback;
 
     IrOp firstFastPathSuccess = build.block(IrBlockKind::Internal);
@@ -2411,13 +2406,13 @@ void translateInstCmpProto(IrBuilder& build, const Instruction* pc, int pcpos)
 
 void translateInstJumpXIsa(IrBuilder& build, const Instruction* pc, int pcpos)
 {
-    // Luwu Classes (rfcs/classes.md): fused class.isinstance(value, class) test-and-branch. Without
+    // Luwu Classes (rfcs/classes): fused class.isinstance(value, class) test-and-branch. Without
     // LBC_JUMPXISA_CHECKCLASS the compiler guarantees the class register holds a class; with it, a
     // non-class exits to the interpreter at this instruction, which raises the builtin's error.
     int ra = LUAU_INSN_A(*pc);
     uint32_t aux = pc[1];
     int classReg = aux & 0xff;
-    bool jumpIfInstance = (aux >> 31) != 0;
+    bool jumpIfInstance = (aux & LBC_JUMPXISA_JUMPIFINSTANCE) != 0;
 
     IrOp target = build.blockAtInst(pcpos + 1 + LUAU_INSN_D(*pc));
     IrOp next = build.blockAtInst(pcpos + 2);

@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 // This code is based on Lua 5.x implementation licensed under MIT License; see lua_LICENSE.txt for details
 #include "lgc.h"
 
@@ -421,7 +421,7 @@ static void traverseproto(global_State* g, Proto* f)
     if (f->deoptimized)
         markobject(g, f->deoptimized);
 
-    // Luwu Classes (rfcs/classes.md): keep the owning class alive while its method proto is alive.
+    // Luwu Classes (rfcs/classes): keep the owning class alive while its method proto is alive.
     // Private-access authorization compares this pointer, and CHECKSELFCLASS's LBC_SELFCLASS_OWNER form
     // uses it as the class (its error path reads the class name).
     if (f->ownerclass)
@@ -467,7 +467,8 @@ static void traverseclass(global_State* g, LuauClass* classdef)
     markobject(g, classdef->name);
     markobject(g, classdef->memberstooffset);
     for (uint32_t i = 0; i < classdef->numberofallmembers; i++)
-        markobject(g, classdef->offsettomember[i]);
+        if (classdef->offsettomember[i])
+            markobject(g, classdef->offsettomember[i]);
     for (uint32_t i = 0; i < classdef->numberofallmembers - classdef->numberofinstancemembers; i++)
         markvalue(g, &classdef->staticmembers[i]);
     if (classdef->memberdefaults)
@@ -476,6 +477,11 @@ static void traverseclass(global_State* g, LuauClass* classdef)
     markobject(g, classdef->metatable);
     if (classdef->instancemetatable)
         markobject(g, classdef->instancemetatable);
+    for (uint32_t i = 0; i < classdef->numtraits; i++)
+        markobject(g, classdef->traits[i]);
+
+    for (uint32_t i = 0; i < classdef->numtraitinits; i++)
+        markvalue(g, &classdef->traitinits[i]);
 }
 
 static void traverseobject(global_State* g, LuauObject* object)
@@ -606,14 +612,7 @@ static size_t propagatemark(global_State* g)
         LuauClass* classdef = gco2class(o);
         g->gray = classdef->gclist;
         traverseclass(g, classdef);
-        // We've traversed the "object" itself ...
-        return sizeof(LuauClass) +
-               // ... plus the method closures, each a `TValue` wide ...
-               ((classdef->numberofallmembers - classdef->numberofinstancemembers) * sizeof(TValue)) +
-               // ... plus a string pointer for each method or property, each a pointer wide ...
-               (classdef->numberofallmembers * sizeof(TString*)) +
-               // ... plus the constant field defaults, when the class carries them.
-               (classdef->memberdefaults ? classdef->numberofinstancemembers * sizeof(TValue) : 0);
+        return luaR_classsize(classdef);
     }
     case LUA_TOBJECT:
     {

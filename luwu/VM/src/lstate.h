@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 // This code is based on Lua 5.x implementation licensed under MIT License; see lua_LICENSE.txt for details
 #pragma once
 
@@ -218,6 +218,7 @@ typedef struct global_State
     struct LuaTable* mt[LUA_T_COUNT]; // metatables for basic types
     TString* ttname[LUA_T_COUNT]; // names for basic types, as returned by tostring()/error messages (LUA_TSYMNONE reports as "none")
     TString* ttypename[LUA_T_COUNT]; // names for basic types, as returned by type() (matches luaT_typenames verbatim)
+    TString* traittypename;          // Luwu Traits (rfcs/classes/traits.md): "trait", which type() and typeof() give for a trait
     TString* tmname[TM_N]; // array with tag-method names
 
     TValue pseudotemp; // storage for temporary values used in pseudo2addr

@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #pragma once
 
 #include "Luau/Common.h"
@@ -205,21 +205,21 @@ static void visitVmRegDefsUses(T& visitor, IrFunction& function, IrInst& inst)
         break;
     case IrCmd::FALLBACK_NEWCLASSMEMBER:
         visitor.use(OP_B(inst));
-        visitor.use(OP_C(inst));
+        visitor.useRange(vmRegOp(OP_C(inst)), function.intOp(OP_D(inst)));
         break;
     case IrCmd::FALLBACK_NEWOBJECT:
     {
         // See IrData.h for the operand shapes. The class is read in place, and the registers above
-        // the instance hold either the constructor arguments (forms 0 and 1) or one value per field
-        // (form 2); form 1 additionally fills in __init and self for the CALL the compiler emits
-        // behind this instruction.
+        // the instance hold either the constructor arguments (LBC_NEWOBJECT_DEFAULT and _INIT) or one
+        // value per field (LBC_NEWOBJECT_FIELDS); the INIT form additionally fills in __init and self
+        // for the CALL the compiler emits behind this instruction.
         int ra = vmRegOp(OP_B(inst));
         int form = function.intOp(OP_D(inst));
         int count = function.intOp(OP_E(inst));
 
         visitor.use(OP_C(inst));
 
-        if (form == 1)
+        if (form == LBC_NEWOBJECT_INIT)
         {
             if (count > 0)
                 visitor.useRange(ra + 3, count);
@@ -243,6 +243,10 @@ static void visitVmRegDefsUses(T& visitor, IrFunction& function, IrInst& inst)
         break;
     case IrCmd::GET_TYPEOF:
         visitor.use(OP_A(inst));
+        break;
+    case IrCmd::GET_TYPE:
+        if (OP_B(inst).kind == IrOpKind::VmReg)
+            visitor.use(OP_B(inst));
         break;
 
     case IrCmd::FINDUPVAL:

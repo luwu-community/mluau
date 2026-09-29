@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/BytecodeBuilder.h"
 
 #include "Luau/BytecodeUtils.h"
@@ -9,16 +9,15 @@
 #include <climits>
 
 LUAU_FASTFLAG(LuauIntegerType2)
-LUAU_FASTFLAG(DebugLuauUserDefinedClasses)
+LUAU_FASTFLAG(LuwuClasses)
 LUAU_FASTFLAG(LuauEmitCallFeedback)
 LUAU_FASTFLAGVARIABLE(LuauVirtualBcBuilder)
-LUAU_FASTFLAGVARIABLE(LuauBytecodeCostModel)
 
 namespace Luau
 {
 
-static_assert(LBC_VERSION_TARGET >= LBC_VERSION_MIN && LBC_VERSION_TARGET <= LBC_VERSION_MAX, "Invalid bytecode version setup");
-static_assert(LBC_VERSION_MAX <= 127, "Bytecode version should be 7-bit so that we can extend the serialization to use varint transparently");
+static_assert(LWBC_VERSION_TARGET >= LWBC_VERSION_MIN && LWBC_VERSION_TARGET <= LWBC_VERSION_MAX, "Invalid bytecode version setup");
+static_assert(LWBC_VERSION_WIP > LWBC_VERSION_MAX && LWBC_VERSION_WIP < LWBC_MAGIC, "Invalid bytecode version setup");
 
 static const uint32_t kMaxConstantCount = 1 << 23;
 static const uint32_t kMaxClosureCount = 1 << 15;
@@ -760,9 +759,11 @@ void BytecodeBuilder::finalize()
 
     // assemble final bytecode blob
     uint8_t version = getVersion();
-    LUAU_ASSERT(version >= LBC_VERSION_MIN && version <= LBC_VERSION_MAX);
+    LUAU_ASSERT((version >= LWBC_VERSION_MIN && version <= LWBC_VERSION_MAX) || version == LWBC_VERSION_WIP);
 
-    bytecode = char(version);
+    // Luwu bytecode versioning: upstream writes its own version number here; see "Luwu bytecode version history" in Bytecode.h
+    bytecode = char(LWBC_MAGIC);
+    writeByte(bytecode, version);
 
     uint8_t typesversion = getTypeEncodingVersion();
     LUAU_ASSERT(typesversion >= LBC_TYPE_VERSION_MIN && typesversion <= LBC_TYPE_VERSION_MAX);
@@ -789,8 +790,8 @@ void BytecodeBuilder::finalize()
 
     for (const Function& func : functions)
     {
-        if (FFlag::LuauBytecodeCostModel)
-            writeVarInt(bytecode, func.data.size());
+        // Luwu bytecode versioning: every Luwu version has the version 12 layout, so this is unconditional (upstream: only at version 12)
+        writeVarInt(bytecode, func.data.size());
         bytecode += func.data;
     }
 
@@ -1005,23 +1006,17 @@ void BytecodeBuilder::writeFunction(std::string& ss, uint32_t id, uint8_t flags,
         writeByte(ss, 0);
     }
 
-    if (FFlag::LuauEmitCallFeedback)
+    // Luwu bytecode versioning: the feedback vector and the inlining cost are always written, since every Luwu version has the
+    // version 12 layout (upstream writes each only when the flag that picks versions 11 and 12 is on)
+    writeVarInt(ss, fbSlots.size());
+    for (uint32_t pc : fbSlots)
     {
-        // Feedback Slots
-        writeVarInt(ss, fbSlots.size());
-        for (uint32_t pc : fbSlots)
-        {
-            writeByte(ss, LFT_CALLTARGET);
-            writeVarInt(ss, pc);
-        }
+        writeByte(ss, LFT_CALLTARGET);
+        writeVarInt(ss, pc);
     }
 
-    if (FFlag::LuauBytecodeCostModel && (flags & LPF_INLINABLE) != 0)
-    {
-        if (!FFlag::LuauEmitCallFeedback)
-            writeVarInt(ss, 0);
+    if ((flags & LPF_INLINABLE) != 0)
         writeVarInt(ss, cost);
-    }
 }
 
 void BytecodeBuilder::writeClassShape(std::string& ss, const ClassShape& cs) const
@@ -1033,6 +1028,12 @@ void BytecodeBuilder::writeClassShape(std::string& ss, const ClassShape& cs) con
     writeVarInt(ss, cs.className);
     writeVarInt(ss, cs.propertyNames.size());
     writeVarInt(ss, cs.methodNames.size());
+    uint32_t shapeFlags = 0;
+    if (cs.isTrait)
+        shapeFlags |= LBC_CLASSSHAPE_TRAIT;
+    if (cs.implementsTraits)
+        shapeFlags |= LBC_CLASSSHAPE_IMPLEMENTS;
+    writeVarInt(ss, shapeFlags);
     // Each member's name and flags byte are written together (properties first, then methods,
     // matching offset order) so the reader can fill in offsetToMember/memberFlags in one pass.
     for (size_t i = 0; i < cs.propertyNames.size(); i++)
@@ -1468,7 +1469,7 @@ std::vector<uint32_t> BytecodeBuilder::expandJumps()
 
 std::string BytecodeBuilder::getError(const std::string& message)
 {
-    // 0 acts as a special marker for error bytecode (it's equal to LBC_VERSION_TARGET for valid bytecode blobs)
+    // 0 acts as a special marker for error bytecode (valid blobs start with LWBC_MAGIC)
     std::string result;
     result += char(0);
     result += message;
@@ -1478,15 +1479,11 @@ std::string BytecodeBuilder::getError(const std::string& message)
 
 uint8_t BytecodeBuilder::getVersion()
 {
-    if (FFlag::LuauBytecodeCostModel)
-        return 12;
-    if (FFlag::LuauEmitCallFeedback)
-        return 11;
+    // Luwu Classes (rfcs/classes): class bytecode is still a work-in-progress format
+    if (FFlag::LuwuClasses)
+        return LWBC_VERSION_WIP;
 
-    if (FFlag::DebugLuauUserDefinedClasses)
-        return 10;
-
-    return LBC_VERSION_TARGET;
+    return LWBC_VERSION_TARGET;
 }
 
 uint8_t BytecodeBuilder::getTypeEncodingVersion()
@@ -1942,9 +1939,17 @@ void BytecodeBuilder::validateInstructions() const
 
         case LOP_NEWCLASSMEMBER:
             VREG(LUAU_INSN_A(insn));
-            LUAU_ASSERT(LUAU_INSN_B(insn) == 0);
-            VREG(LUAU_INSN_C(insn));
-            VCONST(insns[i + 1], String);
+
+            if (LUAU_INSN_B(insn) == LBC_NEWCLASSMEMBER_IMPLEMENTS)
+            {
+                VREGRANGE(LUAU_INSN_C(insn), int(insns[i + 1]) * 2);
+            }
+            else
+            {
+                LUAU_ASSERT(LUAU_INSN_B(insn) == 0);
+                VREG(LUAU_INSN_C(insn));
+                VCONST(insns[i + 1], String);
+            }
             break;
 
         case LOP_GETUDATAKS:
@@ -1978,6 +1983,7 @@ void BytecodeBuilder::validateInstructions() const
             VREG(LUAU_INSN_A(insn));
             VJUMP(LUAU_INSN_D(insn));
             VREG(insns[i + 1] & 0xff); // class register lives in the low byte of aux
+            LUAU_ASSERT((insns[i + 1] & ~(0xffu | LBC_JUMPXISA_JUMPIFINSTANCE | LBC_JUMPXISA_CHECKCLASS)) == 0);
             break;
 
         case LOP_GETOBJECTMEMBER:
@@ -1987,9 +1993,10 @@ void BytecodeBuilder::validateInstructions() const
             break;
 
         case LOP_NEWOBJECT:
+            LUAU_ASSERT(LUAU_INSN_C(insn) <= LBC_NEWOBJECT_FIELDS);
             // with a user __init the instruction lays out `__init`, `self` and the arguments above A;
             // the other forms use one register per argument or per field
-            VREG(LUAU_INSN_A(insn) + (LUAU_INSN_C(insn) == 1 ? 2 : 0) + insns[i + 1]);
+            VREG(LUAU_INSN_A(insn) + (LUAU_INSN_C(insn) == LBC_NEWOBJECT_INIT ? 2 : 0) + insns[i + 1]);
             VREG(LUAU_INSN_B(insn));
             break;
 
@@ -2322,7 +2329,15 @@ void BytecodeBuilder::dumpConstant(std::string& result, int k, bool detailed) co
         // This should always be printable, in fact this should always be a
         // valid Luau identifier!
         LUAU_ASSERT(printableStringConstant(str.data, str.length));
-        formatAppend(result, "class %.*s (props: %zu, methods: %zu)", int(str.length), str.data, cs.propertyNames.size(), cs.methodNames.size());
+        formatAppend(
+            result,
+            "%s %.*s (props: %zu, methods: %zu)",
+            cs.isTrait ? "trait" : "class",
+            int(str.length),
+            str.data,
+            cs.propertyNames.size(),
+            cs.methodNames.size()
+        );
     }
     }
 }
@@ -2753,9 +2768,16 @@ void BytecodeBuilder::dumpInstruction(const uint32_t* code, std::string& result,
         break;
 
     case LOP_NEWCLASSMEMBER:
-        formatAppend(result, "NEWCLASSMEMBER R%d R%d [", LUAU_INSN_A(insn), LUAU_INSN_C(insn));
-        dumpConstant(result, *code, false);
-        result.append("]\n");
+        if (LUAU_INSN_B(insn) == LBC_NEWCLASSMEMBER_IMPLEMENTS)
+        {
+            formatAppend(result, "NEWCLASSMEMBER R%d IMPLEMENTS R%d %d\n", LUAU_INSN_A(insn), LUAU_INSN_C(insn), int(*code));
+        }
+        else
+        {
+            formatAppend(result, "NEWCLASSMEMBER R%d R%d [", LUAU_INSN_A(insn), LUAU_INSN_C(insn));
+            dumpConstant(result, *code, false);
+            result.append("]\n");
+        }
         code++;
         break;
 
@@ -2779,7 +2801,7 @@ void BytecodeBuilder::dumpInstruction(const uint32_t* code, std::string& result,
             LUAU_INSN_A(insn),
             *code & 0xff,
             targetLabel,
-            (*code >> 31) ? "" : " NOT",
+            (*code & LBC_JUMPXISA_JUMPIFINSTANCE) ? "" : " NOT",
             (*code & LBC_JUMPXISA_CHECKCLASS) ? " CHECKCLASS" : ""
         );
         break;
@@ -2794,7 +2816,7 @@ void BytecodeBuilder::dumpInstruction(const uint32_t* code, std::string& result,
 
     case LOP_NEWOBJECT:
     {
-        const char* form = LUAU_INSN_C(insn) == 1 ? " INIT" : (LUAU_INSN_C(insn) == 2 ? " FIELDS" : "");
+        const char* form = LUAU_INSN_C(insn) == LBC_NEWOBJECT_INIT ? " INIT" : (LUAU_INSN_C(insn) == LBC_NEWOBJECT_FIELDS ? " FIELDS" : "");
         formatAppend(result, "NEWOBJECT R%d R%d %d%s\n", LUAU_INSN_A(insn), LUAU_INSN_B(insn), *code++, form);
         break;
     }

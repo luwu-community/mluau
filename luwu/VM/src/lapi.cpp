@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 // This code is based on Lua 5.x implementation licensed under MIT License; see lua_LICENSE.txt for details
 #include "lapi.h"
 
@@ -58,6 +58,9 @@ const char* lua_ident = "$Lua: Lua 5.1.4 Copyright (C) 1994-2008 Lua.org, PUC-Ri
 
 const char* luau_ident = "$Luau: Copyright (C) 2019-2024 Roblox Corporation $\n"
                          "$URL: luau.org $\n";
+
+const char* luwu_ident = "$Luwu: Copyright (C) 2026 Luwu contributors $\n"
+                         "$URL: luwu.org $\n";
 
 #define api_checknelems(L, n) api_check(L, (n) <= (L->top - L->base))
 
@@ -992,8 +995,9 @@ int lua_getmetatable(lua_State* L, int objindex)
         break;
     case LUA_TOBJECT:
     case LUA_TCLASS:
-        // Luwu Classes (rfcs/classes.md): class and object metatables are locked down and never
-        // exposed, so these behave like a primitive without a metatable (such as `number`).
+        // Luwu Classes (rfcs/classes): class and object metatables are locked down and never
+        // exposed, so these behave like a primitive without a metatable (such as `number`). Upstream
+        // returns an object's class's instance metatable, and the global metatable of the type for a class.
         mt = NULL;
         break;
     default:
@@ -1133,8 +1137,9 @@ int lua_setmetatable(lua_State* L, int objindex)
     case LUA_TOBJECT:
     case LUA_TCLASS:
     {
-        // Luwu Classes (rfcs/classes.md): the default case would install a metatable for every value
-        // of the type, which the language doesn't allow for classes and objects.
+        // Luwu Classes (rfcs/classes): the default case would install a metatable for every value
+        // of the type, which the language doesn't allow for classes and objects. Upstream takes the
+        // default case for both.
         luaG_runerror(L, "cannot set the metatable of a %s", luaT_typenames[ttype(obj)]);
     }
     default:
@@ -1707,7 +1712,7 @@ void* lua_getstringexternaluserdata(lua_State* L, int idx)
     return nullptr;
 }
 
-// Luwu Classes (rfcs/classes.md): the class a class-or-object value belongs to, or NULL for any other
+// Luwu Classes (rfcs/classes): the class a class-or-object value belongs to, or NULL for any other
 // value.
 static LuauClass* classofvalue(const TValue* o)
 {
@@ -1728,6 +1733,12 @@ static const TValue* findclassmember(lua_State* L, int idx, const char* memberna
     return luaH_getstr((*classdef)->memberstooffset, luaS_new(L, membername));
 }
 
+int lua_istrait(lua_State* L, int idx)
+{
+    const TValue* o = index2addr(L, idx);
+    return ttisclass(o) && classvalue(o)->istrait;
+}
+
 void lua_newobject(lua_State* L, int idx)
 {
     StkId cls = index2addr(L, idx);
@@ -1741,16 +1752,42 @@ void lua_newobject(lua_State* L, int idx)
     luaC_threadbarrier(L);
 
     LuauClass* classdef = classvalue(cls);
-    const TValue* initoffset = luaH_getstr(classdef->memberstooffset, luaS_newlstr(L, "__init", 6));
-    LUAU_ASSERT(!ttisnil(initoffset));
-    const TValue* init = &classdef->staticmembers[uint32_t(nvalue(initoffset)) - classdef->numberofinstancemembers];
 
-    // `__init` is called directly rather than through the class's `__call`, which skips the private
-    // constructor check (the embedder is trusted) and reads `__init` without a member access (so a class
-    // with `const` fields can still be constructed). The object takes the class's stack slot, so it is
-    // anchored for the call and ends up exactly where the class was once the arguments are dropped.
+    luaR_checktraitsimplemented(L, classdef);
+
+    // Luwu Traits (rfcs/classes/traits.md): constructing a trait calls its `__create`, which replaces the trait in its slot with its result
+    if (classdef->istrait)
+    {
+        setobj2s(L, cls, luaR_traitcreate(L, classdef));
+        lua_call(L, nargs, 1);
+        return;
+    }
+
+    // Construction runs here instead of through the class's `__call`. Doing it here skips the private
+    // constructor check, because the embedder is trusted. It also reads `__init` by offset rather than
+    // as a member, since `__init` is never readable by name. The object replaces the class in its stack
+    // slot. That anchors it during construction, and once the arguments are dropped it ends up exactly
+    // where the class was.
     ptrdiff_t objectslot = savestack(L, cls);
-    setobjectvalue(L, cls, luaR_newobject(L, classdef));
+    LuauObject* object = luaR_newobject(L, classdef);
+    setobjectvalue(L, cls, object);
+
+    // Luwu Traits (rfcs/classes/traits.md): trait fields are initialized before the class's own defaults and `__init`
+    if (classdef->traitinits)
+    {
+        luaR_inittraitfields(L, classdef, object, cls + 1, nargs);
+        cls = restorestack(L, objectslot);
+    }
+
+    if (!classdef->hascustominit)
+    {
+        // an object argument's private fields are read with the embedder's rights, like any access it makes
+        luaR_initpodobject(L, classdef, object, cls + 1, nargs, NULL);
+        L->top = restorestack(L, objectslot) + 1;
+        return;
+    }
+
+    const TValue* init = &classdef->staticmembers[classdef->initoffset - classdef->numberofinstancemembers];
 
     if (!lua_checkstack(L, 2 + nargs))
         luaG_runerror(L, "stack overflow (class constructor arguments)");

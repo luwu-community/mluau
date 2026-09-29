@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 // This code is based on Lua 5.x implementation licensed under MIT License; see lua_LICENSE.txt for details
 #include "lualib.h"
 
@@ -685,6 +685,12 @@ static const luaL_Reg tab_funcs_with_drop[] = {
 int luaopen_table(lua_State* L)
 {
     luaL_register(L, LUA_TABLIBNAME, FFlag::LuwuTableDrop ? tab_funcs_with_drop : tab_funcs);
+
+    if (FFlag::LuwuTableDrop)
+    {
+        lua_pushcfunction(L, tdrop, "drop");
+        lua_setfield(L, -2, "drop");
+    }
 
     // Lua 5.1 compat
     lua_pushcfunction(L, tunpack, "unpack");

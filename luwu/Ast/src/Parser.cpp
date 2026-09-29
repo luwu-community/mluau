@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/Parser.h"
 
 #include "Luau/Ast.h"
@@ -25,9 +25,20 @@ LUAU_FASTFLAGVARIABLE(LuauIntegerType2)
 LUAU_FASTFLAGVARIABLE(LuauExportValueSyntax)
 LUAU_FLAGVERSION(LuauExportValueSyntax, 3)
 
-LUAU_FASTFLAGVARIABLE(DebugLuauNoInline)
-LUAU_FASTFLAGVARIABLE(DebugLuauUserDefinedClasses)
-LUAU_FASTFLAGVARIABLE(LuwuBetterUserDefinedClasses)
+// Luwu @noinline (rfcs/noinline-attribute.md): gates parsing `@noinline`, and the compiler honoring it (no
+// inlining, no LPF_INLINABLE). Upstream spells this `@debugnoinline` behind the Debug flag `DebugLuauNoInline`;
+// Luwu ships it as `@noinline` and drops the debug spelling.
+LUAU_FASTFLAGVARIABLE(LuwuNoinlineAttribute)
+// Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): attributes on variables, type
+// aliases, table fields, classes, class fields, parameters and assignments, where upstream only allows them on
+// functions.
+LUAU_FASTFLAGVARIABLE(LuwuAttributesEverywhere)
+// Luwu Destructuring (rfcs/destructuring.md): `local`/`const` declarations that bind fields of a value,
+// `const fs.{readfile, path} = require("@std/fs")`. Still in progress.
+LUAU_FASTFLAGVARIABLE(LuwuDestructuring)
+// Luwu Declare Statements (rfcs/declare-statements.md): `declare` in ordinary source, where upstream only accepts it
+// in definition files. Still in progress.
+LUAU_FASTFLAGVARIABLE(LuwuDeclareStatements)
 LUAU_FASTFLAGVARIABLE(LuauAllowGlobalDeclarationToBeCalledClass)
 LUAU_FASTFLAGVARIABLE(LuauDisallowExternClassInTypeDefinitions)
 LUAU_FASTFLAGVARIABLE(LuauTableEntriesDontNeedToMatchIndent)
@@ -45,14 +56,115 @@ bool luau_telemetry_parsed_return_type_variadic_with_type_suffix = false;
 namespace Luau
 {
 
+namespace
+{
+
+// Luwu Classes (rfcs/classes): `class` is a contextual keyword, so with the classes flags off a
+// class declaration parses as a nonsense expression statement and reports something about assignments
+// (upstream: "Incomplete statement: expected assignment or a function call").
+// Users have read that as "my Luwu build is broken", so say what is actually wrong.
+// Luwu Destructuring (rfcs/destructuring.md): destructuring always declares new locals, never assigns existing ones.
+const char* const kDestructuringNeedsKeywordError = "Destructuring declares new locals; start it with 'local' or 'const'";
+
+// Luwu Declare Statements (rfcs/declare-statements.md): outside definition files, `declare` is only allowed where it
+// visibly applies to the whole file.
+const char* const kDeclarationPlacementError =
+    "'declare' applies to the whole file, so it must be at the top level of the file or in a 'do' block there";
+// Luwu Declare Statements (rfcs/declare-statements.md): a declaration has no implementation to take a default from, so
+// its defaults (class fields, primary constructor and function parameters) are written as types.
+const char* const kDeclaredDefaultIsATypeError = "In a declaration, a default is written as its type: 'name = T'";
+// Luwu Declare Statements (rfcs/declare-statements.md): a declared value belongs to its file; values shared by
+// several files come from a definitions file.
+const char* const kDeclareExportValueError =
+    "Only types can be exported with 'export declare'; to declare a global for several files, use a definitions file";
+// Luwu: upstream's legacy `declare class` declares an extern type; in Luwu it is a class or nothing.
+const char* const kLegacyDeclareClassError = "In Luwu, 'declare class' does not declare an extern type; write 'declare extern type' instead";
+const char* const kDeclareClassNeedsTypeError =
+    "A declared class is written 'declare class type Name'; to declare an extern type, write 'declare extern type Name'";
+const char* const kDeclareExportOrderError = "'export' goes before 'declare': write 'export declare'";
+const char* const kClassesDisabledError = "Classes are currently disabled; enable the 'LuwuClasses' fast flag to use 'class'";
+
+// Luwu Classes (rfcs/classes): class members may not be named after the keywords that appear in the
+// class header or in front of a member. This keeps those positions unambiguous, and leaves room to give
+// these words meaning there later without breaking existing code.
+const std::unordered_set<std::string> DISALLOWED_CLASS_MEMBER_NAMES{
+    "class",
+    "public",
+    "private",
+    "const",
+    "extends",
+    "implements",
+};
+
+// Only ask this from a position that is unambiguously a field or a function, so the caller's message
+// can say which one it is.
+bool isDisallowedClassMemberName(const AstName& name)
+{
+    return name.value != nullptr && DISALLOWED_CLASS_MEMBER_NAMES.count(name.value) > 0;
+}
+
+} // namespace
+
 using AttributeArgumentsValidator = std::function<std::vector<std::pair<Location, std::string>>(Location, const AstArray<AstExpr*>&)>;
 
 struct AttributeEntry
 {
     const char* name;
     AstAttr::Type type;
+    // Every syntactic position this attribute may be written on. An attribute that reaches a
+    // position outside this set is a parse error, so a new attribute declares where it makes
+    // sense once, here, instead of each position growing a check for it.
+    AstAttr::Context allowedContexts;
+    // What to say when the attribute reaches a position it does not allow, for an attribute whose
+    // allowed set is not something a reader would recognize from the position's name alone. Null
+    // falls back to naming the position that was written on.
+    const char* allowedPositionsHint;
+    // The record fields the attribute takes, ending in nullptr, for editors to offer; nullptr for an
+    // attribute that takes no arguments. argsValidator is what enforces them.
+    const char* const* argumentFields;
     std::optional<AttributeArgumentsValidator> argsValidator;
 };
+
+// A table entry, in a value or a type, may itself *be* a table or a string, so `@deprecated {1, 2}`
+// there is a legitimately attributed entry rather than someone writing arguments. Everywhere else the
+// attributed thing starts with a keyword or a name, so a `{` or a string can only be a mistake.
+static bool contextCanStartWithTableOrString(AstAttr::Context context)
+{
+    return AstAttr::contextAllows(context, AstAttr::Context::TableField) ||
+           AstAttr::contextAllows(context, AstAttr::Context::TableTypeField) ||
+           AstAttr::contextAllows(context, AstAttr::Context::TableIndexer);
+}
+
+// For "Attribute '@x' cannot be applied to %s". Takes a single context, never a set.
+static const char* attributeContextName(AstAttr::Context context)
+{
+    switch (context)
+    {
+    case AstAttr::Context::Function:
+    case AstAttr::Context::InlinableFunction:
+        return "a function";
+    case AstAttr::Context::Local:
+        return "a local variable";
+    case AstAttr::Context::TypeAlias:
+        return "a type alias";
+    case AstAttr::Context::TableField:
+        return "a table field";
+    case AstAttr::Context::TableTypeField:
+        return "a table type field";
+    case AstAttr::Context::TableIndexer:
+        return "a table indexer";
+    case AstAttr::Context::Class:
+        return "a class";
+    case AstAttr::Context::ClassField:
+        return "a class field";
+    case AstAttr::Context::Parameter:
+        return "a parameter";
+    case AstAttr::Context::Assignment:
+        return "an assignment";
+    default:
+        return "this";
+    }
+}
 
 std::vector<std::pair<Location, std::string>> deprecatedArgsValidator(Location attrLoc, const AstArray<AstExpr*>& args)
 {
@@ -92,23 +204,68 @@ std::vector<std::pair<Location, std::string>> deprecatedArgsValidator(Location a
     return errors;
 }
 
-AttributeEntry kAttributeEntries_DEPRECATED[] = {
-    {"@checked", AstAttr::Type::Checked, {}},
-    {"@native", AstAttr::Type::Native, {}},
-    {"@deprecated", AstAttr::Type::Deprecated, {}},
-    {nullptr, AstAttr::Type::Checked, {}}
-};
+// @checked and @native describe how a function is compiled or typechecked, so they mean nothing
+// anywhere else. @deprecated marks an API as one callers should stop using, which every position
+// can have.
+// The fields deprecatedArgsValidator accepts.
+const char* const kDeprecatedArgumentFields[] = {"use", "reason", nullptr};
 
 AttributeEntry kAttributeEntries[] = {
-    {"checked", AstAttr::Type::Checked, {}},
-    {"native", AstAttr::Type::Native, {}},
-    {"deprecated", AstAttr::Type::Deprecated, deprecatedArgsValidator},
-    {nullptr, AstAttr::Type::Checked, {}}
+    {"checked", AstAttr::Type::Checked, AstAttr::Context::AnyFunction, "functions", nullptr, {}},
+    {"native", AstAttr::Type::Native, AstAttr::Context::AnyFunction, "functions", nullptr, {}},
+    {"deprecated", AstAttr::Type::Deprecated, AstAttr::Context::Any, nullptr, kDeprecatedArgumentFields, deprecatedArgsValidator},
+    {nullptr, AstAttr::Type::Checked, AstAttr::Context::None, nullptr, nullptr, {}}
 };
 
-std::pair<AttributeEntry, Luau::FValue<bool>&> kDebugAttributeEntries[] = {
-    {{"debugnoinline", AstAttr::Type::DebugNoinline, {}}, FFlag::DebugLuauNoInline},
+// Attributes that are still behind a flag. Same shape as above; the flag is checked before the entry
+// is offered, so an attribute whose flag is off is simply not a known attribute.
+std::pair<AttributeEntry, Luau::FValue<bool>&> kFlaggedAttributeEntries[] = {
+    {{"noinline",
+      AstAttr::Type::Noinline,
+      AstAttr::Context::InlinableFunction,
+      "a local function, a const function, a class method or a function expression",
+      nullptr,
+      {}},
+     FFlag::LuwuNoinlineAttribute},
 };
+
+std::vector<AttributeInfo> getKnownAttributes()
+{
+    std::vector<AttributeInfo> result;
+
+    for (int i = 0; kAttributeEntries[i].name; ++i)
+    {
+        const AttributeEntry& entry = kAttributeEntries[i];
+        result.push_back(AttributeInfo{entry.name, entry.type, entry.allowedContexts, entry.argumentFields});
+    }
+
+    for (const auto& entry : kFlaggedAttributeEntries)
+    {
+        if (entry.second)
+            result.push_back(AttributeInfo{entry.first.name, entry.first.type, entry.first.allowedContexts, entry.first.argumentFields});
+    }
+
+    return result;
+}
+
+// The one place an attribute name is resolved to its registration; returns nullptr for a name that
+// isn't a known attribute, or one whose flag is off.
+static const AttributeEntry* findAttributeEntry(const char* attributeName)
+{
+    for (int i = 0; kAttributeEntries[i].name; ++i)
+    {
+        if (strcmp(attributeName, kAttributeEntries[i].name) == 0)
+            return &kAttributeEntries[i];
+    }
+
+    for (const auto& entry : kFlaggedAttributeEntries)
+    {
+        if (entry.second && strcmp(attributeName, entry.first.name) == 0)
+            return &entry.first;
+    }
+
+    return nullptr;
+}
 
 ParseError::ParseError(const Location& location, std::string message)
     : location(location)
@@ -331,7 +488,9 @@ Parser::Parser(const char* buffer, size_t bufferSize, AstNameTable& names, Alloc
 
     nameSelf = names.getOrAdd("self");
     nameNumber = names.getOrAdd("number");
+    nameAny = names.getOrAdd("any");
     nameError = names.getOrAdd(kParseNameError);
+    nameDestructured = names.getOrAdd(kDestructuredLocalName);
     nameNil = names.getOrAdd("nil"); // nil is a reserved keyword
 
     matchRecoveryStopOnToken.assign(Lexeme::Type::Reserved_END, 0);
@@ -369,12 +528,52 @@ bool Parser::blockFollow(const Lexeme& l)
 
 AstStatBlock* Parser::parseChunk()
 {
+    nextBlockAllowsDeclarations = true;
     AstStatBlock* result = parseBlock();
 
     if (lexer.current().type != Lexeme::Eof)
         expectAndConsumeFail(Lexeme::Eof, nullptr);
 
+    if (traitsEnabled())
+        checkTraitsDeclaredBeforeUse(result);
+
     return result;
+}
+
+// Luwu Traits (rfcs/classes/traits.md): a class reads its traits when its statement runs, so a trait declared further down
+// the chunk is nil there. Its name in the `implements` list parsed as a global, which would fail at runtime. Classes
+// and traits are only declared at the top level, so the whole chunk says whether that global is really a later trait.
+void Parser::checkTraitsDeclaredBeforeUse(AstStatBlock* chunk)
+{
+    DenseHashMap<AstName, const AstStatClass*> traits{AstName()};
+
+    for (AstStat* stat : chunk->body)
+    {
+        const AstStatClass* trait = stat->as<AstStatClass>();
+        if (trait && trait->isTrait && !traits.contains(trait->name->name))
+            traits[trait->name->name] = trait;
+    }
+
+    for (AstStat* stat : chunk->body)
+    {
+        const AstStatClass* cls = stat->as<AstStatClass>();
+        if (!cls || cls->isTrait)
+            continue;
+
+        for (const AstClassTraitRef& ref : cls->implements)
+        {
+            const AstExprGlobal* global = ref.trait->as<AstExprGlobal>();
+            const AstStatClass* const* trait = global ? traits.find(global->name) : nullptr;
+
+            if (trait && (*trait)->location.begin > cls->location.begin)
+                report(
+                    ref.trait->location,
+                    "Trait '%s' is declared below class '%s'; declare it above the class to implement it",
+                    global->name.value,
+                    cls->name->name.value
+                );
+        }
+    }
 }
 
 // chunk ::= {stat [`;']} [laststat [`;']]
@@ -399,6 +598,10 @@ AstStatBlock* Parser::parseBlockNoScope()
 {
     TempVector<AstStat*> body(scratchStat);
 
+    bool outerBlockAllowsDeclarations = blockAllowsDeclarations;
+    blockAllowsDeclarations = nextBlockAllowsDeclarations;
+    nextBlockAllowsDeclarations = false;
+
     const Position prevPosition = lexer.previousLocation().end;
 
     while (!blockFollow(lexer.current()))
@@ -411,24 +614,35 @@ AstStatBlock* Parser::parseBlockNoScope()
 
         recursionCounter = oldRecursionCount;
 
+        // Luwu Destructuring (rfcs/destructuring.md): a trailing `;` belongs to the last statement a
+        // destructuring declaration desugared to.
+        AstStat* last = pendingStatements.empty() ? stat : pendingStatements.back();
+
         if (lexer.current().type == ';')
         {
             nextLexeme();
-            stat->hasSemicolon = true;
-            stat->location.end = lexer.previousLocation().end;
+            last->hasSemicolon = true;
+            last->location.end = lexer.previousLocation().end;
         }
 
         body.push_back(stat);
 
+        for (AstStat* desugared : pendingStatements)
+            body.push_back(desugared);
+        pendingStatements.clear();
+
         if (isStatLast(stat))
             break;
     }
+
+    blockAllowsDeclarations = outerBlockAllowsDeclarations;
 
     const Location location = Location(prevPosition, lexer.current().location.begin);
 
     return allocator.alloc<AstStatBlock>(location, copy(body));
 }
 
+// Luwu Classes (rfcs/classes): the grammar below adds classStatement (see parseClassStat).
 // stat ::=
 // varlist `=' explist |
 // functioncall |
@@ -442,7 +656,8 @@ AstStatBlock* Parser::parseBlockNoScope()
 // attributes function funcname funcbody |
 // local function Name funcbody |
 // local attributes function Name funcbody |
-// local namelist [`=' explist]
+// local namelist [`=' explist] |
+// classStatement
 // laststat ::= return [explist] | break
 AstStat* Parser::parseStat()
 {
@@ -464,7 +679,7 @@ AstStat* Parser::parseStat()
     case Lexeme::ReservedLocal:
     {
         Location start = lexer.current().location;
-        return parseLocal(start, start.begin, {nullptr, 0}, false);
+        return parseLocal(start, start, {nullptr, 0}, false);
     }
     case Lexeme::ReservedReturn:
         return parseReturn();
@@ -478,8 +693,24 @@ AstStat* Parser::parseStat()
 
     Location start = lexer.current().location;
 
+    // Luwu Destructuring (rfcs/destructuring.md): `.{x} = t` with no `local`/`const`. Parsed as a `local` so the
+    // rest of the file still sees its names.
+    if (destructurePatternFollows())
+    {
+        report(start, "%s", kDestructuringNeedsKeywordError);
+        return parseDestructuring(start, start, /* isConst= */ false);
+    }
+
     // we need to disambiguate a few cases, primarily assignment (lvalue = ...) vs statements-that-are calls
     AstExpr* expr = parsePrimaryExpr(/* asStatement= */ true);
+
+    // Luwu Destructuring (rfcs/destructuring.md): `name.{x} = t` with no `local`/`const`, see parsePrimaryExpr.
+    bool destructuringWithoutKeyword = destructurePatternFollows() && getIdentifier(expr) != "const";
+    if (destructuringWithoutKeyword)
+    {
+        report(expr->location, "%s", kDestructuringNeedsKeywordError);
+        return parseDestructuring(start, start, /* isConst= */ false, Name(getIdentifier(expr), expr->location));
+    }
 
     if (expr->is<AstExprCall>())
         return allocator.alloc<AstStatExpr>(expr->location, expr);
@@ -498,20 +729,48 @@ AstStat* Parser::parseStat()
     if (ident == "type")
         return parseTypeAlias(expr->location, /* exported= */ false, expr->location.begin, expr->location);
 
-    if (FFlag::DebugLuauUserDefinedClasses && ident == "class")
-        return parseClassStat(start, /*exported*/ false, start);
+    if (ident == "class")
+    {
+        if (FFlag::LuwuClasses)
+            return parseClassStat(start, /*exported*/ false, start);
+
+        // Without the feature, `class` is an ordinary identifier, so only diagnose the shape a class
+        // declaration actually has (`class Name`); anything else is someone's variable named `class`.
+        if (lexer.current().type == Lexeme::Name)
+            return reportStatError(expr->location, copy({expr}), {}, "%s", kClassesDisabledError);
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): `trait Name`. Like `class`, `trait` is only a keyword where a declaration starts,
+    // so a variable named `trait` keeps working.
+    if (ident == "trait" && traitsEnabled() && lexer.current().type == Lexeme::Name)
+        return parseClassStat(start, /* exported= */ false, start, {nullptr, 0}, /* declared= */ false, /* isTrait= */ true);
 
     if (ident == "export")
     {
+        // Luwu Declare Statements (rfcs/declare-statements.md): `export declare extern type`, `export declare class`
+        bool exportsDeclaration = FFlag::LuwuDeclareStatements && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "declare";
+        if (exportsDeclaration)
+        {
+            Location declareLocation = lexer.current().location;
+            nextLexeme();
+            return parseDeclaration(declareLocation, AstArray<AstAttr*>({nullptr, 0}), expr->location);
+        }
+
         if (FFlag::LuauExportValueSyntax)
         {
             Lexeme current = lexer.current();
 
+            // Luwu Traits (rfcs/classes/traits.md): `export trait Name`
+            bool exportsTrait = current.type == Lexeme::Name && AstName(current.name) == "trait" && traitsEnabled() &&
+                                lexer.lookahead().type == Lexeme::Name;
+
             if (current.type == Lexeme::ReservedLocal || current.type == Lexeme::ReservedFunction ||
                 (current.type == Lexeme::Name && AstName(current.name) == "const") ||
-                ((FFlag::DebugLuauUserDefinedClasses && current.type == Lexeme::Name) && AstName(current.name) == "class"))
+                (current.type == Lexeme::Name && AstName(current.name) == "class") || exportsTrait)
             {
-                return parseExportValue(expr->location, expr->location.begin, AstArray<AstAttr*>({nullptr, 0}));
+                // `export class` routes here with the classes feature off too, so that it reports the
+                // feature being disabled rather than 'export' wanting an identifier.
+                return parseExportValue(expr->location, expr->location, AstArray<AstAttr*>({nullptr, 0}));
             }
             else if (current.type == Lexeme::Name && AstName(current.name) == "type")
             {
@@ -522,8 +781,11 @@ AstStat* Parser::parseStat()
             }
         }
         // TODO: remove with LuauExportValueSyntax
-        else if (FFlag::DebugLuauUserDefinedClasses && AstName(lexer.current().name) == "class")
+        else if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "class")
         {
+            if (!FFlag::LuwuClasses)
+                return reportStatError(expr->location, copy({expr}), {}, "%s", kClassesDisabledError);
+
             Location classKeywordLocation = lexer.current().location;
             nextLexeme();
             return parseClassStat(start, /*exported*/ true, classKeywordLocation);
@@ -545,13 +807,10 @@ AstStat* Parser::parseStat()
         return parseContinue(expr->location);
 
     if (ident == "const")
-        return parseLocal(expr->location, expr->location.begin, AstArray<AstAttr*>({nullptr, 0}), true);
+        return parseLocal(expr->location, expr->location, AstArray<AstAttr*>({nullptr, 0}), true);
 
-    if (options.allowDeclarationSyntax)
-    {
-        if (ident == "declare")
-            return parseDeclaration(expr->location, AstArray<AstAttr*>({nullptr, 0}));
-    }
+    if (ident == "declare" && declarationsAllowed())
+        return parseDeclaration(expr->location, AstArray<AstAttr*>({nullptr, 0}));
 
     // skip unexpected symbol if lexer couldn't advance at all (statements are parsed in a loop)
     if (start == lexer.current().location)
@@ -688,6 +947,7 @@ AstStat* Parser::parseDo()
 
     Position statsStart = lexer.current().location.begin;
 
+    nextBlockAllowsDeclarations = blockAllowsDeclarations;
     AstStatBlock* body = parseBlock();
 
     body->location.begin = start.begin;
@@ -899,7 +1159,7 @@ AstExpr* Parser::parseFunctionName(bool& hasself, AstName& debugname)
 
 AstStatClass* Parser::getMatchingClass(AstExpr* expr)
 {
-    LUAU_ASSERT(FFlag::DebugLuauUserDefinedClasses);
+    LUAU_ASSERT(FFlag::LuwuClasses);
     if (AstExprGlobal* g = expr->as<AstExprGlobal>())
     {
         if (AstStatClass** classDecl = classesWithinModule.find(g->name))
@@ -911,7 +1171,7 @@ AstStatClass* Parser::getMatchingClass(AstExpr* expr)
 bool Parser::isExprLValue(AstExpr* expr)
 {
     return (expr->is<AstExprLocal>() && !expr->as<AstExprLocal>()->local->isConst) ||
-           (expr->is<AstExprGlobal>() && !(FFlag::DebugLuauUserDefinedClasses && getMatchingClass(expr) != nullptr)) ||
+           (expr->is<AstExprGlobal>() && !(FFlag::LuwuClasses && getMatchingClass(expr) != nullptr)) ||
            expr->is<AstExprIndexExpr>() || expr->is<AstExprIndexName>();
 }
 
@@ -936,8 +1196,7 @@ AstStatFunction* Parser::parseFunctionStat(const AstArray<AstAttr*>& attributes,
 
     if (!isExprLValue(expr))
     {
-        expr = FFlag::LuauExportValueSyntax ? reportLValueError(expr)
-                                            : reportExprError(expr->location, copy({expr}), "Assigned expression must be a variable or a field");
+        expr = reportLValueError(expr);
     }
 
     matchRecoveryStopOnToken[Lexeme::ReservedEnd]++;
@@ -958,31 +1217,22 @@ std::optional<AstAttr::Type> Parser::validateAttribute(
     Location loc,
     const char* attributeName,
     const TempVector<AstAttr*>& attributes,
-    const AstArray<AstExpr*>& args
+    const AstArray<AstExpr*>& args,
+    AstAttr::Context context
 )
 {
     // check if the attribute name is valid
     std::optional<AstAttr::Type> type;
     std::optional<AttributeArgumentsValidator> argsValidator;
+    AstAttr::Context allowedContexts = AstAttr::Context::None;
+    const char* allowedPositionsHint = nullptr;
 
-    for (int i = 0; kAttributeEntries[i].name; ++i)
+    if (const AttributeEntry* entry = findAttributeEntry(attributeName))
     {
-        if (strcmp(attributeName, kAttributeEntries[i].name) == 0)
-        {
-            type = kAttributeEntries[i].type;
-            argsValidator = kAttributeEntries[i].argsValidator;
-            break;
-        }
-    }
-
-    for (const auto& [attributeEntry, fflagBool] : kDebugAttributeEntries)
-    {
-        if (fflagBool && strcmp(attributeName, attributeEntry.name) == 0)
-        {
-            type = attributeEntry.type;
-            argsValidator = attributeEntry.argsValidator;
-            break;
-        }
+        type = entry->type;
+        allowedContexts = entry->allowedContexts;
+        allowedPositionsHint = entry->allowedPositionsHint;
+        argsValidator = entry->argsValidator;
     }
 
     if (!type)
@@ -994,6 +1244,10 @@ std::optional<AstAttr::Type> Parser::validateAttribute(
     }
     else
     {
+        // check that the attribute means something where it was written
+        if (AstAttr::isSingleContext(context) && !AstAttr::contextAllows(allowedContexts, context))
+            reportAttributeNotAllowed(loc, attributeName, allowedPositionsHint, context);
+
         // check that attribute is not duplicated
         for (const AstAttr* attr : attributes)
         {
@@ -1014,7 +1268,7 @@ std::optional<AstAttr::Type> Parser::validateAttribute(
 }
 
 // attrlist = '@[' parattr {',' parattr} ']'
-void Parser::parseAttrList(TempVector<AstAttr*>& attributes, TempVector<CstAttrList*>* cstAttrLists)
+void Parser::parseAttrList(TempVector<AstAttr*>& attributes, TempVector<CstAttrList*>* cstAttrLists, AstAttr::Context context)
 {
     LUAU_ASSERT(FFlag::LuauCstAttr);
 
@@ -1026,6 +1280,7 @@ void Parser::parseAttrList(TempVector<AstAttr*>& attributes, TempVector<CstAttrL
 
     AstArray<AstExpr*> empty;
     TempVector<Position> commaPositions(scratchPosition);
+    const size_t firstInList = attributes.size();
 
     if (lexer.current().type != ']')
     {
@@ -1048,13 +1303,9 @@ void Parser::parseAttrList(TempVector<AstAttr*>& attributes, TempVector<CstAttrL
                 auto [args, argsLocation, _exprLocation] =
                     options.storeCstData ? parseCallList(&argCommaPositions, &closeParenPosition) : parseCallList(nullptr, nullptr);
 
-                for (const AstExpr* arg : args)
-                {
-                    if (!isConstantLiteral(arg) && !isLiteralTable(arg))
-                        report(argsLocation, "Only literals can be passed as arguments for attributes");
-                }
+                reportNonLiteralAttributeArgs(args, argsLocation);
 
-                std::optional<AstAttr::Type> type = validateAttribute(nameLoc, attrName, attributes, args);
+                std::optional<AstAttr::Type> type = validateAttribute(nameLoc, attrName, attributes, args, context);
 
                 AstAttr* node =
                     allocator.alloc<AstAttr>(Location(nameLoc, argsLocation), type.value_or(AstAttr::Type::Unknown), args, AstName(attrName));
@@ -1066,7 +1317,7 @@ void Parser::parseAttrList(TempVector<AstAttr*>& attributes, TempVector<CstAttrL
             }
             else
             {
-                std::optional<AstAttr::Type> type = validateAttribute(nameLoc, attrName, attributes, empty);
+                std::optional<AstAttr::Type> type = validateAttribute(nameLoc, attrName, attributes, empty, context);
 
                 AstAttr* node = allocator.alloc<AstAttr>(nameLoc, type.value_or(AstAttr::Type::Unknown), empty, AstName(attrName));
 
@@ -1107,15 +1358,54 @@ void Parser::parseAttrList(TempVector<AstAttr*>& attributes, TempVector<CstAttrL
 
     if (options.storeCstData)
     {
-        LUAU_ASSERT(cstAttrLists);
-        cstAttrLists->push_back(allocator.alloc<CstAttrList>(
+        CstAttrList* list = allocator.alloc<CstAttrList>(
             open.location.begin, closingBracketFound ? lexer.previousLocation().begin : Position::missing(), copy(commaPositions)
-        ));
+        );
+
+        // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): the list is also recorded on
+        // its first attribute, so a position that has no CST list of its own can still print it. Upstream
+        // asserts that every caller passes `cstAttrLists`; positions that only Luwu allows attributes on don't.
+        LUAU_ASSERT(firstInList < attributes.size());
+        if (CstNode** first = cstNodeMap.find(attributes[firstInList]))
+        {
+            if (CstAttr* attr = (*first)->as<CstAttr>())
+                attr->openedList = list;
+            else if (CstParametrizedAttr* parametrized = (*first)->as<CstParametrizedAttr>())
+                parametrized->openedList = list;
+        }
+
+        if (cstAttrLists)
+            cstAttrLists->push_back(list);
     }
 }
 
+bool Parser::parseMisplacedBareAttributeArgs(const char* name, AstAttr::Context context, AstArray<AstExpr*>& args, Location& argsLocation)
+{
+    // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): upstream reports whatever the
+    // next token then fails to be.
+    if (!FFlag::LuwuAttributesEverywhere)
+        return false;
+
+    // In a table entry, value or type, the entry may itself *be* a table or a string, so there is
+    // nothing misplaced to report.
+    if (contextCanStartWithTableOrString(context))
+        return false;
+
+    const Lexeme::Type next = lexer.current().type;
+    const bool argumentsFollow = next == '{' || next == Lexeme::RawString || next == Lexeme::QuotedString;
+    if (!argumentsFollow)
+        return false;
+
+    report(lexer.current().location, "Attribute arguments must be written as '@[%s ...]'; a bare '@%s' cannot take arguments", name, name);
+
+    std::tie(args, argsLocation, std::ignore) = parseCallList(nullptr);
+    reportNonLiteralAttributeArgs(args, argsLocation);
+
+    return true;
+}
+
 // attribute ::= '@' NAME
-void Parser::parseAttribute_DEPRECATED(TempVector<AstAttr*>& attributes)
+void Parser::parseAttribute_DEPRECATED(TempVector<AstAttr*>& attributes, AstAttr::Context context)
 {
     LUAU_ASSERT(!FFlag::LuauCstAttr);
 
@@ -1128,11 +1418,18 @@ void Parser::parseAttribute_DEPRECATED(TempVector<AstAttr*>& attributes)
         Location loc = lexer.current().location;
 
         const char* name = lexer.current().name;
-        std::optional<AstAttr::Type> type = validateAttribute(loc, name, attributes, empty);
 
         nextLexeme();
 
-        attributes.push_back(allocator.alloc<AstAttr>(loc, type.value_or(AstAttr::Type::Unknown), empty, AstName(name)));
+        AstArray<AstExpr*> args = empty;
+        Location argsLocation;
+        const bool misplaced = parseMisplacedBareAttributeArgs(name, context, args, argsLocation);
+
+        std::optional<AstAttr::Type> type = validateAttribute(loc, name, attributes, args, context);
+
+        attributes.push_back(allocator.alloc<AstAttr>(
+            misplaced ? Location(loc, argsLocation) : loc, type.value_or(AstAttr::Type::Unknown), args, AstName(name)
+        ));
     }
     else
     {
@@ -1154,13 +1451,9 @@ void Parser::parseAttribute_DEPRECATED(TempVector<AstAttr*>& attributes)
 
                     auto [args, argsLocation, _exprLocation] = parseCallList(nullptr);
 
-                    for (const AstExpr* arg : args)
-                    {
-                        if (!isConstantLiteral(arg) && !isLiteralTable(arg))
-                            report(argsLocation, "Only literals can be passed as arguments for attributes");
-                    }
+                    reportNonLiteralAttributeArgs(args, argsLocation);
 
-                    std::optional<AstAttr::Type> type = validateAttribute(nameLoc, attrName, attributes, args);
+                    std::optional<AstAttr::Type> type = validateAttribute(nameLoc, attrName, attributes, args, context);
 
                     attributes.push_back(
                         allocator.alloc<AstAttr>(Location(nameLoc, argsLocation), type.value_or(AstAttr::Type::Unknown), args, AstName(attrName))
@@ -1168,7 +1461,7 @@ void Parser::parseAttribute_DEPRECATED(TempVector<AstAttr*>& attributes)
                 }
                 else
                 {
-                    std::optional<AstAttr::Type> type = validateAttribute(nameLoc, attrName, attributes, empty);
+                    std::optional<AstAttr::Type> type = validateAttribute(nameLoc, attrName, attributes, empty, context);
                     attributes.push_back(allocator.alloc<AstAttr>(nameLoc, type.value_or(AstAttr::Type::Unknown), empty, AstName(attrName)));
                 }
 
@@ -1197,7 +1490,7 @@ void Parser::parseAttribute_DEPRECATED(TempVector<AstAttr*>& attributes)
 }
 
 // attribute ::= '@' NAME
-void Parser::parseAttribute(TempVector<AstAttr*>& attributes)
+void Parser::parseAttribute(TempVector<AstAttr*>& attributes, AstAttr::Context context)
 {
     LUAU_ASSERT(FFlag::LuauCstAttr);
 
@@ -1208,18 +1501,28 @@ void Parser::parseAttribute(TempVector<AstAttr*>& attributes)
     Location loc = lexer.current().location;
 
     const char* name = lexer.current().name;
-    std::optional<AstAttr::Type> type = validateAttribute(loc, name, attributes, empty);
 
     nextLexeme();
 
-    AstAttr* node = allocator.alloc<AstAttr>(loc, type.value_or(AstAttr::Type::Unknown), empty, AstName(name));
+    // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): a bare `@name` never takes
+    // arguments; `@[name { ... }]` is the form that does. Arguments written bare anyway are reported as that,
+    // and parsed so this is the only error.
+    AstArray<AstExpr*> args = empty;
+    Location argsLocation;
+    const bool argumentsFollowBare = parseMisplacedBareAttributeArgs(name, context, args, argsLocation);
+
+    std::optional<AstAttr::Type> type = validateAttribute(loc, name, attributes, args, context);
+
+    AstAttr* node = allocator.alloc<AstAttr>(
+        argumentsFollowBare ? Location(loc, argsLocation) : loc, type.value_or(AstAttr::Type::Unknown), args, AstName(name)
+    );
     attributes.push_back(node);
     if (options.storeCstData)
         cstNodeMap[node] = allocator.alloc<CstAttr>(/* hasAt */ true);
 }
 
 // attributes ::= {attribute}
-AstArray<AstAttr*> Parser::parseAttributes(TempVector<CstAttrList*>* cstAttrLists)
+AstArray<AstAttr*> Parser::parseAttributes(AstAttr::Context context, TempVector<CstAttrList*>* cstAttrLists)
 {
     LUAU_ASSERT(cstAttrLists != nullptr ? FFlag::LuauCstAttr : true);
 
@@ -1234,15 +1537,67 @@ AstArray<AstAttr*> Parser::parseAttributes(TempVector<CstAttrList*>* cstAttrList
         if (FFlag::LuauCstAttr)
         {
             if (lexer.current().type == Lexeme::Type::Attribute)
-                parseAttribute(attributes);
+                parseAttribute(attributes, context);
             else
-                parseAttrList(attributes, cstAttrLists);
+                parseAttrList(attributes, cstAttrLists, context);
         }
         else
-            parseAttribute_DEPRECATED(attributes);
+            parseAttribute_DEPRECATED(attributes, context);
     }
 
     return copy(attributes);
+}
+
+AstArray<AstAttr*> Parser::concatAttributes(const AstArray<AstAttr*>& first, const AstArray<AstAttr*>& second)
+{
+    if (first.size == 0)
+        return second;
+    if (second.size == 0)
+        return first;
+
+    TempVector<AstAttr*> merged(scratchAttr);
+    for (AstAttr* attr : first)
+        merged.push_back(attr);
+    for (AstAttr* attr : second)
+        merged.push_back(attr);
+
+    return copy(merged);
+}
+
+void Parser::validateAttributeContexts(const AstArray<AstAttr*>& attributes, AstAttr::Context context)
+{
+    for (const AstAttr* attr : attributes)
+    {
+        // An unknown attribute was already reported when it was parsed; don't pile a second error on it.
+        if (attr->type == AstAttr::Type::Unknown)
+            continue;
+
+        const AttributeEntry* entry = findAttributeEntry(attr->name.value);
+        if (entry && !AstAttr::contextAllows(entry->allowedContexts, context))
+            reportAttributeNotAllowed(attr->location, attr->name.value, entry->allowedPositionsHint, context);
+    }
+}
+
+void Parser::reportAttributeNotAllowed(const Location& location, const char* attributeName, const char* allowedPositionsHint, AstAttr::Context context)
+{
+    if (allowedPositionsHint)
+        report(location, "Attribute '@%s' can only be applied to %s", attributeName, allowedPositionsHint);
+    else
+        report(location, "Attribute '@%s' cannot be applied to %s", attributeName, attributeContextName(context));
+}
+
+void Parser::reportNonLiteralAttributeArgs(const AstArray<AstExpr*>& args, const Location& argsLocation)
+{
+    for (const AstExpr* arg : args)
+    {
+        if (!isConstantLiteral(arg) && !isLiteralTable(arg))
+            report(argsLocation, "Only literals can be passed as arguments for attributes");
+    }
+}
+
+bool Parser::attributesFollow() const
+{
+    return lexer.current().type == Lexeme::Attribute || lexer.current().type == Lexeme::AttributeOpen;
 }
 
 Location Parser::getAttributeStartLocation(
@@ -1286,65 +1641,112 @@ AstStat* Parser::parseAttributeStat()
 
     AstArray<AstAttr*> attributes;
     TempVector<CstAttrList*> cstAttrLists(scratchCstAttrList);
-    attributes = parseAttributes(FFlag::LuauCstAttr ? &cstAttrLists : nullptr);
+    attributes = parseAttributes(AstAttr::Context::Statement, FFlag::LuauCstAttr ? &cstAttrLists : nullptr);
+
+    const Location attributeStart = FFlag::LuauCstAttr ? getAttributeStartLocation(attributes, &cstAttrLists, startLocation)
+                                                       : (attributes.size > 0 ? attributes.data[0]->location : startLocation);
 
     Lexeme::Type type = lexer.current().type;
 
     switch (type)
     {
     case Lexeme::Type::ReservedFunction:
+        validateAttributeContexts(attributes, AstAttr::Context::Function);
         return parseFunctionStat(attributes, FFlag::LuauCstAttr ? &cstAttrLists : nullptr);
     case Lexeme::Type::ReservedLocal:
-        return parseLocal(
-            FFlag::LuauCstAttr ? getAttributeStartLocation(attributes, &cstAttrLists, startLocation)
-                               : (attributes.size > 0 ? attributes.data[0]->location : lexer.current().location),
-            lexer.current().location.begin,
-            attributes,
-            false,
-            FFlag::LuauCstAttr ? &cstAttrLists : nullptr
-        );
+        return parseLocal(attributeStart, lexer.current().location, attributes, false, FFlag::LuauCstAttr ? &cstAttrLists : nullptr);
     case Lexeme::Type::Name:
     {
         if (FFlag::LuauExportValueSyntax && AstName(lexer.current().name) == "export")
         {
             Location keywordLoc = lexer.current().location;
             nextLexeme();
-            return parseExportValue(
-                FFlag::LuauCstAttr ? getAttributeStartLocation(attributes, &cstAttrLists, startLocation)
-                                   : (attributes.size > 0 ? attributes.data[0]->location : keywordLoc),
-                keywordLoc.begin,
-                attributes,
-                FFlag::LuauCstAttr ? &cstAttrLists : nullptr
-            );
+            return parseExportValue(attributeStart, keywordLoc, attributes, FFlag::LuauCstAttr ? &cstAttrLists : nullptr);
         }
 
         if (strcmp("const", lexer.current().data) == 0)
         {
             Location keywordLoc = lexer.current().location;
             nextLexeme();
-            return parseLocal(
-                FFlag::LuauCstAttr ? getAttributeStartLocation(attributes, &cstAttrLists, startLocation)
-                                   : (attributes.size > 0 ? attributes.data[0]->location : keywordLoc),
-                keywordLoc.begin,
-                attributes,
-                true,
-                FFlag::LuauCstAttr ? &cstAttrLists : nullptr
-            );
+            return parseLocal(attributeStart, keywordLoc, attributes, true, FFlag::LuauCstAttr ? &cstAttrLists : nullptr);
         }
-        if (options.allowDeclarationSyntax && !strcmp("declare", lexer.current().data))
+        if (declarationsAllowed() && !strcmp("declare", lexer.current().data))
         {
+            // A declared function has no body, so it is a function but never an inlinable one.
+            validateAttributeContexts(attributes, AstAttr::Context::Function);
+
             AstExpr* expr = parsePrimaryExpr(/* asStatement= */ true);
             return parseDeclaration(expr->location, attributes);
         }
+
+        // `type`, `class` and an assignment target all begin with a Name, so they are told apart the
+        // way parseStat does it: parse the primary expression and look at what it turned out to be.
+        // The order matters and matches parseStat's -- `type = 5` is an assignment to a global named
+        // `type`, not a malformed type alias.
+        if (FFlag::LuwuAttributesEverywhere)
+        {
+            AstExpr* expr = parsePrimaryExpr(/* asStatement= */ true);
+
+            if (lexer.current().type == ',' || lexer.current().type == '=')
+            {
+                validateAttributeContexts(attributes, AstAttr::Context::Assignment);
+
+                AstStat* node = parseAssignment(expr);
+                node->location = Location(attributeStart, node->location);
+                if (AstStatAssign* assign = node->as<AstStatAssign>())
+                    assign->attributes = attributes;
+                return node;
+            }
+
+            AstName ident = getIdentifier(expr);
+
+            if (ident == "type")
+            {
+                // A type function is not a position any attribute allows, and it has nowhere to keep
+                // them, so they are refused rather than dropped.
+                if (lexer.current().type == Lexeme::ReservedFunction)
+                    report(Location(attributeStart, expr->location), "Attributes cannot be applied to a type function");
+                else
+                    validateAttributeContexts(attributes, AstAttr::Context::TypeAlias);
+
+                return parseTypeAlias(attributeStart, /* exported= */ false, expr->location.begin, expr->location, attributes);
+            }
+
+            if (ident == "class" && FFlag::LuwuClasses)
+            {
+                validateAttributeContexts(attributes, AstAttr::Context::Class);
+                return parseClassStat(attributeStart, /* exported= */ false, expr->location, attributes);
+            }
+
+            if (ident == "trait" && traitsEnabled())
+            {
+                validateAttributeContexts(attributes, AstAttr::Context::Class);
+                return parseClassStat(attributeStart, /* exported= */ false, expr->location, attributes, /* declared= */ false, /* isTrait= */ true);
+            }
+
+            // The expression is already consumed, so name what was attributed rather than quoting a
+            // token from past the end of it.
+            return reportStatError(
+                expr->location,
+                copy({expr}),
+                {},
+                "Expected 'function', 'local function', 'const function', 'declare function', 'type', 'class' or an assignment after attribute"
+            );
+        }
+
+        // Without LuwuAttributesEverywhere, any other name is reported by the default case.
+        LUAU_FALLTHROUGH;
     }
-        [[fallthrough]];
     default:
         return reportStatError(
             lexer.current().location,
             {},
             {},
-            "Expected 'function', 'local function', 'const function', 'declare function' or a function type declaration after attribute, but got "
-            "%s instead",
+            FFlag::LuwuAttributesEverywhere
+                ? "Expected 'function', 'local function', 'const function', 'declare function', 'type', 'class', an assignment or a function "
+                  "type declaration after attribute, but got %s instead"
+                : "Expected 'function', 'local function', 'const function', 'declare function' or a function type declaration after attribute, "
+                  "but got %s instead",
             lexer.current().toString().c_str()
         );
     }
@@ -1363,7 +1765,7 @@ bool isEnoughValues(TempVector<AstExpr*>& values, size_t expected)
 
 AstStat* Parser::parseLocal(
     const Location start,
-    const Position keywordPosition,
+    const Location& keywordLocation,
     const AstArray<AstAttr*>& attributes,
     bool isConst,
     TempVector<CstAttrList*>* cstAttrLists
@@ -1371,23 +1773,31 @@ AstStat* Parser::parseLocal(
 {
     LUAU_ASSERT(cstAttrLists != nullptr ? FFlag::LuauCstAttr : true);
 
+    const Position keywordPosition = keywordLocation.begin;
+
+    // `start` is the start of the whole statement, which with attributes is the first `@` rather
+    // than the keyword. The caller has already consumed a `const` keyword, but not a `local` one.
+    const Location localKeywordLocation = isConst ? keywordLocation : lexer.current().location;
+
     if (!isConst)
         nextLexeme(); // local
 
     if (lexer.current().type == Lexeme::ReservedFunction)
     {
+        // A local or const function is resolved at its call sites, so it is one the compiler can inline.
+        validateAttributeContexts(attributes, AstAttr::Context::InlinableFunction);
+
         Lexeme matchFunction = lexer.current();
         nextLexeme();
 
         Position functionKeywordPosition = matchFunction.location.begin;
         Location functionKeywordLocation = matchFunction.location;
 
-        // For the closing 'end' indentation-mismatch diagnostic only, match against the column
-        // where 'local'/'const' starts rather than 'function' -- but do this on a separate copy,
-        // not `matchFunction` itself, since `matchFunction.location` is also used below as the
-        // real, unadjusted 'function' keyword location for the resulting AstExprFunction (and its
-        // CST node); mutating it in place used to corrupt that location, making the function
-        // expression's span start at 'local'/'const' instead of 'function'.
+        // The closing 'end' indentation-mismatch diagnostic matches against the column where
+        // 'local'/'const' starts rather than 'function', so it gets a patched copy of the token.
+        // Luwu: upstream patches `matchFunction` itself, which parseFunctionBody also takes the
+        // AstExprFunction's start from, so upstream's function expression starts at 'local'/'const'.
+        // Luwu's starts at 'function', so keyword hovers can tell the tokens apart by location.
         Lexeme endMatchLexeme = matchFunction;
         if (endMatchLexeme.location.begin.line == start.begin.line)
             endMatchLexeme.location.begin.column = start.begin.column;
@@ -1421,15 +1831,30 @@ AstStat* Parser::parseLocal(
     }
     else
     {
+        if (destructuringFollows())
+        {
+            if (attributes.size != 0)
+                report(attributes.data[0]->location, "Attributes can't be applied to a destructuring declaration");
+
+            return parseDestructuring(start, localKeywordLocation, isConst);
+        }
+
+        // The attributes were parsed before we knew this was a plain binding rather than a local
+        // function, so this is where they get checked against the position they landed on.
         if (attributes.size != 0)
         {
-            return reportStatError(
-                lexer.current().location,
-                {},
-                {},
-                "Expected 'function' after local declaration with attribute, but got %s instead",
-                lexer.current().toString().c_str()
-            );
+            if (!FFlag::LuwuAttributesEverywhere)
+            {
+                return reportStatError(
+                    lexer.current().location,
+                    {},
+                    {},
+                    "Expected 'function' after local declaration with attribute, but got %s instead",
+                    lexer.current().toString().c_str()
+                );
+            }
+
+            validateAttributeContexts(attributes, AstAttr::Context::Local);
         }
 
         matchRecoveryStopOnToken['=']++;
@@ -1465,7 +1890,10 @@ AstStat* Parser::parseLocal(
         Location end = values.empty() ? lexer.previousLocation() : values.back()->location;
 
         AstStatLocal* node = allocator.alloc<AstStatLocal>(Location(start, end), copy(vars), copy(values), equalsSignLocation, isConst);
-        node->keywordLocation = start;
+        // Only when attributes are present do `start` and the keyword differ; every other path
+        // passes the keyword's own location as `start`, so this keeps those byte-identical.
+        node->keywordLocation = attributes.size > 0 ? localKeywordLocation : start;
+        node->attributes = attributes;
         if (options.storeCstData)
         {
             cstNodeMap[node] = allocator.alloc<CstStatLocal>(extractAnnotationColonPositions(names), varsCommaPositions, copy(valuesCommaPositions));
@@ -1485,6 +1913,356 @@ AstStat* Parser::parseLocal(
 
         return node;
     }
+}
+
+// Luwu Destructuring (rfcs/destructuring.md): `.{` or `name.{` right after `local`/`const`. Neither `name.` nor
+// `{` can start anything else there, so both are parsed as a (malformed) destructuring for a useful error.
+bool Parser::destructuringFollows()
+{
+    if (lexer.current().type == '{')
+        return true;
+
+    if (lexer.current().type == '.')
+        return destructurePatternFollows();
+
+    return lexer.current().type == Lexeme::Name && lexer.lookahead().type == '.';
+}
+
+// Luwu Destructuring (rfcs/destructuring.md): `.{`, which starts a pattern wherever it appears.
+bool Parser::destructurePatternFollows()
+{
+    return lexer.current().type == '.' && lexer.lookahead().type == '{';
+}
+
+// Luwu Destructuring (rfcs/destructuring.md): the declaration desugars to one `local`/`const` per binding, in
+// source order. The value goes to the named local, or to a hidden one, and each field is read from there:
+//
+//   const fs.{readfile as rf, path} = require("@std/fs")
+//
+//   const fs = require("@std/fs")
+//   const rf = fs.readfile
+//   const path = fs.path
+//
+// The first statement is returned; the rest are left in pendingStatements for parseBlockNoScope.
+AstStat* Parser::parseDestructuring(const Location& start, const Location& keywordLocation, bool isConst, std::optional<Name> name)
+{
+    DestructureTarget target;
+    target.name = name;
+    if (!target.name && lexer.current().type == Lexeme::Name)
+        target.name = parseName("variable name");
+
+    // JavaScript's `local {x, y} = t`
+    if (lexer.current().type == '{')
+        report(lexer.current().location, "Destructuring needs a '.' before '{': 'local .{x, y} = t'");
+
+    parseDestructurePattern(target);
+
+    if (lexer.current().type == ':')
+    {
+        nextLexeme();
+        target.annotation = parseType();
+    }
+
+    Location equalsLocation = lexer.current().location;
+    AstExpr* value = nullptr;
+
+    if (lexer.current().type == '=')
+    {
+        nextLexeme();
+        value = parseExpr();
+    }
+    else
+    {
+        value = reportExprError(lexer.current().location, {}, "Expected '=' and a value after the destructuring pattern");
+    }
+
+    if (lexer.current().type == ',')
+    {
+        Location extra = lexer.current().location;
+        TempVector<AstExpr*> rest(scratchExpr);
+        nextLexeme();
+        parseExprList(rest);
+        report(Location(extra, lexer.previousLocation()), "A destructuring declaration takes exactly one value");
+    }
+
+    Location location(start, value->location);
+
+    if (!FFlag::LuwuDestructuring)
+        report(location, "Destructuring is a Luwu feature; enable the 'LuwuDestructuring' fast flag to use it");
+
+    std::vector<AstStat*> statements;
+    AstDestructurePattern pattern = desugarDestructuring(target, value, location, equalsLocation, isConst, statements);
+
+    AstStatLocal* first = statements.front()->as<AstStatLocal>();
+    LUAU_ASSERT(first);
+    first->keywordLocation = keywordLocation;
+    first->destructure = allocator.alloc<AstDestructurePattern>(pattern);
+
+    // Upstream's destructuring RFC (luau-lang/rfcs#260) is still open, so none of this is Luau syntax yet.
+    for (AstStat* statement : statements)
+    {
+        statement->luwuOnly = true;
+
+        if (statement != first)
+            statement->as<AstStatLocal>()->destructuredFrom = first;
+    }
+
+    pendingStatements.insert(pendingStatements.end(), statements.begin() + 1, statements.end());
+
+    return first;
+}
+
+// Parses `.{ fieldlist }` into `target`, starting at the `.` (or at the `{`, when the caller already reported
+// the missing `.`). A malformed field gets one error that names the form that works, and parsing resumes at the
+// next field so the rest of the pattern still binds.
+void Parser::parseDestructurePattern(DestructureTarget& target)
+{
+    unsigned int oldRecursionCount = recursionCounter;
+    incrementRecursionCounter("destructuring");
+
+    Location begin = lexer.current().location;
+    if (lexer.current().type == '.')
+        nextLexeme();
+
+    Lexeme open = lexer.current();
+    expectAndConsume('{', "destructuring");
+
+    if (lexer.current().type == '}')
+        report(Location(begin, lexer.current().location), "A destructuring pattern needs at least one field");
+
+    while (lexer.current().type != '}' && lexer.current().type != Lexeme::Eof)
+    {
+        if (lexer.current().type != Lexeme::Name)
+        {
+            reportDestructureKeyError();
+            skipDestructureField();
+        }
+        else
+        {
+            target.fields.push_back(parseDestructureField());
+        }
+
+        if (lexer.current().type == ',')
+        {
+            nextLexeme();
+            continue;
+        }
+
+        if (lexer.current().type == '}' || lexer.current().type == Lexeme::Eof)
+            break;
+
+        // Two fields with no comma between them: report it and carry on with the next field
+        if (lexer.current().type == Lexeme::Name)
+        {
+            report(lexer.current().location, "Expected ',' between destructured fields, got '%s'", lexer.current().name);
+            continue;
+        }
+
+        report(lexer.current().location, "Expected ',' or '}' after a destructured field, got %s", lexer.current().toString().c_str());
+        skipDestructureField();
+
+        if (lexer.current().type == ',')
+            nextLexeme();
+    }
+
+    target.patternLocation = Location(begin, lexer.current().location);
+    target.closed = expectMatchAndConsume('}', open);
+
+    recursionCounter = oldRecursionCount;
+}
+
+// field ::= Name [`.' `{' fieldlist `}'] | Name `as' target
+Parser::DestructureField Parser::parseDestructureField()
+{
+    DestructureField field{parseName("field name"), std::nullopt, {}};
+    const char* key = field.key.name.value;
+
+    if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "as")
+    {
+        field.asLocation = lexer.current().location;
+        nextLexeme();
+
+        if (lexer.current().type == Lexeme::Name)
+        {
+            field.target.name = parseName("variable name");
+        }
+        else if (lexer.current().type != '.')
+        {
+            report(lexer.current().location, "Expected a name or '.{' after 'as', got %s", lexer.current().toString().c_str());
+            // Bind the field under its own name so the rest of the declaration still parses, placed in the gap after
+            // `as` where the name will be written, so tools see a cursor there as being on a binding name
+            field.target.name = Name(field.key.name, Location(field.asLocation->end, lexer.current().location.begin));
+        }
+    }
+    else
+    {
+        field.target.name = field.key;
+    }
+
+    if (lexer.current().type == '.' && lexer.lookahead().type == Lexeme::Name)
+    {
+        // `key.inner`: a path, which a pattern doesn't have
+        const char* inner = lexer.lookahead().name;
+        report(
+            Location(field.key.location, lexer.lookahead().location),
+            "To take '%s' out of '%s', write '%s.{%s}' to bind both, or '%s as .{%s}' to bind only '%s'",
+            inner,
+            key,
+            key,
+            inner,
+            key,
+            inner,
+            inner
+        );
+        skipDestructureField();
+
+        // `key as .inner` reaches here with nothing to bind the field to
+        if (!field.target.name)
+            field.target.name = field.key;
+
+        return field;
+    }
+
+    if (lexer.current().type == '.')
+        parseDestructurePattern(field.target);
+
+    if (lexer.current().type == ':')
+    {
+        nextLexeme();
+        field.target.annotation = parseType();
+
+        // `key: T as name`: the annotation types what `as` binds, so it goes after it
+        bool asAfterAnnotation = !field.asLocation && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "as";
+        if (asAfterAnnotation)
+        {
+            Location as = lexer.current().location;
+            nextLexeme();
+            std::optional<Name> renamed = parseNameOpt("variable name");
+            report(
+                Location(as, lexer.previousLocation()),
+                "An annotation goes after the name it types: '%s as %s: T'",
+                key,
+                renamed ? renamed->name.value : "name"
+            );
+            if (renamed)
+                field.target.name = renamed;
+        }
+    }
+
+    if (lexer.current().type == '=')
+    {
+        // A default value, which destructuring doesn't have: parse it so it doesn't cascade into more errors
+        Location equals = lexer.current().location;
+        nextLexeme();
+        AstExpr* defaultValue = parseExpr();
+        report(
+            Location(equals, defaultValue->location),
+            "Destructured fields can't have default values; a missing field reads as whatever indexing the value gives"
+        );
+    }
+
+    return field;
+}
+
+// Something other than a name where a field's key goes.
+void Parser::reportDestructureKeyError()
+{
+    const Lexeme& current = lexer.current();
+
+    bool nestedWithoutField = current.type == '{' || current.type == '.';
+    bool otherKey =
+        current.type == '[' || current.type == Lexeme::QuotedString || current.type == Lexeme::RawString || current.type == Lexeme::Number;
+
+    if (current.type == Lexeme::Dot3)
+        report(current.location, "Destructuring has no rest pattern; bind the value with a name to keep the rest: 'local t.{x} = ...'");
+    else if (nestedWithoutField)
+        report(current.location, "A nested pattern needs the field it destructures: 'field.{...}' or 'field as .{...}'");
+    else if (otherKey)
+        report(current.location, "Destructured fields are names; read any other key by indexing the value: 'local v = t[key]'");
+    else
+        report(current.location, "Expected a field name in the destructuring pattern, got %s", current.toString().c_str());
+}
+
+// Skips to the `,` or `}` that ends the current field, stepping over anything bracketed inside it.
+void Parser::skipDestructureField()
+{
+    int depth = 0;
+
+    while (lexer.current().type != Lexeme::Eof)
+    {
+        Lexeme::Type type = lexer.current().type;
+
+        if (depth == 0 && (type == ',' || type == '}'))
+            return;
+
+        if (type == '{' || type == '(' || type == '[')
+            depth++;
+        else if (type == '}' || type == ')' || type == ']')
+            depth--;
+
+        nextLexeme();
+    }
+}
+
+AstDestructurePattern Parser::desugarDestructuring(
+    const DestructureTarget& target,
+    AstExpr* value,
+    const Location& location,
+    const Location& equalsLocation,
+    bool isConst,
+    std::vector<AstStat*>& out
+)
+{
+    AstLocal* local = nullptr;
+
+    if (target.name)
+    {
+        local = pushLocal(Binding(*target.name, target.annotation, Position{0, 0}, isConst));
+    }
+    else
+    {
+        // Code can't name the hidden local, so it never enters the scope: nothing can shadow it or be
+        // shadowed by it, and the linter has nothing to report about it.
+        local = allocator.alloc<AstLocal>(
+            nameDestructured,
+            target.patternLocation.value_or(location),
+            /* shadow= */ nullptr,
+            functionStack.size() - 1,
+            functionStack.back().loopDepth,
+            target.annotation,
+            isConst
+        );
+    }
+
+    out.push_back(allocator.alloc<AstStatLocal>(location, copy({local}), copy({value}), equalsLocation, isConst));
+
+    AstDestructurePattern pattern;
+    pattern.local = local;
+    pattern.location = target.patternLocation;
+    pattern.closed = target.closed;
+
+    TempVector<AstDestructureField> fields(scratchDestructureField);
+
+    for (const DestructureField& field : target.fields)
+    {
+        Location keyLocation = field.key.location;
+        AstExpr* object = allocator.alloc<AstExprLocal>(keyLocation, local, /* upvalue= */ false);
+        AstExpr* read = allocator.alloc<AstExprIndexName>(keyLocation, object, field.key.name, keyLocation, keyLocation.begin, '.');
+
+        Position end = keyLocation.end;
+        if (field.target.annotation)
+            end = field.target.annotation->location.end;
+        else if (field.target.patternLocation)
+            end = field.target.patternLocation->end;
+        else if (field.target.name)
+            end = field.target.name->location.end;
+
+        AstDestructurePattern fieldTarget = desugarDestructuring(field.target, read, Location(keyLocation.begin, end), keyLocation, isConst, out);
+        fields.push_back(AstDestructureField{field.key.name, keyLocation, field.asLocation, fieldTarget});
+    }
+
+    pattern.fields = copy(fields);
+    return pattern;
 }
 
 // return [explist]
@@ -1518,7 +2296,13 @@ AstStat* Parser::parseReturn()
 }
 
 // type Name [`<' varlist `>'] `=' Type
-AstStat* Parser::parseTypeAlias(const Location& start, bool exported, Position typeKeywordPosition, const Location& typeKeywordLocation)
+AstStat* Parser::parseTypeAlias(
+    const Location& start,
+    bool exported,
+    Position typeKeywordPosition,
+    const Location& typeKeywordLocation,
+    const AstArray<AstAttr*>& attributes
+)
 {
     // parsing a type function
     if (lexer.current().type == Lexeme::ReservedFunction)
@@ -1533,6 +2317,8 @@ AstStat* Parser::parseTypeAlias(const Location& start, bool exported, Position t
     // Use error name if the name is missing
     if (!name)
         name = Name(nameError, lexer.current().location);
+    else
+        checkTypeName(*name, /* declared= */ false);
 
     Position genericsOpenPosition = Position::missing();
     AstArray<Position> genericsCommaPositions;
@@ -1551,6 +2337,7 @@ AstStat* Parser::parseTypeAlias(const Location& start, bool exported, Position t
     AstStatTypeAlias* node = allocator.alloc<AstStatTypeAlias>(
         Location(start, type->location), name->name, name->location, generics, genericPacks, type, exported, typeKeywordLocation
     );
+    node->attributes = attributes;
     if (options.storeCstData)
         cstNodeMap[node] = allocator.alloc<CstStatTypeAlias>(
             typeKeywordPosition, genericsOpenPosition, genericsCommaPositions, genericsClosePosition, equalsPosition
@@ -1590,18 +2377,16 @@ const std::unordered_set<std::string> EXPLICITLY_DISALLOWED_METAMETHODS{
 
 } // namespace
 
-// classStatement ::= `class` Name classProps `end`
-// classProps ::= classProp [classProps]
-// classProp ::= name [: classQualifier* type]
-// Luwu Classes (rfcs/classes.md): parse the parameter list of a class's primary constructor, e.g. the
-// `(name: string, age = 0)` of `class Cat(name: string, age = 0)`. Each parameter implicitly declares
-// a field of the same name (public and mutable unless qualified), and the whole list is compiled into a synthesized `__init`.
+// Luwu Classes (rfcs/classes): parse the parameter list of a class's primary constructor, e.g. the
+// `(name: string, age = 0)` of `class Cat(name: string, age = 0)`. Each parameter also declares a field
+// of the same name, public and mutable unless qualified. The list is compiled into a synthesized `__init`.
 LUAU_NOINLINE AstClassPrimaryConstructor* Parser::parseClassPrimaryConstructor(
     const std::optional<Location>& qualifierLocation,
-    AstClassMemberVisibility visibility
+    AstClassMemberVisibility visibility,
+    bool declared
 )
 {
-    LUAU_ASSERT(FFlag::DebugLuauUserDefinedClasses && FFlag::LuwuBetterUserDefinedClasses);
+    LUAU_ASSERT(FFlag::LuwuClasses);
 
     Lexeme matchParen = lexer.current();
     Location start = lexer.current().location;
@@ -1611,10 +2396,10 @@ LUAU_NOINLINE AstClassPrimaryConstructor* Parser::parseClassPrimaryConstructor(
     TempVector<AstClassPrimaryConstructorParamQualifiers> argQualifiers(scratchClassParamQualifiers);
     DenseHashSet<AstName> argNames{{}};
 
-    // The parameters, and the default value expressions attached to them, are compiled into the
-    // class's synthesized `__init`, which is one function scope deeper than the class declaration
-    // itself. Parse them at that depth so references to outer locals are correctly marked as
-    // upvalues -- the same dummyFunction push class field default values use.
+    // The parameters and their default values are compiled into the class's synthesized `__init`,
+    // which is one function scope deeper than the class declaration. Parse them at that depth, so
+    // references to outer locals are marked as upvalues. Field default values do the same
+    // dummyFunction push.
     static Function dummyFunction;
     functionStack.emplace_back(dummyFunction);
 
@@ -1627,12 +2412,30 @@ LUAU_NOINLINE AstClassPrimaryConstructor* Parser::parseClassPrimaryConstructor(
         }
         else
         {
-            // Luwu Classes (rfcs/classes.md): a parameter may carry the access specifier and the
-            // `const` modifier of the field it declares, Kotlin-style: `class SshKey private (public
-            // const public_key: string, private const private_key: string)`. A qualifier is only a
-            // qualifier when another name follows it, so a parameter may still be *named* `public`,
-            // `private` or `const`.
+            // Luwu Classes (rfcs/classes): a parameter may carry the access specifier and `const`
+            // modifier of the field it declares, Kotlin-style:
+            // `class SshKey private (public const public_key: string, private const private_key: string)`.
+            //
+            // `public`, `private` and `const` only count as qualifiers when another name follows them.
+            // A parameter named just `public` is read as a parameter name, and then rejected below
+            // because fields can't be named after those keywords.
             AstClassPrimaryConstructorParamQualifiers qualifiers;
+
+            // A parameter's attributes may be written on either side of its access specifier, the
+            // same rule class members follow, so `@deprecated public x` and `public @deprecated x`
+            // both read naturally. parseBinding picks up the ones written after it.
+            AstArray<AstAttr*> attributesBeforeQualifier{nullptr, 0};
+            if (FFlag::LuwuAttributesEverywhere && attributesFollow())
+                attributesBeforeQualifier = parseAttributes(AstAttr::Context::Parameter);
+
+            // A qualifier is only a qualifier when a parameter follows it, and an attribute can only
+            // introduce one.
+            auto qualifierIntroducesParam = [&]()
+            {
+                Lexeme::Type next = lexer.lookahead().type;
+                return next == Lexeme::Name ||
+                       (FFlag::LuwuAttributesEverywhere && (next == Lexeme::Attribute || next == Lexeme::AttributeOpen));
+            };
 
             // `const public x` is the wrong order; the modifier follows the access specifier.
             if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const" && lexer.lookahead().type == Lexeme::Name &&
@@ -1644,8 +2447,9 @@ LUAU_NOINLINE AstClassPrimaryConstructor* Parser::parseClassPrimaryConstructor(
                 nextLexeme(); // skip the misplaced 'const' and let the access specifier parse normally
             }
 
-            if (lexer.current().type == Lexeme::Name && lexer.lookahead().type == Lexeme::Name &&
-                (AstName(lexer.current().name) == "public" || AstName(lexer.current().name) == "private"))
+            const bool isAccessSpecifier = lexer.current().type == Lexeme::Name && qualifierIntroducesParam() &&
+                                           (AstName(lexer.current().name) == "public" || AstName(lexer.current().name) == "private");
+            if (isAccessSpecifier)
             {
                 qualifiers.qualifierLocation = lexer.current().location;
 
@@ -1653,9 +2457,19 @@ LUAU_NOINLINE AstClassPrimaryConstructor* Parser::parseClassPrimaryConstructor(
                     qualifiers.visibility = AstClassMemberVisibility::Private;
 
                 nextLexeme();
+
+                // `public @deprecated const x` -- between the access specifier and the `const`
+                // modifier is still the specifier's side, which is where a class field accepts it too.
+                if (FFlag::LuwuAttributesEverywhere && attributesFollow())
+                {
+                    AstArray<AstAttr*> afterQualifier = parseAttributes(AstAttr::Context::Parameter);
+                    attributesBeforeQualifier = concatAttributes(attributesBeforeQualifier, afterQualifier);
+                }
             }
 
-            if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const" && lexer.lookahead().type == Lexeme::Name)
+            const bool isConstModifier =
+                lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const" && qualifierIntroducesParam();
+            if (isConstModifier)
             {
                 qualifiers.constLocation = lexer.current().location;
                 qualifiers.isConst = true;
@@ -1664,7 +2478,28 @@ LUAU_NOINLINE AstClassPrimaryConstructor* Parser::parseClassPrimaryConstructor(
 
             // a primary constructor's parameters are function parameters that happen to belong to a
             // class, so their defaults ride on the same flag function parameter defaults do
-            Binding binding = parseBinding(/* isConst= */ false, /* allowDefault= */ FFlag::LuwuDefaultArguments);
+            Binding binding = declared ? parseDeclaredClassBinding(qualifiers.declaredDefaultLocation)
+                                       : parseBinding(/* isConst= */ false, /* allowDefault= */ FFlag::LuwuDefaultArguments, /* allowAttributes= */ true);
+
+            if (attributesBeforeQualifier.size > 0)
+            {
+                if (binding.attributes.size > 0)
+                {
+                    // Same rule, and same recovery, as a class member's: report it but keep both, so
+                    // the parameter behaves as written.
+                    report(
+                        binding.attributes.data[0]->location,
+                        "Attributes on a class member must all be written on the same side of the access specifier"
+                    );
+                }
+
+                binding.attributes = concatAttributes(attributesBeforeQualifier, binding.attributes);
+            }
+
+            // Every parameter declares a field, so the keywords banned from field names are banned here
+            // too (rfcs/classes).
+            if (isDisallowedClassMemberName(binding.name.name))
+                report(binding.name.location, "Fields are not allowed to be named '%s'", binding.name.name.value);
 
             if (argNames.contains(binding.name.name))
                 report(binding.name.location, "Duplicate primary constructor parameter '%s'", binding.name.name.value);
@@ -1690,9 +2525,9 @@ LUAU_NOINLINE AstClassPrimaryConstructor* Parser::parseClassPrimaryConstructor(
         }
     }
 
-    // The locals are created inside the dummy scope, so the synthesized `__init` sees them as its
-    // own parameters, and then immediately taken back out of scope: they are only visible to field
-    // initializer expressions, which push them again (see pushClassPrimaryConstructorParams).
+    // The locals are created inside the dummy scope, so the synthesized `__init` sees them as its own
+    // parameters. Then they go straight back out of scope. Only field initializer expressions can see
+    // them, and those push them again (see pushClassPrimaryConstructorParams).
     unsigned int localsBegin = saveLocals();
 
     TempVector<AstLocal*> vars(scratchLocal);
@@ -1721,10 +2556,15 @@ LUAU_NOINLINE AstClassPrimaryConstructor* Parser::parseClassPrimaryConstructor(
     return primaryConstructor;
 }
 
-// Luwu Classes (rfcs/classes.md): does the token the class body is sitting on read as a statement
-// rather than as a member declaration? A member is `name`, `name: T`, `name = expr` or a `function`;
-// anything that starts a statement outright, or a name followed by a call/index/comma, is a sign the
-// class was never closed and we are now eating the code that follows it.
+// Luwu Classes (rfcs/classes): does the current token in a class body start a statement rather than
+// a member? A member is `name`, `name: T`, `name = expr` or a `function`. A statement keyword, or a name
+// followed by a call, index or comma, means the class was never closed and we are now eating the code
+// that follows it.
+bool Parser::traitsEnabled() const
+{
+    return FFlag::LuwuTraits && FFlag::LuwuClasses;
+}
+
 bool Parser::classBodyLooksLikeStatement()
 {
     if (lexer.current().type == '(')
@@ -1746,38 +2586,65 @@ bool Parser::classBodyLooksLikeStatement()
         return false;
     }
 
-    // `print(...)`, `t.field = x`, `a, b = 1, 2` -- none of which a class member can be. Note `name:`
-    // is deliberately absent: that is a member's type annotation.
+    // `print(...)`, `t.field = x` and `a, b = 1, 2` can't be class members. `name:` is not in this
+    // list on purpose: it starts a member's type annotation.
     Lexeme::Type next = lexer.lookahead().type;
     return next == '(' || next == '.' || next == ',' || next == '[';
 }
 
-LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool exported, const Location& classKeywordLocation)
+// Luwu Classes (rfcs/classes): the grammar is also in the RFC's "Class definition syntax" section.
+// classStatement ::= [`export'] `class' Name [`<' GenericTypeListWithDefaults `>'] [primaryCtor] [`implements' traitRefList]
+//                    {classMember} `end'
+// primaryCtor ::= [access] `(' [ctorParam {`,' ctorParam}] `)'
+// ctorParam ::= [access] [`const'] Name [`:' Type] [`=' exp]
+// classMember ::= [access] [`const'] Name [`:' Type] [`=' exp] [`;']
+//              | {attribute} [access] {attribute} `function' Name funcbody [`;']
+// access ::= `public' | `private'
+// Luwu Traits (rfcs/classes/traits.md): a trait is parsed by the same function.
+// traitStatement ::= [`export'] `trait' Name [`<' GenericTypeListWithDefaults `>'] [`(' [ctorParam {`,' ctorParam}] `)']
+//                    [`needs' traitRefList] {traitMember} `end'
+// traitMember ::= classMember | [access] `final' `function' Name funcbody [`;']
+//              | `expect' [access] [`const'] Name [`:' Type] [`;']
+//              | `expect' [access] `function' Name [`?'] funcsignature [`;']
+LUAU_NOINLINE AstStat* Parser::parseClassStat(
+    const Location& start,
+    bool exported,
+    const Location& classKeywordLocation,
+    const AstArray<AstAttr*>& classAttributes,
+    bool declared,
+    bool isTrait
+)
 {
-    LUAU_ASSERT(FFlag::DebugLuauUserDefinedClasses);
+    LUAU_ASSERT(FFlag::LuwuClasses);
+    LUAU_ASSERT(!isTrait || FFlag::LuwuTraits);
+    // what the declaration is called in messages
+    const char* kind = isTrait ? "trait" : "class";
+
     std::optional<Name> name = parseNameOpt("type name");
 
     // Use error name if the name is missing
     if (!name)
         name = Name(nameError, lexer.current().location);
+    else
+        checkTypeName(*name, declared);
 
     AstArray<AstGenericType*> generics{};
     AstArray<AstGenericTypePack*> genericPacks{};
-    if (FFlag::LuwuBetterUserDefinedClasses && FFlag::LuwuGenericNominals)
+    if (FFlag::LuwuGenericNominals)
     {
-        // Luwu Classes (rfcs/classes.md): a class's generic parameter list may carry defaults, like
+        // Luwu Classes (rfcs/classes): a class's generic parameter list may carry defaults, like
         // a type alias's -- `class Box<T = string>`.
         std::tie(generics, genericPacks) = parseGenericTypeList(/* withDefaultValues= */ true);
     }
 
-    // Luwu Classes (rfcs/classes.md): an optional primary constructor, which may carry an access
+    // Luwu Classes (rfcs/classes): an optional primary constructor, which may carry an access
     // specifier of its own: `class Cat(name: string)`, `class Account private (holder: User)`.
     // The `(` lookahead is what keeps `public`/`private` here from being confused with the access
     // specifier of the class's first member.
     std::optional<Location> ctorQualifierLocation;
     AstClassMemberVisibility ctorVisibility = AstClassMemberVisibility::Public;
 
-    if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == Lexeme::Name && lexer.lookahead().type == '(' &&
+    if (lexer.current().type == Lexeme::Name && lexer.lookahead().type == '(' &&
         (AstName(lexer.current().name) == "public" || AstName(lexer.current().name) == "private"))
     {
         ctorQualifierLocation = lexer.current().location;
@@ -1788,12 +2655,12 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
         nextLexeme();
     }
 
-    // Luwu Classes (rfcs/classes.md): no classical inheritance. Upstream Luau spells it `class A extends B`,
-    // which would otherwise parse here as a class with two bare fields named `extends` and `B`; say what's
-    // wrong instead, for anyone porting Luau classes. Checked before and after a primary constructor.
+    // Luwu Classes (rfcs/classes): no classical inheritance. Upstream Luau spells it `class A extends B`.
+    // Here that would parse as a class with two bare fields, `extends` and `B`, so report what's actually
+    // wrong for anyone porting upstream classes. Checked both before and after a primary constructor.
     auto rejectExtends = [&]()
     {
-        if (!FFlag::LuwuBetterUserDefinedClasses || lexer.current().type != Lexeme::Name || AstName(lexer.current().name) != "extends" ||
+        if (lexer.current().type != Lexeme::Name || AstName(lexer.current().name) != "extends" ||
             lexer.lookahead().type != Lexeme::Name)
             return;
 
@@ -1804,24 +2671,108 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
 
         report(
             Location(extendsLocation, baseLocation),
-            "Luwu classes don't support inheritance ('extends'); hold the other class in a field and forward to it instead"
+            "Luwu classes don't support classical inheritance ('extends'); consider composing your classes (holding an object of another "
+            "class in your class) or waiting for Luwu traits"
         );
     };
 
+    // Luwu Classes (rfcs/classes): `implements` is reserved in the class header for traits. Like
+    // `extends`, it would otherwise parse as a list of bare fields. The whole interface list is consumed
+    // so it produces only one error.
+    auto rejectImplements = [&]()
+    {
+        if (FFlag::LuwuTraits)
+            return;
+
+        if (lexer.current().type != Lexeme::Name || AstName(lexer.current().name) != "implements" ||
+            lexer.lookahead().type != Lexeme::Name)
+            return;
+
+        Location implementsLocation = lexer.current().location;
+        nextLexeme();
+        Location lastLocation = lexer.current().location;
+        nextLexeme();
+
+        while (lexer.current().type == ',' && lexer.lookahead().type == Lexeme::Name)
+        {
+            nextLexeme();
+            lastLocation = lexer.current().location;
+            nextLexeme();
+        }
+
+        report(Location(implementsLocation, lastLocation), "The 'implements' keyword has not yet been implemented");
+    };
+
     rejectExtends();
+    rejectImplements();
 
     AstClassPrimaryConstructor* primaryConstructor = nullptr;
 
-    if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == '(')
-        primaryConstructor = parseClassPrimaryConstructor(ctorQualifierLocation, ctorVisibility);
+    if (lexer.current().type == '(')
+        primaryConstructor = parseClassPrimaryConstructor(ctorQualifierLocation, ctorVisibility, declared);
 
     if (primaryConstructor)
+    {
         rejectExtends();
+        rejectImplements();
+    }
 
-    // Every parameter implicitly declares a field of the same name, so a *method* named after one
-    // collides with it. A *property* named after one does not: that's how the RFC spells applying an
-    // access specifier or modifier to a parameter's field, so those are left out of
-    // classMemberNamespace and checked against it only once, when restated.
+    // Luwu Traits (rfcs/classes/traits.md): a trait is never constructed, so its parameter list takes no access specifier.
+    if (isTrait && ctorQualifierLocation)
+        report(*ctorQualifierLocation, "A trait's parameter list can't be public or private: traits are never constructed");
+
+    // Luwu Traits (rfcs/classes/traits.md): `class C(...) implements A, B("arg")` and `trait T(...) needs A, B`. Both are
+    // contextual keywords, recognized only where a name follows.
+    AstArray<AstClassTraitRef> implements{nullptr, 0};
+    AstArray<AstClassTraitRef> needs{nullptr, 0};
+    std::optional<Location> implementsKeywordLocation;
+    std::optional<Location> needsKeywordLocation;
+
+    auto contextualKeywordListFollows = [&](const char* keyword)
+    {
+        return FFlag::LuwuTraits && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == keyword &&
+               lexer.lookahead().type == Lexeme::Name;
+    };
+
+    if (contextualKeywordListFollows("implements"))
+    {
+        Location implementsLocation = lexer.current().location;
+        nextLexeme();
+
+        if (isTrait)
+        {
+            report(implementsLocation, "A trait can't implement other traits; write 'needs' to require that its implementors implement them");
+            needsKeywordLocation = implementsLocation;
+            needs = parseClassTraitRefs(/* allowArgs= */ false, primaryConstructor);
+        }
+        else
+        {
+            implementsKeywordLocation = implementsLocation;
+            implements = parseClassTraitRefs(/* allowArgs= */ true, primaryConstructor);
+        }
+    }
+    else if (contextualKeywordListFollows("needs"))
+    {
+        Location needsLocation = lexer.current().location;
+        nextLexeme();
+
+        if (!isTrait)
+        {
+            report(needsLocation, "Only a trait can need other traits; a class lists the traits it implements with 'implements'");
+            implementsKeywordLocation = needsLocation;
+            implements = parseClassTraitRefs(/* allowArgs= */ true, primaryConstructor);
+        }
+        else
+        {
+            needsKeywordLocation = needsLocation;
+            needs = parseClassTraitRefs(/* allowArgs= */ false, primaryConstructor);
+        }
+    }
+
+    // Every parameter declares a field of the same name, so a *method* with that name collides with it.
+    // A *field* with that name doesn't: restating a parameter's field in the class body is how the RFC
+    // gives it an access specifier or modifier. So parameters are kept out of classMemberNamespace, and a
+    // restated field is added to it like any other member.
     DenseHashSet<AstName> primaryConstructorParams{{}};
 
     if (primaryConstructor)
@@ -1830,7 +2781,7 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
             primaryConstructorParams.insert(arg->name);
     }
 
-    // Luwu Classes (rfcs/classes.md): a parameter may carry its field's access specifier and `const`
+    // Luwu Classes (rfcs/classes): a parameter may carry its field's access specifier and `const`
     // modifier directly (`class SshKey(public const public_key: string)`). Restating such a field in
     // the class body is allowed, but the restatement has to agree with the parameter, and once
     // *anything* in the class carries an access specifier, everything must.
@@ -1881,13 +2832,9 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
     // slightly more performant here (e.g.: a "scratch" set).
     DenseHashSet<AstName> classMemberNamespace{{}};
 
-    // Under LuwuBetterUserDefinedClasses, if *any* member carries an explicit
-    // access specifier -- `public` just as much as `private` -- then every
-    // member must carry one, so that a bare `x: number` never has to be read
-    // against the rest of the class to know how it is accessed. We collect the
-    // locations of members that didn't have an explicit qualifier as we go, and
-    // only report them once we know whether the class ended up with any
-    // qualifier at all (rfcs/classes.md).
+    // Members without an access specifier, collected while parsing the body. Whether they are errors
+    // depends on whether any other member has a specifier, which is only known once the whole class is
+    // parsed (see the all-or-nothing check after the body, rfcs/classes).
     std::vector<std::pair<Location, bool>> unqualifiedMemberLocations; // (location, isFunction)
     std::vector<Location> explicitPublicQualifierLocations;
     // Primary constructor parameters whose field the class body restates with an explicit access
@@ -1900,16 +2847,16 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
 
     while (lexer.current().type != Lexeme::ReservedEnd && lexer.current().type != Lexeme::Eof)
     {
-        // A class body and a statement list overlap enough (`const x = f()` is valid as either) that a
-        // class missing its `end` silently swallows the statements after it, and then reports a pile of
-        // nonsense at whatever token finally fails to be a member -- often many lines away. When the
-        // token we're looking at reads as a *statement* rather than a member, say what actually went
-        // wrong and hand the rest of the file back to the enclosing block.
-        if (FFlag::LuwuBetterUserDefinedClasses && classBodyLooksLikeStatement())
+        // A class body and a statement list overlap: `const x = f()` is valid as either. So a class
+        // missing its `end` swallows the statements after it, and the error shows up at whichever token
+        // finally isn't a member, often many lines away. When the current token reads as a statement,
+        // report the missing `end` here and hand the rest of the file back to the enclosing block.
+        if (classBodyLooksLikeStatement())
         {
             report(
                 lexer.current().location,
-                "Expected 'end' (to close 'class' at line %d), got %s",
+                "Expected 'end' (to close '%s' at line %d), got %s",
+                kind,
                 classKeywordLocation.begin.line + 1,
                 lexer.current().toString().c_str()
             );
@@ -1920,12 +2867,50 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
         std::optional<Location> qualifierLocation;
         AstClassMemberVisibility visibility = AstClassMemberVisibility::Public;
 
-        // Luwu Classes (rfcs/classes.md): functions in a class are always const, so `const function` is rejected
+        // Luwu Classes (rfcs/classes): a class method may carry attributes, like a free function:
+        // `@native function update(self) end`. They can go on either side of the access specifier.
+        // `@native private function` reads well when the attribute has its own line, and
+        // `private @native function` when it doesn't. They can't go on both sides at once, so a reader
+        // only has to look in one place.
+        AstArray<AstAttr*> attributes{nullptr, 0};
+        TempVector<CstAttrList*> cstAttrLists(scratchCstAttrList);
+
+        auto memberAttributesFollow = [&]()
+        {
+            return lexer.current().type == Lexeme::Attribute || lexer.current().type == Lexeme::AttributeOpen;
+        };
+
+        auto parseMemberAttributes = [&]()
+        {
+            attributes = parseAttributes(AstAttr::Context::ClassMember, FFlag::LuauCstAttr ? &cstAttrLists : nullptr);
+        };
+
+        if (memberAttributesFollow())
+            parseMemberAttributes();
+
+        // Luwu Traits (rfcs/classes/traits.md): `expect` leads a trait member that implementing classes must declare
+        // themselves, before its access specifier: `expect private model: Model`, `expect public function fire(self)`.
+        // It is a keyword only where a member follows it, so `expect: number` is a field named `expect`.
+        std::optional<Location> expectLocation;
+
+        bool expectFollows = FFlag::LuwuTraits && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "expect" &&
+                             (lexer.lookahead().type == Lexeme::Name || lexer.lookahead().type == Lexeme::ReservedFunction);
+        if (expectFollows)
+        {
+            expectLocation = lexer.current().location;
+
+            if (!isTrait)
+                report(*expectLocation, "Only a trait can 'expect' members; a class defines its own");
+
+            nextLexeme();
+        }
+
+        // Luwu Classes (rfcs/classes): functions in a class are always const, so `const function` is rejected
         // rather than being read as a field -- it's valid outside a class, and easy to paste into one. The `const`
         // is dropped so the function itself still parses.
         auto rejectConstFunction = [&]()
         {
-            if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const" &&
+            if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const" &&
                 lexer.lookahead().type == Lexeme::ReservedFunction)
             {
                 report(lexer.current().location, "Functions in a class are always const; remove 'const' here");
@@ -1935,7 +2920,7 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
 
         rejectConstFunction();
 
-        if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const")
+        if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const")
         {
             const Lexeme& next = lexer.lookahead();
             if (next.type == Lexeme::Name && (AstName(next.name) == "public" || AstName(next.name) == "private"))
@@ -1945,14 +2930,25 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
             }
         }
 
-        if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "public")
+        // An access specifier only counts as one when a member follows it. `public: number` is a member
+        // *named* `public`. The RFC disallows that name, and reporting it is clearer than reporting a
+        // missing field name (rfcs/classes).
+        auto qualifierIntroducesMember = [&]()
+        {
+            Lexeme::Type next = lexer.lookahead().type;
+            // An attribute can only introduce a method, so it counts as a member following the
+            // specifier: `private @native function ...`.
+            return next == Lexeme::Name || next == Lexeme::ReservedFunction || next == Lexeme::Attribute || next == Lexeme::AttributeOpen;
+        };
+
+        if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "public" && qualifierIntroducesMember())
         {
             qualifierLocation = lexer.current().location;
-            if (FFlag::LuwuBetterUserDefinedClasses)
-                explicitPublicQualifierLocations.push_back(*qualifierLocation);
+            explicitPublicQualifierLocations.push_back(*qualifierLocation);
             nextLexeme();
         }
-        else if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "private")
+        else if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "private" &&
+                 qualifierIntroducesMember())
         {
             qualifierLocation = lexer.current().location;
             visibility = AstClassMemberVisibility::Private;
@@ -1960,19 +2956,87 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
             nextLexeme();
         }
 
+        // `public @native function` -- the attributes may equally well follow the access specifier.
+        if (qualifierLocation && memberAttributesFollow())
+        {
+            if (attributes.size > 0)
+            {
+                report(lexer.current().location, "Attributes on a class member must all be written on the same side of the access specifier");
+
+                // Report and keep going: both lists are still kept on the function, so the member
+                // behaves as written and the CST has an entry for every attribute it prints.
+                AstArray<AstAttr*> after = parseAttributes(AstAttr::Context::ClassMember, FFlag::LuauCstAttr ? &cstAttrLists : nullptr);
+                attributes = concatAttributes(attributes, after);
+            }
+            else
+                parseMemberAttributes();
+        }
+
         // `public const function`
         if (qualifierLocation)
             rejectConstFunction();
 
-        // If we saw a qualifier _and_ the current token is not `function`,
-        // assume this is a property. Under LuwuBetterUserDefinedClasses, an
-        // unqualified property is allowed too; whether the class needed
-        // qualifiers is checked after the class body.
-        if ((qualifierLocation || FFlag::LuwuBetterUserDefinedClasses) && lexer.current().type != Lexeme::ReservedFunction)
+        // Luwu Traits (rfcs/classes/traits.md): `final` follows the access specifier, like `const`. A final function can't
+        // be defined by an implementing class.
+        std::optional<Location> finalLocation;
+
+        bool finalFollows = FFlag::LuwuTraits && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "final" &&
+                            (lexer.lookahead().type == Lexeme::Name || lexer.lookahead().type == Lexeme::ReservedFunction);
+        if (finalFollows)
+        {
+            finalLocation = lexer.current().location;
+
+            if (!isTrait)
+                report(*finalLocation, "Only a trait's members can be 'final'");
+            else if (expectLocation)
+                report(*finalLocation, "An expected member can't be 'final': the implementing class defines it");
+            else if (lexer.lookahead().type != Lexeme::ReservedFunction)
+                report(*finalLocation, "'final' fields are not implemented yet");
+
+            nextLexeme();
+        }
+
+        // Attributes are parsed before the member kind is known, and both members can carry them, so
+        // the only shapes rejected here are the ones that are no member at all -- the class's own
+        // `end` above all, which must not be parsed as a field name or it swallows the rest of the
+        // file. The attributes were consumed either way, so this makes progress.
+        const bool attributedMemberFollows =
+            lexer.current().type == Lexeme::ReservedFunction || (FFlag::LuwuAttributesEverywhere && lexer.current().type == Lexeme::Name);
+        if (attributes.size > 0 && !attributedMemberFollows)
+        {
+            if (FFlag::LuwuAttributesEverywhere)
+            {
+                report(
+                    lexer.current().location,
+                    "Expected 'function' or a field name after attribute, but got %s instead",
+                    lexer.current().toString().c_str()
+                );
+            }
+            else
+            {
+                report(lexer.current().location, "Expected 'function' after attribute, but got %s instead", lexer.current().toString().c_str());
+            }
+
+            attributes = {nullptr, 0};
+
+            // Without the feature, a field name still parses as a field, with whatever access specifier came
+            // with it. Anything else, most often the class's own `end`, goes back around the loop: parsing it
+            // as a field would consume the `end` and swallow the rest of the file.
+            if (FFlag::LuwuAttributesEverywhere || lexer.current().type != Lexeme::Name)
+                continue;
+        }
+
+        // Luwu Classes (rfcs/classes): anything but `function` starts a property, qualified or not
+        // (upstream requires a qualifier here); whether the class needed qualifiers is checked after
+        // the class body.
+        if (lexer.current().type != Lexeme::ReservedFunction)
         {
             std::optional<Location> constLocation;
             bool isConst = false;
-            if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const")
+            // As with the access specifiers above, `const` is only the modifier when a field name
+            // follows it; `const = 1` declares a field named `const`.
+            if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "const" &&
+                lexer.lookahead().type == Lexeme::Name)
             {
                 constLocation = lexer.current().location;
                 isConst = true;
@@ -1982,51 +3046,50 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
             std::optional<Name> propName = parseNameOpt("class field name");
             if (!propName)
             {
-                if (FFlag::LuwuBetterUserDefinedClasses)
-                    nextLexeme(); // skip the unexpected token to avoid an infinite loop
+                nextLexeme(); // skip the unexpected token to avoid an infinite loop
                 continue;
             }
 
-            if (FFlag::LuwuBetterUserDefinedClasses && !qualifierLocation)
+            if (isDisallowedClassMemberName(propName->name))
+                report(propName->location, "Fields are not allowed to be named '%s'", propName->name.value);
+
+            if (!qualifierLocation)
                 unqualifiedMemberLocations.push_back({propName->location, /* isFunction */ false});
 
-            // Luwu Classes (rfcs/classes.md): restating a primary constructor parameter's field is how
-            // an *unqualified* parameter list gets its access specifiers, but a parameter that already
-            // states its own may not be contradicted here -- reading `public text` in the header and
-            // `private text` in the body would leave neither one trustworthy.
-            if (FFlag::LuwuBetterUserDefinedClasses)
+            // Luwu Classes (rfcs/classes): restating a primary constructor parameter's field in the
+            // body is how an *unqualified* parameter gets its access specifier. A parameter that already
+            // has one can be restated, but not contradicted: with `public text` in the header and
+            // `private text` in the body, a reader couldn't trust either.
+            if (int paramIndex = findPrimaryConstructorParam(propName->name); paramIndex >= 0)
             {
-                if (int paramIndex = findPrimaryConstructorParam(propName->name); paramIndex >= 0)
+                const AstClassPrimaryConstructorParamQualifiers& param = primaryConstructor->argsQualifiers.data[paramIndex];
+
+                if (qualifierLocation)
+                    paramsQualifiedInBody.insert(propName->name);
+
+                if (param.qualifierLocation && qualifierLocation && param.visibility != visibility)
                 {
-                    const AstClassPrimaryConstructorParamQualifiers& param = primaryConstructor->argsQualifiers.data[paramIndex];
-
-                    if (qualifierLocation)
-                        paramsQualifiedInBody.insert(propName->name);
-
-                    if (param.qualifierLocation && qualifierLocation && param.visibility != visibility)
-                    {
-                        // Do not inline these into the report call: MSVC miscompiles inlined ternaries
-                        // feeding %s in Windows Debug CI (see the identical note further down).
-                        const char* declared = param.visibility == AstClassMemberVisibility::Private ? "private" : "public";
-                        const char* restated = visibility == AstClassMemberVisibility::Private ? "private" : "public";
-                        report(
-                            propName->location,
-                            "Field '%s' was explicitly marked as %s on line %d, cannot reassign it as %s",
-                            propName->name.value,
-                            declared,
-                            param.qualifierLocation->begin.line + 1,
-                            restated
-                        );
-                    }
-
-                    if (param.isConst && !isConst)
-                        report(
-                            propName->location,
-                            "Field '%s' was explicitly marked as const on line %d, cannot reassign it as mutable",
-                            propName->name.value,
-                            param.constLocation->begin.line + 1
-                        );
+                    // Do not inline these into the report call: MSVC miscompiles inlined ternaries
+                    // feeding %s in Windows Debug CI (see the identical note further down).
+                    const char* declared = param.visibility == AstClassMemberVisibility::Private ? "private" : "public";
+                    const char* restated = visibility == AstClassMemberVisibility::Private ? "private" : "public";
+                    report(
+                        propName->location,
+                        "Field '%s' was explicitly marked as %s on line %d, cannot reassign it as %s",
+                        propName->name.value,
+                        declared,
+                        param.qualifierLocation->begin.line + 1,
+                        restated
+                    );
                 }
+
+                if (param.isConst && !isConst)
+                    report(
+                        propName->location,
+                        "Field '%s' was explicitly marked as const on line %d, cannot reassign it as mutable",
+                        propName->name.value,
+                        param.constLocation->begin.line + 1
+                    );
             }
 
             AstType* propType = nullptr;
@@ -2041,7 +3104,22 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
 
             std::optional<Location> equalsLocation;
             AstExpr* defaultValue = nullptr;
-            if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == '=')
+            if (declared && lexer.current().type == '=')
+            {
+                // Luwu Declare Statements (rfcs/declare-statements.md): a declared field's default is written as its type
+                equalsLocation = lexer.current().location;
+                nextLexeme();
+
+                // `x: T = value` copied from a class: the annotation is the type, and the value is skipped
+                if (propType)
+                {
+                    report(*equalsLocation, "%s", kDeclaredDefaultIsATypeError);
+                    parseExpr();
+                }
+                else
+                    propType = parseType();
+            }
+            else if (lexer.current().type == '=')
             {
                 equalsLocation = lexer.current().location;
                 nextLexeme();
@@ -2070,8 +3148,30 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
             if (strncmp(propName->name.value, "__", 2) == 0)
                 report(propName->location, "Class fields cannot start with '__'");
 
+            if (expectLocation && defaultValue)
+                report(*equalsLocation, "An expected field can't have a default value: the implementing class declares it");
+
+            // Luwu Traits (rfcs/classes/traits.md): a trait field the trait provides needs a value to provide. Without one it
+            // would be nil in every implementing class, whatever its type says.
+            bool traitFieldHasNoValue = isTrait && !declared && !expectLocation && !defaultValue && findPrimaryConstructorParam(propName->name) < 0;
+            if (traitFieldHasNoValue)
+                report(
+                    propName->location,
+                    "Trait field '%s' needs a default value, or 'expect' in front to have implementing classes declare it",
+                    propName->name.value
+                );
+
+            // Luwu Declare Statements (rfcs/declare-statements.md): a declaration writes every type out
+            if (declared && !propType)
+                report(propName->location, "Declared class field '%s' needs a type: 'name: T', or 'name = T' if it has a default", propName->name.value);
+
+            // The member turned out to be a field rather than a method, so pin the attributes down
+            // to that position now -- `@native` is a method-only attribute.
+            if (attributes.size > 0)
+                validateAttributeContexts(attributes, AstAttr::Context::ClassField);
+
             bool hasSemicolon = false;
-            if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == ';')
+            if (lexer.current().type == ';')
             {
                 nextLexeme();
                 hasSemicolon = true;
@@ -2085,8 +3185,8 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
             {
                 classMemberNamespace.insert(propName->name);
 
-                // Either both of these are present or neither are.
-                LUAU_ASSERT((bool)propType == (bool)typeColonLocation);
+                // Either both of these are present or neither are, except for a declared class's `name = T`.
+                LUAU_ASSERT((bool)propType == (bool)typeColonLocation || (declared && equalsLocation && !typeColonLocation));
                 declarations.push_back(
                     AstClassProperty{
                         qualifierLocation,
@@ -2100,16 +3200,32 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
                         constLocation,
                         equalsLocation,
                         defaultValue,
+                        attributes,
+                        expectLocation,
                     }
                 );
             }
         }
-        else if (lexer.current().type == Lexeme::ReservedFunction)
+        else
         {
+            validateAttributeContexts(attributes, AstAttr::Context::InlinableFunction);
+
             auto matchFunction = lexer.current();
             nextLexeme();
 
             Name name = parseName("method name");
+
+            // Luwu Traits (rfcs/classes/traits.md): `expect function name?(self)` is an expected function a class may leave out
+            bool isOptional = false;
+            if (lexer.current().type == '?')
+            {
+                if (!expectLocation)
+                    report(lexer.current().location, "Only an expected function can be optional: 'expect function %s?(...)'", name.name.value);
+
+                isOptional = expectLocation.has_value();
+                nextLexeme();
+            }
+
             // This is a little funky as we pass in a debug name but not a
             // local name. The reason is that // in the declaration:
             //
@@ -2124,19 +3240,64 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
             // the class' print. That would be `self.print`.
             matchRecoveryStopOnToken[Lexeme::ReservedEnd]++;
 
-            auto [body, _] = parseFunctionBody(false, matchFunction, name.name, nullptr, {});
+            auto [body, _] = parseFunctionBody(
+                false,
+                matchFunction,
+                name.name,
+                nullptr,
+                attributes,
+                /* isConst= */ false,
+                FFlag::LuauCstAttr ? &cstAttrLists : nullptr,
+                /* endMatchLexeme= */ nullptr,
+                /* isClassFunction= */ true,
+                /* signatureOnly= */ declared || expectLocation.has_value()
+            );
 
             matchRecoveryStopOnToken[Lexeme::ReservedEnd]--;
+
+            if (declared)
+                checkDeclaredClassMethod(body);
+
+            if (isDisallowedClassMemberName(name.name))
+                report(name.location, "Functions are not allowed to be named '%s'", name.name.value);
 
             if (body->args.size > 0 && body->args.data[0]->name == "self" && body->args.data[0]->annotation != nullptr)
                 report(body->args.data[0]->annotation->location, "The 'self' parameter cannot have a type annotation");
 
             if (strncmp(name.name.value, "__", 2) == 0)
             {
-                if (FFlag::LuwuBetterUserDefinedClasses && name.name == "__init")
+                if (name.name == "__create")
                 {
+                    // Luwu Traits (rfcs/classes/traits.md): `__create` makes a trait callable, as a factory: `Path("./src")` returns whatever
+                    // it returns, usually an object of one of the classes implementing the trait. The trait defines it
+                    // itself, and it runs before any object exists, so it takes no `self`. Trait parameters would make
+                    // `Trait(...)` read two ways (trait arguments, or a factory call), so a trait has one or the other.
+                    if (!isTrait)
+                        report(name.location, "Only a trait can define '__create'; a class's constructor is '__init'");
+                    else if (expectLocation)
+                        report(name.location, "A trait's '__create' can't be expected: the trait defines it");
+                    else if (primaryConstructor)
+                        report(
+                            name.location,
+                            "A trait with parameters can't define '__create': 'Trait(...)' would mean both trait arguments and a call to "
+                            "'__create'"
+                        );
+                    else if (body->args.size > 0 && body->args.data[0]->name == "self")
+                        report(name.location, "'__create' can't take 'self': it runs before there is an object");
+                }
+                else if (name.name == "__init" && isTrait && !expectLocation)
+                {
+                    // Luwu Traits (rfcs/classes/traits.md): construction belongs to the class. A trait's state comes from its field defaults and
+                    // trait parameters. A trait may only expect `__init`, to require a constructor its `__create` can call.
+                    report(name.location, "A trait can't define '__init': initialize its fields with default values or trait parameters");
+                }
+                else if (name.name == "__init")
+                {
+                    if (isOptional)
+                        report(name.location, "A trait's expected '__init' can't be optional");
+
                     // The primary constructor already defines this class's `__init`.
-                    if (primaryConstructor)
+                    if (primaryConstructor && !isTrait)
                         report(
                             name.location,
                             "Cannot define an '__init' constructor because this class defines a primary constructor on line %d; remove the "
@@ -2157,15 +3318,13 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
             }
 
             bool hasSemicolon = false;
-            if (FFlag::LuwuBetterUserDefinedClasses && lexer.current().type == ';')
+            if (lexer.current().type == ';')
             {
                 // used by linter to explicitly ignore SameLineStatement with class prop decls
                 nextLexeme();
                 hasSemicolon = true;
             }
 
-            // TODO CLI-200853: We should support attributes, we do not need
-            // to support them prior to the full launch.
             if (classMemberNamespace.contains(name.name) || primaryConstructorParams.contains(name.name))
             {
                 report(name.location, "Duplicate class member '%s'", name.name.value);
@@ -2174,7 +3333,7 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
             {
                 classMemberNamespace.insert(name.name);
 
-                if (FFlag::LuwuBetterUserDefinedClasses && !qualifierLocation)
+                if (!qualifierLocation)
                     unqualifiedMemberLocations.push_back({name.location, /* isFunction */ true});
 
                 declarations.push_back(
@@ -2186,24 +3345,24 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
                         name.location,
                         body,
                         hasSemicolon,
+                        expectLocation,
+                        isOptional,
+                        finalLocation,
                     }
                 );
             }
         }
-        else
-        {
-            report(lexer.current().location, "Only class fields and functions can be declared within a class");
-            nextLexeme(); // skip the unexpected token to avoid an infinite loop
-        }
     }
 
-    // Luwu Classes (rfcs/classes.md): access specifiers are all-or-nothing across a class. A class
-    // that writes none of them is entirely public, which is the POD case the RFC deliberately keeps
-    // terse; but the moment one member -- or one primary constructor parameter -- says `public` or
-    // `private`, every other member and parameter has to say which it is, so that the unqualified ones
-    // can never be mistaken for an oversight. Note the primary constructor's *own* qualifier (`class
-    // PositiveNumber private (...)`) is not a member qualifier and does not trigger any of this.
-    if (FFlag::LuwuBetterUserDefinedClasses && (sawPrivateMember || sawQualifiedParam || !explicitPublicQualifierLocations.empty()))
+    // Luwu Classes (rfcs/classes): access specifiers are all-or-nothing within a class.
+    //
+    // A class with no access specifiers is entirely public. That's the POD case, which the RFC keeps
+    // short on purpose. Once any member or primary constructor parameter says `public` or `private`,
+    // every other member and parameter must say one too, so a missing one can't be an oversight.
+    //
+    // The primary constructor's own specifier (`class PositiveNumber private (...)`) makes the
+    // constructor private. It isn't a member's specifier, so it doesn't count here.
+    if ((sawPrivateMember || sawQualifiedParam || !explicitPublicQualifierLocations.empty()))
     {
         if (sawPrivateMember || sawQualifiedParam)
         {
@@ -2216,14 +3375,16 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
                 if (sawPrivateMember)
                     report(
                         loc,
-                        "This class contains non-public members; put the 'public' or 'private' keyword in front of this %s to prevent ambiguity",
+                        "This %s contains non-public members; put the 'public' or 'private' keyword in front of this %s to prevent ambiguity",
+                        kind,
                         memberKind
                     );
                 else
                     report(
                         loc,
-                        "This class mixes explicit and implicit 'public'; put the 'public' or 'private' keyword in front of this %s to prevent "
+                        "This %s mixes explicit and implicit 'public'; put the 'public' or 'private' keyword in front of this %s to prevent "
                         "ambiguity",
+                        kind,
                         memberKind
                     );
             }
@@ -2235,14 +3396,16 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
             for (const Location& loc : explicitPublicQualifierLocations)
                 report(
                     loc,
-                    "This class mixes explicit and implicit 'public'; remove 'public' or add 'public' or 'private' to all other members to prevent "
-                    "ambiguity"
+                    "This %s mixes explicit and implicit 'public'; remove 'public' or add 'public' or 'private' to all other members to prevent "
+                    "ambiguity",
+                    kind
                 );
         }
 
-        // A parameter's field is qualified either in the parameter list or by the class body member
-        // that restates it; a field qualified in neither is the same ambiguity as an unqualified
-        // member, and gets a message pointing at whichever of the two places is the natural fix.
+        // A parameter's field can be qualified in the parameter list, or by a class body member that
+        // restates it. A field qualified in neither place is as ambiguous as an unqualified member. The
+        // message points at the place that is the natural fix: the parameter list if other parameters
+        // are qualified there, otherwise either one.
         if (primaryConstructor)
         {
             for (size_t i = 0; i < primaryConstructor->args.size; ++i)
@@ -2269,32 +3432,146 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(const Location& start, bool export
     // TODO: We should use `expectMatchEndAndConsume`. It is difficult as we
     // are treating "class" as a contextual keyword (and we must as we also)
     // plan to add a `class` library.
-    Location end = lexer.current().location;
-    bool hasEnd = unterminated ? false : expectAndConsume(Lexeme::ReservedEnd, "class");
+    // An unterminated class ends at its last member, not at the statement that follows it.
+    Location end = unterminated ? lexer.previousLocation() : lexer.current().location;
+    bool hasEnd = unterminated ? false : expectAndConsume(Lexeme::ReservedEnd, kind);
     Location location{start, end};
 
     // We only allow classes at the top level: we can make use of the
     // recursion counter to check this, though it's a little clowny.
-    if (recursionCounter > 1)
-        report(nameLocal->location, "Cannot declare class '%s' inside another statement or expression", nameLocal->name.value);
+    // Luwu Declare Statements (rfcs/declare-statements.md): a declared class follows the rules for declarations instead.
+    if (recursionCounter > 1 && !declared)
+        report(nameLocal->location, "Cannot declare %s '%s' inside another statement or expression", kind, nameLocal->name.value);
 
     AstStatClass* cls = allocator.alloc<AstStatClass>(
         location, nameLocal, copy(declarations), exported, classKeywordLocation, generics, genericPacks, primaryConstructor
     );
     cls->hasEnd = hasEnd;
-    if (classesWithinModule.contains(nameLocal->name))
+    cls->attributes = classAttributes;
+    cls->isTrait = isTrait;
+    cls->implements = implements;
+    cls->needs = needs;
+    cls->implementsLocation = implementsKeywordLocation;
+    cls->needsLocation = needsKeywordLocation;
+
+    // A declared class has no value, so its name is not a class name for assignment and lookup; a clash with a
+    // class's type name is reported by the type checker.
+    if (declared)
+        return cls;
+
+    if (AstStatClass** previous = classesWithinModule.find(nameLocal->name))
     {
-        // We do not allow shadowing classes with the same name.
+        // We do not allow shadowing classes with the same name. Luwu Traits (rfcs/classes/traits.md): traits share the name
+        // space, since both are hoisted values.
+        const char* kinds = isTrait || (*previous)->isTrait ? "class or trait" : "class";
         return reportStatError(
             nameLocal->location,
             {},
             copy({static_cast<AstStat*>(cls)}),
-            "A class named '%s' has already been declared in this module",
+            "A %s named '%s' has already been declared in this module",
+            kinds,
             nameLocal->name.value
         );
     }
     classesWithinModule[nameLocal->name] = cls;
     return cls;
+}
+
+// Luwu Traits (rfcs/classes/traits.md):
+// traitRefList ::= traitRef {`,' traitRef}
+// traitRef ::= Name {`.' Name} [`<' TypeList `>'] [`(' [explist] `)']
+AstArray<AstClassTraitRef> Parser::parseClassTraitRefs(bool allowArgs, AstClassPrimaryConstructor* primaryConstructor)
+{
+    LUAU_ASSERT(FFlag::LuwuTraits);
+    std::vector<AstClassTraitRef> refs;
+
+    while (true)
+    {
+        AstClassTraitRef ref;
+        Location start = lexer.current().location;
+
+        // A trait's needed traits are compiled into its `__needs` function, one function scope deeper than the trait
+        // (see Compiler's ClassInitDefaultsVisitor::visitTrait); a class's traits are read by the class statement itself.
+        static Function needsFunction;
+        if (!allowArgs)
+            functionStack.emplace_back(needsFunction);
+
+        AstExpr* trait = parseNameExpr("trait name");
+
+        while (lexer.current().type == '.' && lexer.lookahead().type == Lexeme::Name)
+        {
+            Position opPosition = lexer.current().location.begin;
+            nextLexeme();
+
+            Name index = parseName("trait name");
+            trait = allocator.alloc<AstExprIndexName>(Location(start, index.location), trait, index.name, index.location, opPosition, '.');
+        }
+
+        if (!allowArgs)
+            functionStack.pop_back();
+
+        ref.trait = trait;
+
+        if (lexer.current().type == '<')
+            ref.typeArguments = parseTypeParams();
+
+        if (lexer.current().type == '(')
+        {
+            MatchLexeme matchParen = lexer.current();
+            Location argsStart = lexer.current().location;
+            nextLexeme();
+
+            // Trait arguments are evaluated on every construction, with the class's primary constructor parameters in
+            // scope, like a field default; they get the same function depth for the same reason (see parseClassStat).
+            static Function dummyFunction;
+            functionStack.emplace_back(dummyFunction);
+
+            unsigned int localsBegin = saveLocals();
+
+            if (primaryConstructor)
+                pushClassPrimaryConstructorParams(primaryConstructor);
+
+            TempVector<AstExpr*> args(scratchExpr);
+
+            if (lexer.current().type != ')')
+            {
+                args.push_back(parseExpr());
+
+                while (lexer.current().type == ',')
+                {
+                    nextLexeme();
+                    args.push_back(parseExpr());
+                }
+            }
+
+            restoreLocals(localsBegin);
+            functionStack.pop_back();
+
+            Location argsEnd = lexer.current().location;
+            expectMatchAndConsume(')', matchParen);
+
+            ref.hasArgs = true;
+            ref.args = copy(args);
+            ref.argsLocation = Location(argsStart, argsEnd);
+
+            if (!allowArgs)
+                report(
+                    ref.argsLocation,
+                    "A trait can't pass arguments to a trait it needs: only the implementing class passes trait arguments, in its "
+                    "'implements' list"
+                );
+        }
+
+        ref.location = Location(start, lexer.previousLocation());
+        refs.push_back(ref);
+
+        if (lexer.current().type != ',')
+            break;
+
+        nextLexeme();
+    }
+
+    return copy(refs.data(), refs.size());
 }
 
 // type function Name `(' arglist `)' `=' funcbody `end'
@@ -2322,6 +3599,9 @@ AstStat* Parser::parseTypeFunction(const Location& start, bool exported, Positio
     matchRecoveryStopOnToken[Lexeme::ReservedEnd]--;
 
     bool hasErrors = parseErrors.size() > errorsAtStart;
+
+    // After hasErrors: a name clash doesn't make the function body unusable
+    checkTypeName(*fnName, /* declared= */ false);
 
     AstStatTypeFunction* node =
         allocator.alloc<AstStatTypeFunction>(Location(start, body->location), fnName->name, fnName->location, body, exported, hasErrors);
@@ -2362,7 +3642,10 @@ AstDeclaredExternTypeProperty Parser::parseDeclaredExternTypeMethod(const AstArr
     Location varargLocation;
     AstTypePack* varargAnnotation = nullptr;
     if (lexer.current().type != ')')
+    {
+        DeclaredParameters declaredParameters(*this);
         std::tie(vararg, varargLocation, varargAnnotation) = parseBindingList(args, /* allowDot3 */ true, /* allowDefault= */ false);
+    }
 
     expectMatchAndConsume(')', matchParen);
 
@@ -2402,9 +3685,20 @@ AstDeclaredExternTypeProperty Parser::parseDeclaredExternTypeMethod(const AstArr
     return AstDeclaredExternTypeProperty{fnName.name, fnName.location, fnType, true, Location(start, end)};
 }
 
-AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*>& attributes)
+bool Parser::declarationsAllowed() const
+{
+    return options.allowDeclarationSyntax || FFlag::LuwuDeclareStatements;
+}
+
+AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*>& attributes, std::optional<Location> exportKeywordLocation)
 {
     // `declare` token is already parsed at this point
+
+    // Luwu Declare Statements (rfcs/declare-statements.md): outside definition files, a declaration applies to the
+    // whole file, so it may only appear where the whole file can see it written: at the top level, or in a `do`
+    // block there (which editors can fold).
+    if (!options.allowDeclarationSyntax && !blockAllowsDeclarations)
+        report(start, "%s", kDeclarationPlacementError);
 
     if ((attributes.size != 0) && (lexer.current().type != Lexeme::ReservedFunction))
         return reportStatError(
@@ -2414,6 +3708,56 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
             "Expected a function type declaration after attribute, but got %s instead",
             lexer.current().toString().c_str()
         );
+
+    // Luwu Declare Statements (rfcs/declare-statements.md): `export declare extern type` and `export declare class`.
+    // `export` leads, as in `export type` and `export class`; `declare export` is reported and parsed as meant. That
+    // keeps `declare export: T`, a global named `export`, unambiguous. Only types can be exported: a declared value is
+    // visible to its own file, and one that every file sees belongs in a definitions file.
+    std::optional<Location> exportLocation = exportKeywordLocation;
+    bool misplacedExport = FFlag::LuwuDeclareStatements && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "export" &&
+                           lexer.lookahead().type != ':';
+    if (misplacedExport)
+    {
+        report(lexer.current().location, "%s", kDeclareExportOrderError);
+        if (!exportLocation)
+            exportLocation = lexer.current().location;
+        nextLexeme();
+    }
+
+    if (exportLocation)
+    {
+        bool exportsType = declaresClass() || (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "extern");
+        if (!exportsType)
+        {
+            report(*exportLocation, "%s", kDeclareExportValueError);
+            exportLocation.reset();
+        }
+    }
+
+    if (declaresClass())
+    {
+        Location classKeywordLocation = lexer.current().location;
+        nextLexeme();
+
+        // `declare class type Name`: the `type` says this is a type and brings no value into scope. Without it, report
+        // and parse the class it meant.
+        bool typeKeyword = lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "type" && lexer.lookahead().type == Lexeme::Name;
+        if (typeKeyword)
+            nextLexeme();
+        else
+            report(classKeywordLocation, "%s", kDeclareClassNeedsTypeError);
+
+        AstStat* stat = parseClassStat(start, /* exported= */ exportLocation.has_value(), classKeywordLocation, {nullptr, 0}, /* declared= */ true);
+        AstStatClass* shape = stat->as<AstStatClass>();
+        if (!shape)
+            return stat;
+
+        Location location = shape->location;
+        if (exportKeywordLocation)
+            location.begin = exportKeywordLocation->begin;
+
+        return allocator.alloc<AstStatDeclareClass>(location, shape, start);
+    }
 
     if (lexer.current().type == Lexeme::ReservedFunction)
     {
@@ -2434,7 +3778,10 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
         AstTypePack* varargAnnotation = nullptr;
 
         if (lexer.current().type != ')')
+        {
+            DeclaredParameters declaredParameters(*this);
             std::tie(vararg, varargLocation, varargAnnotation) = parseBindingList(args, /* allowDot3= */ true, /* allowDefault= */ false);
+        }
 
         expectMatchAndConsume(')', matchParen);
 
@@ -2442,22 +3789,39 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
         retTypes = parseOptionalReturnType();
         if (!retTypes)
             retTypes = allocator.alloc<AstTypePackExplicit>(lexer.current().location, AstTypeList{copy<AstType*>(nullptr, 0), nullptr});
-        Location end = lexer.current().location;
+        // Luwu: upstream ends the declaration at the token after it, so whatever follows a `declare function` looks
+        // like it's on the same line (the SameLineStatement lint reports it, once declarations can be in source).
+        Location end = lexer.previousLocation();
 
         TempVector<AstType*> vars(scratchType);
         TempVector<AstArgumentName> varNames(scratchArgName);
 
+        // Luwu Declare Statements (rfcs/declare-statements.md): a declared *value* may leave its types out, so an
+        // untyped parameter is `any` and an untyped `...` is `...any`. Upstream requires every parameter's type.
         for (size_t i = 0; i < args.size(); ++i)
         {
-            if (!args[i].annotation)
-                return reportStatError(Location(start, end), {}, {}, "All declaration parameters must be annotated");
+            AstType* annotation = args[i].annotation;
+            if (!annotation)
+            {
+                if (!FFlag::LuwuDeclareStatements)
+                    return reportStatError(Location(start, end), {}, {}, "All declaration parameters must be annotated");
 
-            vars.push_back(args[i].annotation);
+                annotation = untypedDeclarationType(args[i].name.location);
+            }
+
+            vars.push_back(annotation);
             varNames.push_back({args[i].name.name, args[i].name.location});
         }
 
         if (vararg && !varargAnnotation)
-            return reportStatError(Location(start, end), {}, {}, "All declaration parameters must be annotated");
+        {
+            if (!FFlag::LuwuDeclareStatements)
+                return reportStatError(Location(start, end), {}, {}, "All declaration parameters must be annotated");
+
+            varargAnnotation = allocator.alloc<AstTypePackVariadic>(varargLocation, untypedDeclarationType(varargLocation));
+        }
+
+        checkDuplicateDeclaration(globalName);
 
         return allocator.alloc<AstStatDeclareFunction>(
             Location(start, end),
@@ -2479,17 +3843,18 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
     // global variable declaration whose name is `class`, not as a malformed class declaration. This allows
     // us to support a global table like string/math/bit32 called `class`. CLI-203833 tracks the work to actually
     // remove support for `declare class X [extends Y]` syntax.
-    else if (FFlag::LuauDisallowExternClassInTypeDefinitions
-                 ? AstName(lexer.current().name) == "extern"
-                 : (AstName(lexer.current().name) == "class" &&
-                    (FFlag::LuauAllowGlobalDeclarationToBeCalledClass ? lexer.lookahead().type != ':' : true)) ||
-                       AstName(lexer.current().name) == "extern")
+    //
+    // Luwu: `declare class X` never declares an extern type, whatever LuauDisallowExternClassInTypeDefinitions says. With
+    // Luwu Declare Statements (rfcs/declare-statements.md) it declares a Luwu class (see declaresClass above). Otherwise
+    // it is an error naming `declare extern type`, and it is parsed as the extern type it meant so nothing cascades.
+    // `declare class: T` is always a global named `class`.
+    else if (AstName(lexer.current().name) == "extern" || legacyDeclareClass())
     {
-        bool foundExtern = false;
-        if (AstName(lexer.current().name) == "extern")
+        bool isExtern = AstName(lexer.current().name) == "extern";
+        if (!isExtern)
+            report(lexer.current().location, "%s", kLegacyDeclareClassError);
+        else
         {
-            if (!FFlag::LuauDisallowExternClassInTypeDefinitions)
-                foundExtern = true;
             nextLexeme();
             if (AstName(lexer.current().name) != "type")
                 return reportStatError(
@@ -2500,15 +3865,15 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
         Location classLocation = lexer.current().location;
         nextLexeme();
 
-        Location classStart = lexer.current().location;
         Name className = parseName("type name");
+        checkTypeName(className, /* declared= */ true);
 
         AstArray<AstGenericType*> classGenerics;
         AstArray<AstGenericTypePack*> classGenericPacks;
 
         if (FFlag::LuwuGenericNominals)
         {
-            // An extern type's generic parameter list may carry defaults, like a type alias's --
+            // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): an extern type's generic parameter list may carry defaults:
             // `declare extern type Box<T = string> with ... end`.
             std::tie(classGenerics, classGenericPacks) = parseGenericTypeList(/* withDefaultValues= */ true);
         }
@@ -2521,25 +3886,36 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
         }
 
         std::optional<AstName> superName = std::nullopt;
+        std::optional<Location> superNameLocation = std::nullopt;
         std::optional<Location> extendsLocation = std::nullopt;
 
         if (AstName(lexer.current().name) == "extends")
         {
             extendsLocation = lexer.current().location;
             nextLexeme();
-            superName = parseName("supertype name").name;
+            Name parsedSuperName = parseName("supertype name");
+            superName = parsedSuperName.name;
+            superNameLocation = parsedSuperName.location;
         }
 
-        if (FFlag::LuauDisallowExternClassInTypeDefinitions || foundExtern)
+        // Luwu Declare Statements (rfcs/declare-statements.md): `with` is optional, as in a class, and kept only for
+        // compatibility with upstream, which requires it. A `with` followed by `:` is the first property, named `with`;
+        // the keyword is never followed by `:`.
+        std::optional<Location> withLocation;
+        if (isExtern)
         {
-            if (AstName(lexer.current().name) != "with")
+            bool withKeyword = AstName(lexer.current().name) == "with" && (!FFlag::LuwuDeclareStatements || lexer.lookahead().type != ':');
+            if (withKeyword)
+            {
+                withLocation = lexer.current().location;
+                nextLexeme();
+            }
+            else if (!FFlag::LuwuDeclareStatements)
                 report(
                     lexer.current().location,
                     "Expected `with` keyword before listing properties of the external type, but got %s instead",
                     lexer.current().name
                 );
-            else
-                nextLexeme();
         }
 
         TempVector<AstDeclaredExternTypeProperty> props(scratchDeclaredClassProps);
@@ -2549,9 +3925,11 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
         {
             AstArray<AstAttr*> attributes{nullptr, 0};
 
+            skipClassOnlyExternTypeKeywords();
+
             if (lexer.current().type == Lexeme::Attribute || lexer.current().type == Lexeme::AttributeOpen)
             {
-                attributes = Parser::parseAttributes();
+                attributes = Parser::parseAttributes(AstAttr::Context::Function);
 
                 if (lexer.current().type != Lexeme::ReservedFunction)
                     return reportStatError(
@@ -2618,7 +3996,8 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
             {
                 AstTableAccess access = AstTableAccess::ReadWrite;
 
-                if (lexer.current().type == Lexeme::Name && lexer.lookahead().type != ':')
+                // Luwu: `name = T` is a property with a (rejected) default below, not an access modifier
+                if (lexer.current().type == Lexeme::Name && lexer.lookahead().type != ':' && lexer.lookahead().type != '=')
                 {
                     if (AstName(lexer.current().name) == "read")
                     {
@@ -2643,7 +4022,15 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
                 if (!propName)
                     break;
 
-                expectAndConsume(':', "property type annotation");
+                // Luwu: `name = T` is how a declared class writes a default; an extern type has no defaults
+                if (lexer.current().type == '=')
+                {
+                    report(lexer.current().location, "Extern type properties have no defaults; write 'name: T'");
+                    nextLexeme();
+                }
+                else
+                    expectAndConsume(':', "property type annotation");
+
                 AstType* propType = parseType();
                 props.push_back(
                     AstDeclaredExternTypeProperty{
@@ -2656,8 +4043,11 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
         Location classEnd = lexer.current().location;
         nextLexeme(); // skip past `end`
 
-        return allocator.alloc<AstStatDeclareExternType>(
-            Location(classStart, classEnd),
+        // Luwu: upstream starts the statement at the type's name, so `declare extern type` falls outside it and tools
+        // can't find the statement from its keywords. It starts at `declare` (or `export`); the name has nameLocation.
+        Position statementBegin = exportLocation ? exportLocation->begin : start.begin;
+        AstStatDeclareExternType* declaration = allocator.alloc<AstStatDeclareExternType>(
+            Location(statementBegin, classEnd.end),
             className.name,
             superName,
             copy(props),
@@ -2668,13 +4058,42 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
             classGenerics,
             classGenericPacks
         );
+        declaration->exportLocation = exportLocation;
+        declaration->withLocation = withLocation;
+        declaration->nameLocation = className.location;
+        declaration->superNameLocation = superNameLocation;
+        bool withOmitted = isExtern && !withLocation;
+        if (exportLocation || withOmitted)
+            declaration->luwuOnly = true;
+        return declaration;
     }
     else if (std::optional<Name> globalName = parseNameOpt("global variable name"))
     {
-        expectAndConsume(':', "global variable declaration");
+        // Luwu Declare Statements (rfcs/declare-statements.md): `declare name` with no type says the global exists and
+        // leaves its type to the environment (see ConstraintGenerator). Upstream requires the type.
+        AstType* type = nullptr;
+        if (lexer.current().type == ':' || !FFlag::LuwuDeclareStatements)
+        {
+            expectAndConsume(':', "global variable declaration");
+            type = parseType(/* in declaration context */ true);
+        }
 
-        AstType* type = parseType(/* in declaration context */ true);
-        return allocator.alloc<AstStatDeclareGlobal>(Location(start, type->location), globalName->name, globalName->location, type, start);
+        // Luwu Declare Statements (rfcs/declare-statements.md): a declaration has no value; `declare cat = 2` is reported
+        // and the value is skipped, so the declaration still stands
+        if (FFlag::LuwuDeclareStatements && lexer.current().type == '=')
+        {
+            report(
+                lexer.current().location,
+                "declare may only be used to initialize globals; assign to '%s' on a new line to assign to the global variable",
+                globalName->name.value
+            );
+            nextLexeme();
+            parseExpr();
+        }
+
+        checkDuplicateDeclaration(*globalName);
+        Location end = type ? type->location : globalName->location;
+        return allocator.alloc<AstStatDeclareGlobal>(Location(start, end), globalName->name, globalName->location, type, start);
     }
     else
     {
@@ -2682,6 +4101,165 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
     }
 }
 
+// Luwu Declare Statements (rfcs/declare-statements.md): `declare class type Name` (or the `declare class Name` it is
+// reported for), as opposed to `declare class: T`, a global named `class`. It takes the place of upstream's legacy
+// `declare class`, which declares an extern type.
+// Luwu: class and trait member keywords in an extern type body each get one error naming the fix, and are skipped so
+// the member itself still parses. They only count when a member follows: `public: number` is a property named `public`.
+void Parser::skipClassOnlyExternTypeKeywords()
+{
+    while (lexer.current().type == Lexeme::Name)
+    {
+        Lexeme::Type next = lexer.lookahead().type;
+        bool memberFollows = next == Lexeme::Name || next == Lexeme::ReservedFunction || next == Lexeme::Attribute || next == Lexeme::AttributeOpen;
+        if (!memberFollows)
+            return;
+
+        AstName keyword(lexer.current().name);
+        if (keyword == "public" || keyword == "private")
+            report(
+                lexer.current().location,
+                "Extern types have no access specifiers; every member is public. To declare a class, use 'declare class type'"
+            );
+        else if (keyword == "const")
+            report(lexer.current().location, "Extern types have no 'const'; write 'read' for a read-only property");
+        else if (keyword == "expect" || keyword == "final")
+            report(lexer.current().location, "'%s' belongs in a trait, not an extern type", keyword.value);
+        else
+            return;
+
+        nextLexeme();
+    }
+}
+
+// Upstream's legacy `declare class Name`, an extern type, where it isn't a Luwu class
+bool Parser::legacyDeclareClass()
+{
+    return !declaresClass() && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "class" &&
+           lexer.lookahead().type == Lexeme::Name;
+}
+
+bool Parser::declaresClass()
+{
+    return FFlag::LuwuDeclareStatements && FFlag::LuwuClasses && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "class" &&
+           lexer.lookahead().type == Lexeme::Name;
+}
+
+Parser::DeclaredParameters::DeclaredParameters(Parser& parser)
+    : parser(parser)
+    , outer(parser.parsingDeclaredParameters)
+{
+    parser.parsingDeclaredParameters = FFlag::LuwuDeclareStatements;
+}
+
+Parser::DeclaredParameters::~DeclaredParameters()
+{
+    parser.parsingDeclaredParameters = outer;
+}
+
+// The `any` an untyped part of a declared value stands for, e.g. a `declare function` parameter.
+AstType* Parser::untypedDeclarationType(const Location& location)
+{
+    return allocator.alloc<AstTypeReference>(location, std::nullopt, nameAny, std::nullopt, location);
+}
+
+// A declared class's primary constructor parameter: `name: T`, or `name = T` for one with a default.
+Parser::Binding Parser::parseDeclaredClassBinding(std::optional<Location>& declaredDefaultLocation)
+{
+    std::optional<Name> name = parseNameOpt("variable name");
+    if (!name)
+        name = Name(nameError, lexer.current().location);
+
+    AstType* annotation = nullptr;
+    if (lexer.current().type == ':')
+    {
+        nextLexeme();
+        annotation = parseType();
+    }
+
+    if (lexer.current().type == '=')
+    {
+        declaredDefaultLocation = lexer.current().location;
+        nextLexeme();
+
+        // `x: T = value` copied from a class: the annotation is the type, and the value is skipped
+        if (annotation)
+        {
+            report(*declaredDefaultLocation, "%s", kDeclaredDefaultIsATypeError);
+            parseExpr();
+        }
+        else
+            annotation = parseType();
+    }
+
+    if (!annotation)
+        report(name->location, "All declaration parameters must be annotated");
+
+    return Binding(*name, annotation);
+}
+
+// A declared method is a signature, so everything but `self` needs a type.
+void Parser::checkDeclaredClassMethod(AstExprFunction* function)
+{
+    for (size_t i = 0; i < function->args.size; ++i)
+    {
+        AstLocal* arg = function->args.data[i];
+        bool isSelf = i == 0 && arg->name == "self";
+        if (!isSelf && !arg->annotation)
+            report(arg->location, "All declaration parameters must be annotated");
+    }
+
+    if (function->vararg && !function->varargAnnotation)
+        report(function->varargLocation, "All declaration parameters must be annotated");
+}
+
+// Luwu Declare Statements (rfcs/declare-statements.md): a declared type (extern type or class) applies to the whole file,
+// so no other type in the file may have its name: a second declaration, or an alias, type function or class at any
+// depth. Definition files keep upstream's rules.
+void Parser::checkTypeName(const Name& name, bool declared)
+{
+    if (options.allowDeclarationSyntax || !FFlag::LuwuDeclareStatements || name.name == nameError)
+        return;
+
+    if (const Location* previous = fileTypeDeclarations.find(name.name))
+    {
+        report(name.location, "Type '%s' is declared on line %d, and a declared type can't be shadowed", name.name.value, previous->begin.line + 1);
+        return;
+    }
+
+    if (declared)
+    {
+        if (const Location* previous = fileTypeNames.find(name.name))
+        {
+            report(name.location, "Type '%s' is already defined on line %d, and a declared type can't shadow it", name.name.value, previous->begin.line + 1);
+            return;
+        }
+
+        fileTypeDeclarations[name.name] = name.location;
+    }
+    else if (!fileTypeNames.contains(name.name))
+        fileTypeNames[name.name] = name.location;
+}
+
+// Luwu Declare Statements (rfcs/declare-statements.md): a file may declare each global once. Definition files keep
+// upstream's rules, which allow redeclaring.
+void Parser::checkDuplicateDeclaration(const Name& name)
+{
+    if (options.allowDeclarationSyntax)
+        return;
+
+    if (const Location* previous = fileDeclarations.find(name.name))
+    {
+        report(name.location, "'%s' is already declared on line %d", name.name.value, previous->begin.line + 1);
+        return;
+    }
+
+    fileDeclarations[name.name] = name.location;
+}
+
+// Luwu: upstream (still at 0.738) names the const variable only under LuauExportValueSyntax, and reports
+// "Assigned expression must be a variable or a field" otherwise. Luwu always calls this, so the error
+// names the variable (a class method's const `self` exists whatever that flag is).
 AstExprError* Parser::reportLValueError(AstExpr* expr)
 {
     if (expr->is<AstExprLocal>() && expr->as<AstExprLocal>()->local->isConst)
@@ -2689,7 +4267,7 @@ AstExprError* Parser::reportLValueError(AstExpr* expr)
         AstExprLocal* local = expr->as<AstExprLocal>();
         return reportExprError(expr->location, copy({expr}), "Variable '%s' is constant and may not be reassigned", local->local->name.value);
     }
-    if (FFlag::DebugLuauUserDefinedClasses)
+    if (FFlag::LuwuClasses)
     {
         if (AstStatClass* classStat = getMatchingClass(expr))
         {
@@ -2710,9 +4288,7 @@ AstExprError* Parser::reportLValueError(AstExpr* expr)
 AstStat* Parser::parseAssignment(AstExpr* initial)
 {
     if (!isExprLValue(initial))
-        initial = FFlag::LuauExportValueSyntax
-                      ? reportLValueError(initial)
-                      : reportExprError(initial->location, copy({initial}), "Assigned expression must be a variable or a field");
+        initial = reportLValueError(initial);
 
     TempVector<AstExpr*> vars(scratchExpr);
     TempVector<Position> varsCommaPositions(scratchPosition);
@@ -2727,8 +4303,7 @@ AstStat* Parser::parseAssignment(AstExpr* initial)
         AstExpr* expr = parsePrimaryExpr(/* asStatement= */ true);
 
         if (!isExprLValue(expr))
-            expr = FFlag::LuauExportValueSyntax ? reportLValueError(expr)
-                                                : reportExprError(expr->location, copy({expr}), "Assigned expression must be a variable or a field");
+            expr = reportLValueError(expr);
 
         vars.push_back(expr);
     }
@@ -2748,7 +4323,7 @@ AstStat* Parser::parseAssignment(AstExpr* initial)
 
 AstStat* Parser::parseExportValue(
     const Location& start,
-    const Position keywordPosition,
+    const Location& keywordLocation,
     const AstArray<AstAttr*>& attributes,
     TempVector<CstAttrList*>* cstAttrLists
 )
@@ -2770,6 +4345,13 @@ AstStat* Parser::parseExportValue(
 
     auto exportLocalStat = [&](AstStat* stat, const Location& keywordLocation) -> AstStat*
     {
+        // Luwu Destructuring (rfcs/destructuring.md): not supported with `export` yet.
+        if (!pendingStatements.empty())
+        {
+            report(stat->location, "A destructuring declaration can't be exported");
+            return stat;
+        }
+
         if (AstStatLocal* localStat = stat->as<AstStatLocal>())
         {
             localStat->isExported = true;
@@ -2810,14 +4392,14 @@ AstStat* Parser::parseExportValue(
         {
             report(start, "'export' must be followed by an identifier or 'function'; try removing 'local'");
             // still parse the function for error recovery
-            return parseLocal(start, localKeywordLocation.begin, {nullptr, 0}, true);
+            return parseLocal(start, localKeywordLocation, {nullptr, 0}, true);
         }
 
-        return exportLocalStat(parseLocal(start, keywordPosition, {nullptr, 0}, false), localKeywordLocation);
+        return exportLocalStat(parseLocal(start, keywordLocation, {nullptr, 0}, false), localKeywordLocation);
     }
     else if (lexer.current().type == Lexeme::ReservedFunction)
     {
-        auto funcStat = parseLocal(start, keywordPosition, attributes, true, cstAttrLists);
+        auto funcStat = parseLocal(start, keywordLocation, attributes, true, cstAttrLists);
         if (!funcStat->is<AstStatLocalFunction>())
             // parseLocal returned a parse error
             return funcStat;
@@ -2840,13 +4422,16 @@ AstStat* Parser::parseExportValue(
         {
             report(start, "'export' must be followed by an identifier or 'function'");
             // still parse the function for error recovery
-            return parseLocal(start, constKeywordLocation.begin, {nullptr, 0}, true);
+            return parseLocal(start, constKeywordLocation, {nullptr, 0}, true);
         }
 
-        return exportLocalStat(parseLocal(start, constKeywordLocation.begin, {nullptr, 0}, true), constKeywordLocation);
+        return exportLocalStat(parseLocal(start, constKeywordLocation, {nullptr, 0}, true), constKeywordLocation);
     }
-    else if (FFlag::DebugLuauUserDefinedClasses && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "class")
+    else if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "class")
     {
+        if (!FFlag::LuwuClasses)
+            return reportStatError(start, {}, {}, "%s", kClassesDisabledError);
+
         Location classKeywordLocation = lexer.current().location;
         nextLexeme();
         auto stat = parseClassStat(start, /*exported*/ true, classKeywordLocation);
@@ -2859,6 +4444,20 @@ AstStat* Parser::parseExportValue(
         }
         return stat;
     }
+    else if (lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "trait" && traitsEnabled())
+    {
+        Location traitKeywordLocation = lexer.current().location;
+        nextLexeme();
+        auto stat = parseClassStat(start, /*exported*/ true, traitKeywordLocation, {nullptr, 0}, /* declared= */ false, /* isTrait= */ true);
+        if (auto traitStat = stat->as<AstStatClass>())
+        {
+            if (!checkDuplicateExport(traitStat->name->name, traitStat->name->location))
+                report(traitStat->name->location, "Duplicate exported trait '%s'", traitStat->name->name.value);
+
+            traitStat->name->isExported = true;
+        }
+        return stat;
+    }
 
     return reportStatError(start, {}, {}, "'export' must be followed by an identifier or 'function'");
 }
@@ -2868,9 +4467,7 @@ AstStat* Parser::parseCompoundAssignment(AstExpr* initial, AstExprBinary::Op op)
 {
     if (!isExprLValue(initial))
     {
-        initial = FFlag::LuauExportValueSyntax
-                      ? reportLValueError(initial)
-                      : reportExprError(initial->location, copy({initial}), "Assigned expression must be a variable or a field");
+        initial = reportLValueError(initial);
     }
 
     Position opPosition = lexer.current().location.begin;
@@ -2913,7 +4510,9 @@ std::pair<AstExprFunction*, AstLocal*> Parser::parseFunctionBody(
     const AstArray<AstAttr*>& attributes,
     const bool isConst,
     TempVector<CstAttrList*>* cstAttrLists,
-    const Lexeme* endMatchLexeme
+    const Lexeme* endMatchLexeme,
+    bool isClassFunction,
+    bool signatureOnly
 )
 {
     LUAU_ASSERT(cstAttrLists != nullptr ? FFlag::LuauCstAttr : true);
@@ -2958,6 +4557,10 @@ std::pair<AstExprFunction*, AstLocal*> Parser::parseFunctionBody(
 
     if (lexer.current().type != ')')
     {
+        std::optional<DeclaredParameters> declaredParameters;
+        if (signatureOnly)
+            declaredParameters.emplace(*this);
+
         if (cstNode)
             std::tie(vararg, varargLocation, varargAnnotation) = parseBindingList(
                 args,
@@ -2965,11 +4568,21 @@ std::pair<AstExprFunction*, AstLocal*> Parser::parseFunctionBody(
                 /* allowDefault= */ FFlag::LuwuDefaultArguments,
                 &cstNode->argsCommaPositions,
                 nullptr,
-                &cstNode->varargAnnotationColonPosition
+                &cstNode->varargAnnotationColonPosition,
+                /* isConst= */ false,
+                /* allowAttributes= */ true
             );
         else
-            std::tie(vararg, varargLocation, varargAnnotation) =
-                parseBindingList(args, /* allowDot3= */ true, /* allowDefault= */ FFlag::LuwuDefaultArguments);
+            std::tie(vararg, varargLocation, varargAnnotation) = parseBindingList(
+                args,
+                /* allowDot3= */ true,
+                /* allowDefault= */ FFlag::LuwuDefaultArguments,
+                nullptr,
+                nullptr,
+                nullptr,
+                /* isConst= */ false,
+                /* allowAttributes= */ true
+            );
     }
 
     std::optional<Location> argLocation;
@@ -2999,16 +4612,40 @@ std::pair<AstExprFunction*, AstLocal*> Parser::parseFunctionBody(
 
     auto [self, vars, varsDefaults] = prepareFunctionArguments(start, hasself, args);
 
-    AstStatBlock* body = parseBlock();
+    // Luwu Classes (rfcs/classes): a method's `self` is const, so every write to it (assignment,
+    // `function self()`, a write from a nested closure) is rejected like a write to any const local.
+    // Field writes (`self.x = v`) and a new `local self` are unaffected.
+    if (isClassFunction && vars.size > 0 && vars.data[0]->name == "self")
+        vars.data[0]->isConst = true;
 
-    functionStack.pop_back();
+    AstStatBlock* body = nullptr;
+    Location end;
+    if (signatureOnly)
+    {
+        // Like `declare function`, a signature with no return type returns nothing.
+        if (!typelist)
+            typelist = allocator.alloc<AstTypePackExplicit>(lexer.previousLocation(), AstTypeList{copy<AstType*>(nullptr, 0), nullptr});
 
-    restoreLocals(localsBegin);
+        end = lexer.previousLocation();
+        body = allocator.alloc<AstStatBlock>(Location(end.end, end.end), AstArray<AstStat*>{nullptr, 0});
+        body->hasEnd = true;
 
-    Location end = lexer.current().location;
+        functionStack.pop_back();
+        restoreLocals(localsBegin);
+    }
+    else
+    {
+        body = parseBlock();
 
-    bool hasEnd = expectMatchEndAndConsume(Lexeme::ReservedEnd, endMatchLexeme ? *endMatchLexeme : matchFunction);
-    body->hasEnd = hasEnd;
+        functionStack.pop_back();
+
+        restoreLocals(localsBegin);
+
+        end = lexer.current().location;
+
+        bool hasEnd = expectMatchEndAndConsume(Lexeme::ReservedEnd, endMatchLexeme ? *endMatchLexeme : matchFunction);
+        body->hasEnd = hasEnd;
+    }
 
     AstExprFunction* node = allocator.alloc<AstExprFunction>(
         Location(start, end),
@@ -3058,8 +4695,13 @@ void Parser::parseExprList(TempVector<AstExpr*>& result, TempVector<Position>* c
     }
 }
 
-Parser::Binding Parser::parseBinding(bool isConst, bool allowDefault)
+Parser::Binding Parser::parseBinding(bool isConst, bool allowDefault, bool allowAttributes)
 {
+    // A parameter's attributes come before its name: `function f(@deprecated a: number)`.
+    AstArray<AstAttr*> attributes{nullptr, 0};
+    if (FFlag::LuwuAttributesEverywhere && allowAttributes && attributesFollow())
+        attributes = parseAttributes(AstAttr::Context::Parameter);
+
     std::optional<Name> name = parseNameOpt("variable name");
 
     // Use placeholder if the name is missing
@@ -3070,7 +4712,27 @@ Parser::Binding Parser::parseBinding(bool isConst, bool allowDefault)
     AstType* annotation = parseOptionalType();
 
     AstExpr* defaultValue = nullptr;
-    if (allowDefault && lexer.current().type == '=')
+    if (parsingDeclaredParameters && lexer.current().type == '=')
+    {
+        // Luwu Declare Statements (rfcs/declare-statements.md): a declared parameter's default is written as its type,
+        // and only tells the caller it may leave the parameter out. `x: T = value` copied from a function keeps its
+        // annotation, and the value is skipped.
+        Location equalsLocation = lexer.current().location;
+        nextLexeme();
+
+        if (annotation)
+        {
+            report(equalsLocation, "%s", kDeclaredDefaultIsATypeError);
+            parseExpr();
+        }
+        else
+        {
+            AstType* type = parseType();
+            AstType* parts[] = {type, allocator.alloc<AstTypeOptional>(Location(equalsLocation))};
+            annotation = allocator.alloc<AstTypeUnion>(type->location, copy(parts, 2));
+        }
+    }
+    else if (allowDefault && lexer.current().type == '=')
     {
         nextLexeme();
         // The depth of functionStack is used to determine the scoping for a local
@@ -3088,9 +4750,9 @@ Parser::Binding Parser::parseBinding(bool isConst, bool allowDefault)
     }
 
     if (options.storeCstData)
-        return Binding(*name, annotation, colonPosition, isConst, defaultValue);
+        return Binding(*name, annotation, colonPosition, isConst, defaultValue, attributes);
     else
-        return Binding(*name, annotation, Position::missing(), isConst, defaultValue);
+        return Binding(*name, annotation, Position::missing(), isConst, defaultValue, attributes);
 }
 
 AstArray<Position> Parser::extractAnnotationColonPositions(const TempVector<Binding>& bindings)
@@ -3109,7 +4771,8 @@ LUAU_NOINLINE std::tuple<bool, Location, AstTypePack*> Parser::parseBindingList(
     AstArray<Position>* commaPositions,
     Position* initialCommaPosition,
     Position* varargAnnotationColonPosition,
-    bool isConst
+    bool isConst,
+    bool allowAttributes
 )
 {
     TempVector<Position> localCommaPositions(scratchPosition);
@@ -3140,7 +4803,26 @@ LUAU_NOINLINE std::tuple<bool, Location, AstTypePack*> Parser::parseBindingList(
             return {true, varargLocation, tailAnnotation};
         }
 
-        result.push_back(parseBinding(isConst, allowDefault));
+        // Luwu Destructuring (rfcs/destructuring.md): a pattern where only names are allowed. Parsed and dropped,
+        // so the error is the only one.
+        if (destructurePatternFollows())
+        {
+            Location patternStart = lexer.current().location;
+            DestructureTarget ignored;
+            parseDestructurePattern(ignored);
+
+            // Only parameter lists allow `...`
+            const char* message = "A destructuring pattern has to be the only binding in its declaration";
+            if (allowDot3)
+                message = "Destructuring isn't supported in function parameters; destructure the parameter in the body";
+
+            report(Location(patternStart, lexer.previousLocation()), "%s", message);
+            result.push_back(Binding(Name(nameError, patternStart)));
+        }
+        else
+        {
+            result.push_back(parseBinding(isConst, allowDefault, allowAttributes));
+        }
 
         if (lexer.current().type != ',')
             break;
@@ -3440,6 +5122,13 @@ AstType* Parser::parseTableType(bool inDeclarationContext)
         AstTableAccess access = AstTableAccess::ReadWrite;
         std::optional<Location> accessLocation;
 
+        // Attributes come before the `read`/`write` modifier, so `@deprecated read x: T` reads in
+        // the order it is written. Which entry kind they belong to isn't known yet, so they are
+        // checked against both and pinned down in each branch below.
+        AstArray<AstAttr*> attributes{nullptr, 0};
+        if (FFlag::LuwuAttributesEverywhere && attributesFollow())
+            attributes = parseAttributes(AstAttr::Context::TableTypeMember);
+
         if (lexer.current().type == Lexeme::Name && lexer.lookahead().type != ':')
         {
             if (AstName(lexer.current().name) == "read")
@@ -3484,7 +5173,8 @@ AstType* Parser::parseTableType(bool inDeclarationContext)
 
                 if (chars && !containsNull)
                 {
-                    props.push_back(AstTableProp{AstName(chars->data), begin.location, type, access, accessLocation});
+                    validateAttributeContexts(attributes, AstAttr::Context::TableTypeField);
+                    props.push_back(AstTableProp{AstName(chars->data), begin.location, type, access, accessLocation, attributes});
                     if (options.storeCstData)
                     {
                         CstExprTable::Separator separator = tableSeparator();
@@ -3520,6 +5210,8 @@ AstType* Parser::parseTableType(bool inDeclarationContext)
                 {
                     auto tableIndexerResult = parseTableIndexer(access, accessLocation, begin);
                     indexer = tableIndexerResult.node;
+                    validateAttributeContexts(attributes, AstAttr::Context::TableIndexer);
+                    indexer->attributes = attributes;
                     if (options.storeCstData)
                     {
                         CstExprTable::Separator separator = tableSeparator();
@@ -3545,7 +5237,8 @@ AstType* Parser::parseTableType(bool inDeclarationContext)
             isArray = true;
             Location nullTypeLocation = Location(start.begin, 0);
             AstType* index = allocator.alloc<AstTypeReference>(nullTypeLocation, std::nullopt, nameNumber, std::nullopt, nullTypeLocation);
-            indexer = allocator.alloc<AstTableIndexer>(AstTableIndexer{index, type, type->location, access, accessLocation});
+            validateAttributeContexts(attributes, AstAttr::Context::TableIndexer);
+            indexer = allocator.alloc<AstTableIndexer>(AstTableIndexer{index, type, type->location, access, accessLocation, attributes});
             break;
         }
         else
@@ -3560,7 +5253,8 @@ AstType* Parser::parseTableType(bool inDeclarationContext)
 
             AstType* type = parseType(inDeclarationContext);
 
-            props.push_back(AstTableProp{name->name, name->location, type, access, accessLocation});
+            validateAttributeContexts(attributes, AstAttr::Context::TableTypeField);
+            props.push_back(AstTableProp{name->name, name->location, type, access, accessLocation, attributes});
             if (options.storeCstData)
             {
                 CstExprTable::Separator separator = tableSeparator();
@@ -3930,7 +5624,7 @@ AstTypeOrPack Parser::parseSimpleType(bool allowPack, bool inDeclarationContext)
         }
         else
         {
-            attributes = Parser::parseAttributes();
+            attributes = Parser::parseAttributes(AstAttr::Context::Function);
             return parseFunctionType(allowPack, attributes);
         }
     }
@@ -4434,6 +6128,13 @@ AstExpr* Parser::parsePrimaryExpr(bool asStatement)
     {
         if (lexer.current().type == '.')
         {
+            // Luwu Destructuring (rfcs/destructuring.md): `const .{` starts a destructuring declaration, and
+            // `name.{` at the start of a statement is one missing its keyword. `.{` can't index anything.
+            bool bareName = expr->is<AstExprGlobal>() || expr->is<AstExprLocal>();
+            bool startsDestructuring = asStatement && bareName && destructurePatternFollows();
+            if (startsDestructuring)
+                break;
+
             Position opPosition = lexer.current().location.begin;
             nextLexeme();
 
@@ -4688,7 +6389,7 @@ LUAU_NOINLINE AstExpr* Parser::parseAttributedFunction(const Location& start)
     AstArray<AstAttr*> attributes{nullptr, 0};
     TempVector<CstAttrList*> cstAttrLists(scratchCstAttrList);
 
-    attributes = parseAttributes(FFlag::LuauCstAttr ? &cstAttrLists : nullptr);
+    attributes = parseAttributes(AstAttr::Context::InlinableFunction, FFlag::LuauCstAttr ? &cstAttrLists : nullptr);
 
     if (lexer.current().type != Lexeme::ReservedFunction)
     {
@@ -4734,7 +6435,18 @@ AstExpr* Parser::parseSimpleExpr()
         Lexeme matchFunction = lexer.current();
         nextLexeme();
 
-        return parseFunctionBody(false, matchFunction, AstName(), nullptr, AstArray<AstAttr*>{nullptr, 0}, false, nullptr).first;
+        // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): a table entry that parsed
+        // attributes in front of this function hands them over.
+        AstArray<AstAttr*> attributes{nullptr, 0};
+        TempVector<CstAttrList*>* cstAttrLists = nullptr;
+        if (pendingFunctionAttributes)
+        {
+            attributes = pendingFunctionAttributes->attributes;
+            cstAttrLists = pendingFunctionAttributes->cstAttrLists;
+            pendingFunctionAttributes.reset();
+        }
+
+        return parseFunctionBody(false, matchFunction, AstName(), nullptr, attributes, false, cstAttrLists).first;
     }
     else if (lexer.current().type == Lexeme::Number)
     {
@@ -4952,6 +6664,24 @@ AstExpr* Parser::parseTableConstructor()
         if (!FFlag::LuauTableEntriesDontNeedToMatchIndent)
             lastElementIndent_DEPRECATED = lexer.current().location.begin.column;
 
+        AstArray<AstAttr*> attributes{nullptr, 0};
+        TempVector<CstAttrList*> cstAttrLists(scratchCstAttrList);
+        if (FFlag::LuwuAttributesEverywhere && attributesFollow())
+        {
+            attributes = parseAttributes(AstAttr::Context::TableEntry, FFlag::LuauCstAttr ? &cstAttrLists : nullptr);
+
+            // In a list entry, attributes directly in front of `function` belong to the function, as
+            // they do wherever else a function expression is written.
+            if (lexer.current().type == Lexeme::ReservedFunction)
+            {
+                validateAttributeContexts(attributes, AstAttr::Context::InlinableFunction);
+                pendingFunctionAttributes = PendingFunctionAttributes{attributes, FFlag::LuauCstAttr ? &cstAttrLists : nullptr};
+                attributes = {nullptr, 0};
+            }
+            else
+                validateAttributeContexts(attributes, AstAttr::Context::TableField);
+        }
+
         if (lexer.current().type == '[')
         {
             Position indexerOpenPosition = lexer.current().location.begin;
@@ -4968,7 +6698,7 @@ AstExpr* Parser::parseTableConstructor()
 
             AstExpr* value = parseExpr();
 
-            items.push_back({AstExprTable::Item::Kind::General, key, value});
+            items.push_back({AstExprTable::Item::Kind::General, key, value, attributes});
             if (options.storeCstData)
             {
                 CstExprTable::Separator separator = tableSeparator();
@@ -4998,7 +6728,7 @@ AstExpr* Parser::parseTableConstructor()
             if (AstExprFunction* func = value->as<AstExprFunction>())
                 func->debugname = name.name;
 
-            items.push_back({AstExprTable::Item::Kind::Record, key, value});
+            items.push_back({AstExprTable::Item::Kind::Record, key, value, attributes});
             if (options.storeCstData)
             {
                 CstExprTable::Separator separator = tableSeparator();
@@ -5014,8 +6744,9 @@ AstExpr* Parser::parseTableConstructor()
         else
         {
             AstExpr* expr = parseExpr();
+            LUAU_ASSERT(!pendingFunctionAttributes);
 
-            items.push_back({AstExprTable::Item::Kind::List, nullptr, expr});
+            items.push_back({AstExprTable::Item::Kind::List, nullptr, expr, attributes});
             if (options.storeCstData)
             {
                 CstExprTable::Separator separator = tableSeparator();
@@ -5711,20 +7442,19 @@ AstLocal* Parser::pushLocal(const Binding& binding)
     local = allocator.alloc<AstLocal>(
         name.name, name.location, /* shadow= */ local, functionStack.size() - 1, functionStack.back().loopDepth, binding.annotation, binding.isConst
     );
+    local->attributes = binding.attributes;
 
     localStack.push_back(local);
 
     return local;
 }
 
-// Luwu Classes (rfcs/classes.md): bring a class's primary constructor parameters into scope for a
+// Luwu Classes (rfcs/classes): bring a class's primary constructor parameters into scope for a
 // field initializer expression, the only place they are visible. Their AstLocals were created once,
 // at the depth of the synthesized `__init`, by parseClassPrimaryConstructor; this re-enters them into
-// the scope chain so restoreLocals can take them back out.
-unsigned int Parser::pushClassPrimaryConstructorParams(AstClassPrimaryConstructor* primaryConstructor)
+// the scope chain, and the caller's restoreLocals takes them back out.
+void Parser::pushClassPrimaryConstructorParams(AstClassPrimaryConstructor* primaryConstructor)
 {
-    unsigned int localsBegin = saveLocals();
-
     for (AstLocal* arg : primaryConstructor->args)
     {
         AstLocal*& local = localMap[arg->name];
@@ -5733,8 +7463,6 @@ unsigned int Parser::pushClassPrimaryConstructorParams(AstClassPrimaryConstructo
 
         localStack.push_back(arg);
     }
-
-    return localsBegin;
 }
 
 unsigned int Parser::saveLocals()

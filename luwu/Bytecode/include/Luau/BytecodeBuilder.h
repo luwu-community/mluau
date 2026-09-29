@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #pragma once
 
 #include "Luau/Bytecode.h"
@@ -53,13 +53,17 @@ public:
         int32_t className;
         std::vector<int32_t> propertyNames;
         std::vector<int32_t> methodNames;
-        // Parallel to propertyNames/methodNames; LUAU_CLASSMEMBER_* bits (see VM/src/lclass.h) for
+        // Parallel to propertyNames/methodNames; LBC_CLASSMEMBER_* bits (see Luau/Bytecode.h) for
         // each member, in the same order (properties first, then methods).
         std::vector<uint8_t> propertyFlags;
         std::vector<uint8_t> methodFlags;
         // Parallel to propertyNames: for a member flagged LBC_CLASSMEMBER_CONSTDEFAULT, the proto
         // constant index of its default value; -1 for every other member.
         std::vector<int32_t> propertyDefaults;
+        // Luwu Traits (rfcs/classes/traits.md): the shape is a trait's (LBC_CLASSSHAPE_TRAIT), or a class's with an
+        // `implements` list (LBC_CLASSSHAPE_IMPLEMENTS)
+        bool isTrait = false;
+        bool implementsTraits = false;
     };
 
     BytecodeBuilder(BytecodeEncoder* encoder = 0);

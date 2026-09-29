@@ -1,9 +1,10 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Types.h"
 
 #include "Luau/BytecodeBuilder.h"
 
 LUAU_FASTFLAG(LuauIntegerFastcalls)
+LUAU_FASTFLAG(LuwuClasses)
 
 namespace Luau
 {
@@ -37,9 +38,11 @@ static LuauBytecodeType getPrimitiveType(AstName name)
         return LBC_TYPE_VECTOR;
     else if (name == "none")
         return LBC_TYPE_SYMNONE;
-    else if (name == "class")
+    // Luwu Classes (rfcs/classes): the class tags are Luwu bytecode version 200 (see Bytecode.h), so they are only
+    // emitted while classes are. Without classes these are ordinary type names, as they are upstream.
+    else if (FFlag::LuwuClasses && name == "class")
         return LBC_TYPE_CLASS;
-    else if (name == "object")
+    else if (FFlag::LuwuClasses && name == "object")
         return LBC_TYPE_OBJECT;
     else if (name == "any" || name == "unknown")
         return LBC_TYPE_ANY;
@@ -78,10 +81,9 @@ static LuauBytecodeType getType(
             }
         }
 
-        // Luwu Classes (rfcs/classes.md): a generic of the enclosing class (`T` in `class List<T>`) is as
-        // unknown as a function's own generic. Without this it fell through to the userdata guess below,
-        // and a method like `push(self, value: T)` got an entry guard against userdata that fails for
-        // every real argument, sending each call back to the interpreter.
+        // Luwu Classes (rfcs/classes): a generic of the enclosing class (`T` in `class List<T>`) is as
+        // unknown as a function's own generic. The userdata guess below would give `push(self, value: T)` an
+        // entry guard that every real argument fails, sending each call back to the interpreter.
         if (isGeneric(ref->name, generics) || classGenerics.contains(ref->name))
             return LBC_TYPE_ANY;
 
@@ -91,11 +93,10 @@ static LuauBytecodeType getType(
         if (LuauBytecodeType prim = getPrimitiveType(ref->name); prim != LBC_TYPE_INVALID)
             return prim;
 
-        // Luwu Classes (rfcs/classes.md): a type annotation naming a declared class (`x: Account`)
-        // refers to an instance of that class, i.e. an object, not host userdata. Without this,
-        // such annotations fell through to the LBC_TYPE_USERDATA guess below, which made native
-        // codegen emit an entry-arg CHECK_TAG against LUA_TUSERDATA that always fails for a real
-        // object argument, forcing every call to bail out to the interpreter.
+        // Luwu Classes (rfcs/classes): a type annotation naming a declared class (`x: Account`)
+        // refers to an instance of that class, i.e. an object, not host userdata. The LBC_TYPE_USERDATA
+        // guess below would make native codegen guard entry arguments against LUA_TUSERDATA, which every
+        // real object fails.
         if (classNames.contains(ref->name))
             return LBC_TYPE_OBJECT;
 
@@ -198,7 +199,7 @@ static std::string getFunctionType(
         AstLocal* arg = func->args.data[i];
 
         LuauBytecodeType ty;
-        // Luwu Classes (rfcs/classes.md): a method's leading unannotated `self` is always an
+        // Luwu Classes (rfcs/classes): a method's leading unannotated `self` is always an
         // instance of the owning class, so type it as an object. `self` may not be annotated (the
         // parser rejects that), which is why this can't come through the annotation path below.
         if (isClassMethod && i == 0 && arg->name == "self" && arg->annotation == nullptr)
@@ -265,19 +266,24 @@ struct TypeMapVisitor : AstVisitor
     DenseHashMap<AstLocal*, const AstType*> resolvedLocals;
     DenseHashMap<AstExpr*, const AstType*> resolvedExprs;
     DenseHashMap<AstLocal*, const AstType*> functionReturnTypes{nullptr};
-    // Luwu Classes (rfcs/classes.md): method functions whose leading `self` param is a class
+    // Luwu Classes (rfcs/classes): method functions whose leading `self` param is a class
     // instance; populated in visit(AstStatClass) before descending into the method bodies.
     DenseHashSet<AstExprFunction*> classMethods{nullptr};
-    // Names of declared classes seen so far (forward order), so a type annotation naming a class
-    // (`x: Account`) or a direct constructor call (`Account(...)`) resolves to an object, not the
-    // LBC_TYPE_USERDATA guess used for unrecognized type names.
+    // Names of the module's declared classes, so a type annotation naming a class (`x: Account`) or a
+    // direct constructor call (`Account(...)`) resolves to an object, not the LBC_TYPE_USERDATA guess
+    // used for unrecognized type names. Filled by declareClasses before the walk.
     DenseHashSet<AstName> classNames{AstName()};
     // Generic type parameters of the class whose body is being visited (see visit(AstStatClass)); getType
     // treats them like a function's own generics.
     DenseHashSet<AstName> classGenerics{AstName()};
-    // Maps a class's module-scoped local to its declaration, so constructor-call detection
-    // (`Account(...)`) can recognize the callee as a class value.
-    DenseHashMap<AstLocal*, AstStatClass*> classDecls{nullptr};
+    // Maps a declared class's name to its declaration, so a static call (`Account.new(...)`) can find the
+    // method's return type. Filled by declareClasses before the walk.
+    DenseHashMap<AstName, AstStatClass*> classDecls{AstName()};
+    // Filled by trackValues; null when the caller doesn't track values, which leaves every local counted as written. A
+    // written local doesn't take its initializer's type (see visit(AstStatLocal)).
+    const DenseHashMap<AstLocal*, Compile::Variable>* variables = nullptr;
+    // May a declared type decide something here? See DebugLuwuCompilerTrustsTypeAnnotations in Compiler.cpp.
+    bool trustsTypeAnnotations = false;
 
     TypeMapVisitor(
         DenseHashMap<AstExprFunction*, std::string>& functionTypes,
@@ -495,17 +501,68 @@ struct TypeMapVisitor : AstVisitor
         return true; // Let generic visitor step into all expressions
     }
 
-    bool visit(AstStatClass* node) override
+    // Luwu Classes (rfcs/classes): classes are hoisted, so a class is in scope for the whole module,
+    // including code above its declaration. Recording them all before the walk types an annotation or a
+    // constructor call that precedes the declaration the same as one that follows it. Classes can only be
+    // declared at the top level of the module.
+    void declareClasses(AstStatBlock* root)
     {
-        // The class value itself (the module-scoped `ClassName` local) is a `class`; typing it lets
-        // static-member access (`ClassName.method`) take the class fast path in native codegen.
-        if (node->name)
+        for (AstStat* stat : root->body)
         {
-            localTypes[node->name] = LBC_TYPE_CLASS;
-            classNames.insert(node->name->name);
-            classDecls[node->name] = node;
+            AstStatClass* decl = stat->as<AstStatClass>();
+            if (!decl || !decl->name)
+                continue;
+
+            // The class value itself (the module-scoped `ClassName` local) is a `class`; typing it lets
+            // static-member access (`ClassName.method`) take the class fast path in native codegen.
+            localTypes[decl->name] = LBC_TYPE_CLASS;
+            classNames.insert(decl->name->name);
+            classDecls[decl->name->name] = decl;
+        }
+    }
+
+    bool namesClass(const AstType* type) const
+    {
+        const AstTypeReference* ref = type->as<AstTypeReference>();
+        return ref && !ref->prefix && classNames.contains(ref->name);
+    }
+
+    bool isWritten(AstLocal* local) const
+    {
+        const Compile::Variable* variable = variables ? variables->find(local) : nullptr;
+        return !variable || variable->written;
+    }
+
+    static const AstClassMethod* findClassMethod(const AstStatClass* decl, AstName name)
+    {
+        for (const AstClassMember& member : decl->members)
+        {
+            if (const AstClassMethod* method = Luau::get_if<AstClassMethod>(&member); method && method->functionName == name)
+                return method;
         }
 
+        return nullptr;
+    }
+
+    // Whether `method`'s first declared return type names a class. A generic of the class or of the method
+    // (`function get(self): T`) is unknown even when it shares a class's name, and an optional (`Account?`)
+    // may be nil.
+    bool returnsClassInstance(const AstStatClass* decl, const AstClassMethod* method) const
+    {
+        const AstTypePackExplicit* retPack =
+            method->function->returnAnnotation ? method->function->returnAnnotation->as<AstTypePackExplicit>() : nullptr;
+        if (!retPack || retPack->typeList.types.size == 0)
+            return false;
+
+        const AstTypeReference* ref = retPack->typeList.types.data[0]->as<AstTypeReference>();
+        if (!ref || ref->prefix || !classNames.contains(ref->name))
+            return false;
+
+        return !isGeneric(ref->name, decl->generics) && !isGeneric(ref->name, method->function->generics);
+    }
+
+    bool visit(AstStatClass* node) override
+    {
         // Record each method's function so getFunctionType (invoked when we descend into it below)
         // types the leading `self` param as an object. See getFunctionType.
         for (const AstClassMember& member : node->members)
@@ -592,7 +649,13 @@ struct TypeMapVisitor : AstVisitor
             {
                 if (i < node->values.size)
                 {
-                    if (const AstType** typePtr = resolvedExprs.find(node->values.data[i]))
+                    // Luwu Classes (rfcs/classes): a class-typed initializer is propagated only to a local that
+                    // is never written; the type covers the whole range and codegen guards it with a VM exit.
+                    // That includes a construction (`Cat()`), whose result is typed `object`.
+                    const AstType** typePtr = resolvedExprs.find(node->values.data[i]);
+                    bool isClassType = typePtr && (namesClass(*typePtr) || *typePtr == &builtinTypes.objectType);
+                    bool skipClassTypeOfWrittenLocal = isClassType && isWritten(var);
+                    if (typePtr && !skipClassTypeOfWrittenLocal)
                         resolvedLocals[var] = *typePtr;
                 }
             }
@@ -1009,35 +1072,29 @@ struct TypeMapVisitor : AstVisitor
             {
                 if (const AstType** typePtr = functionReturnTypes.find(local->local))
                     recordResolvedType(node, *typePtr);
-                else if (LuauBytecodeType* classTy = localTypes.find(local->local); classTy && *classTy == LBC_TYPE_CLASS)
-                {
-                    // Luwu Classes (rfcs/classes.md): calling the class value directly constructs a
-                    // new instance (`Account(...)`), so the call result is an object.
-                    recordResolvedType(node, &builtinTypes.objectType);
-                }
+            }
+            else if (AstExprGlobal* global = node->func->as<AstExprGlobal>(); global && classNames.contains(global->name))
+            {
+                // Luwu Classes (rfcs/classes): a class is referenced by name (the parser doesn't bind it as a
+                // local, which is what lets it hoist), and calling it constructs a new instance
+                // (`Account(...)`), so the call result is an object.
+                recordResolvedType(node, &builtinTypes.objectType);
             }
             else if (AstExprIndexName* indexName = node->func->as<AstExprIndexName>())
             {
-                // Luwu Classes: a static member call on the class value (`Account.new(...)`) whose
-                // declared return type names a class returns an object of that class.
-                if (AstExprLocal* objLocal = indexName->expr->as<AstExprLocal>())
+                // Luwu Classes (rfcs/classes): a static call on a class (`Account.new(...)`) whose declared
+                // return type names a class returns an object. Nothing checks that declared type. If it is
+                // wrong, codegen's guard on the hint fails and the rest of each calling function runs
+                // interpreted. So the result is only typed when annotations are trusted.
+                AstExprGlobal* classGlobal = indexName->expr->as<AstExprGlobal>();
+
+                if (classGlobal && trustsTypeAnnotations)
                 {
-                    if (AstStatClass* const* classDecl = classDecls.find(objLocal->local))
+                    if (AstStatClass* const* classDecl = classDecls.find(classGlobal->name))
                     {
-                        for (const AstClassMember& member : (*classDecl)->members)
-                        {
-                            const AstClassMethod* method = Luau::get_if<AstClassMethod>(&member);
-                            if (!method || method->functionName != indexName->index || !method->function->returnAnnotation)
-                                continue;
-
-                            if (AstTypePackExplicit* retPack = method->function->returnAnnotation->as<AstTypePackExplicit>())
-                            {
-                                if (retPack->typeList.types.size >= 1)
-                                    recordResolvedType(node, retPack->typeList.types.data[0]);
-                            }
-
-                            break;
-                        }
+                        if (const AstClassMethod* method = findClassMethod(*classDecl, indexName->index);
+                            method && returnsClassInstance(*classDecl, method))
+                            recordResolvedType(node, &builtinTypes.objectType);
                     }
                 }
             }
@@ -1065,12 +1122,20 @@ void buildTypeMap(
     const DenseHashMap<AstExprCall*, int>& builtinCalls,
     const DenseHashMap<AstName, Compile::Global>& globals,
     LibraryMemberTypeCallback libraryMemberTypeCb,
-    BytecodeBuilder& bytecode
+    BytecodeBuilder& bytecode,
+    const DenseHashMap<AstLocal*, Compile::Variable>* variables,
+    bool trustsTypeAnnotations
 )
 {
     TypeMapVisitor visitor(
         functionTypes, localTypes, exprTypes, hostVectorType, userdataTypes, builtinTypes, builtinCalls, globals, libraryMemberTypeCb, bytecode
     );
+    visitor.variables = variables;
+    visitor.trustsTypeAnnotations = trustsTypeAnnotations;
+
+    if (AstStatBlock* block = root->as<AstStatBlock>())
+        visitor.declareClasses(block);
+
     root->visit(&visitor);
 }
 

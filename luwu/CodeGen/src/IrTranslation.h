@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #pragma once
 
 #include <stdint.h>
@@ -70,7 +70,7 @@ void translateInstSetTable(IrBuilder& build, const Instruction* pc, int pcpos);
 void translateInstGetImport(IrBuilder& build, const Instruction* pc, int pcpos);
 void translateInstGetTableKS(IrBuilder& build, const Instruction* pc, int pcpos);
 void translateInstSetTableKS(IrBuilder& build, const Instruction* pc, int pcpos);
-// Luwu Classes (rfcs/classes.md): member read at a constant offset on a proven receiver.
+// Luwu Classes (rfcs/classes): member read at a constant offset on a proven receiver.
 void translateInstGetObjectMember(IrBuilder& build, const Instruction* pc, int pcpos);
 void translateInstNewObject(IrBuilder& build, const Instruction* pc, int pcpos);
 void translateInstSetObjectMember(IrBuilder& build, const Instruction* pc, int pcpos);

@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/IrAnalysis.h"
 
 #include "Luau/DenseHash.h"
@@ -483,7 +483,7 @@ static void computeCfgLiveInOutRegSets(IrFunction& function)
             // This is because fallback blocks define an alternative implementation of the same operations
             // This can cause the current block to define more registers that actually were available at fallback entry
             //
-            // Luwu Classes (rfcs/classes.md): an edge between two fallback blocks of the same instruction is skipped
+            // Luwu Classes (rfcs/classes): an edge between two fallback blocks of the same instruction is skipped
             // too. A field access or method call on an untyped receiver puts its object path in a fallback block,
             // and a failed check there jumps to the instruction's generic fallback (see translateInstGetTableKS).
             // Counting that edge breaks on pending call results. In `a:m(b:n())`, the results of `b:n()` are still

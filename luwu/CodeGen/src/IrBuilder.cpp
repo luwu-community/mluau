@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/IrBuilder.h"
 
 #include "Luau/Bytecode.h"
@@ -681,16 +681,23 @@ void IrBuilder::translateInst(LuauOpcode op, const Instruction* pc, int i)
         inst(IrCmd::FALLBACK_FORGPREP, constUint(i), vmReg(LUAU_INSN_A(*pc)), loopStart);
         break;
     }
-    // Class declaration and non-native construction have no machine code lowering, but neither can be a bare
-    // `JUMP vmExit`: such a jump carries no VM register operands, so nothing downstream knows which
-    // registers the interpreter will go on to read, and stores that are still needed get eliminated
-    // -- a numeric for loop's limit/step/index, say, sitting below these instructions' own operands
-    // and otherwise untouched by them. They run as ordinary C fallbacks instead, which also keeps the
-    // rest of the function native rather than abandoning it to the interpreter at the first
-    // construction. (CHECKSELFCLASS is lowered properly; see translateInstCheckSelfClass.)
+    // Class declaration and non-native construction have no machine code lowering. They still can't be
+    // a bare `JUMP vmExit`. Such a jump carries no VM register operands, so nothing downstream knows
+    // which registers the interpreter will read next, and stores it still needs get eliminated. For
+    // example, a numeric for loop's limit, step and index sit in registers below these instructions'
+    // own operands, and these instructions don't touch them.
+    //
+    // So both run as ordinary C fallbacks instead. That also keeps the rest of the function native,
+    // rather than handing it to the interpreter at the first construction. (CHECKSELFCLASS does have a
+    // real lowering; see translateInstCheckSelfClass.)
     case LOP_NEWCLASSMEMBER:
-        inst(IrCmd::FALLBACK_NEWCLASSMEMBER, constUint(i), vmReg(LUAU_INSN_A(*pc)), vmReg(LUAU_INSN_C(*pc)));
+    {
+        // Luwu Traits (rfcs/classes/traits.md): the IMPLEMENTS form reads the traits and their argument counts
+        bool implements = LUAU_INSN_B(*pc) == LBC_NEWCLASSMEMBER_IMPLEMENTS;
+        int regCount = implements ? int(pc[1]) * 2 : 1;
+        inst(IrCmd::FALLBACK_NEWCLASSMEMBER, constUint(i), vmReg(LUAU_INSN_A(*pc)), vmReg(LUAU_INSN_C(*pc)), constInt(regCount));
         break;
+    }
 
     case LOP_NEWOBJECT:
         translateInstNewObject(*this, pc, i);

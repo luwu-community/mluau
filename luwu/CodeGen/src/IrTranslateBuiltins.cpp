@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "IrTranslateBuiltins.h"
 
 #include "Luau/Bytecode.h"
@@ -440,7 +440,7 @@ static BuiltinImplResult translateBuiltinType(IrBuilder& build, int nparams, int
         return {BuiltinImplType::None, -1};
 
     IrOp tag = build.inst(IrCmd::LOAD_TAG, build.vmReg(arg));
-    IrOp name = build.inst(IrCmd::GET_TYPE, tag);
+    IrOp name = build.inst(IrCmd::GET_TYPE, tag, build.vmReg(arg));
 
     build.inst(IrCmd::STORE_POINTER, build.vmReg(ra), name);
     build.inst(IrCmd::STORE_TAG, build.vmReg(ra), build.constTag(LUA_TSTRING));
@@ -970,7 +970,7 @@ static BuiltinImplResult translateBuiltinBufferIsFrozen(IrBuilder& build, int np
     return {BuiltinImplType::Full, 1};
 }
 
-// Luwu Classes (rfcs/classes.md): class.isinstance(value, class) -> boolean, inlined as a tag-guarded
+// Luwu Classes (rfcs/classes): class.isinstance(value, class) -> boolean, inlined as a tag-guarded
 // class-pointer comparison instead of a call into the class library.
 static BuiltinImplResult translateBuiltinClassIsinstance(IrBuilder& build, int nparams, int ra, int arg, IrOp args, int nresults, int pcpos)
 {

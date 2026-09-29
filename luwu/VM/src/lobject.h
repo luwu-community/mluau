@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 // This code is based on Lua 5.x implementation licensed under MIT License; see lua_LICENSE.txt for details
 #pragma once
 
@@ -414,16 +414,18 @@ typedef struct Proto
 
     void* userdata;
 
-    // Luwu Classes (rfcs/classes.md): for a proto that is one of a class's own methods (including
-    // __init / __defaults) or is lexically nested anywhere inside one, the class it belongs to;
-    // NULL otherwise. Set (recursively, over the whole nested-proto tree) when the method closure is
-    // registered (luaR_addclassmember/luaR_stampownerclass) and GC-marked (traverseproto). Both the
-    // interpreter (luaR_closureownsprivateaccess) and native codegen use it to authorize
-    // private/const member access from inside the owning class's methods (and any closure nested in
-    // them) without needing to scan the class's static members: `object->lclass ==
-    // currentClosure->l.p->ownerclass` is exactly the "closure owns private access" test (method
-    // protos, and their nested protos, are unique per class), and const writes additionally require
-    // the closure to be the class's __init.
+    // Luwu Classes (rfcs/classes): the class this proto belongs to, or NULL. A proto belongs to a
+    // class if it is one of the class's own methods (including `__init` and `__defaults`), or if it is
+    // lexically nested anywhere inside one.
+    //
+    // It is set on the whole tree of nested protos when the method closure is registered
+    // (luaR_addclassmember, luaR_stampownerclass). It is GC-marked in traverseproto.
+    //
+    // The interpreter (luaR_closureownsprivateaccess) and native codegen both use it to authorize
+    // private and const member access without scanning the class's static members. Method protos and
+    // the protos nested in them are unique per class, so `object->lclass ==
+    // currentClosure->l.p->ownerclass` is exactly the "closure owns private access" test. A const write
+    // additionally requires the closure to be the class's `__init`.
     struct LuauClass* ownerclass;
 
     GCObject* gclist;
@@ -611,7 +613,8 @@ typedef struct LuauClass
     // Mapping from member name to offset.
     LuaTable* memberstooffset;
 
-    // Mapping from offset to member name.
+    // Mapping from offset to member name. NULL at `initoffset`: `__init` is only ever resolved by name
+    // (see luaR_sealclassshape).
     TString** offsettomember;
 
     // Metatable for this *class object*. At time of writing this only contains
@@ -641,8 +644,9 @@ typedef struct LuauClass
     // instead of the default POD table-copy constructor.
     bool hascustominit;
 
-    // The member offset of `__init` (index `staticmembers` with it minus `numberofinstancemembers`),
-    // only meaningful when `hascustominit` is set. Used by construction and the `const`-write check.
+    // The member offset of `__init` (index `staticmembers` with it minus `numberofinstancemembers`).
+    // Every class has an `__init` member; its slot holds a closure only when `hascustominit` is set.
+    // Used by construction, the private-constructor check and the `const`-write check.
     uint32_t initoffset;
 
     // Set when this class's `__init` is the one a primary constructor implies (`class Cat(name)`),
@@ -656,9 +660,8 @@ typedef struct LuauClass
     // LBC_CLASSMEMBER_* in Luau/Bytecode.h). Owned by this class object; freed in luaR_freeclass.
     uint8_t* memberflags;
 
-    // True if any entry in `memberflags` has LBC_CLASSMEMBER_PRIVATE set, or the class has a `const`
-    // member (which blocks reading `__init`, see LBC_CLASSMEMBER_INITBLOCKED). Lets the interpreter
-    // skip the private-access brand check entirely for classes without either.
+    // True if any entry in `memberflags` has LBC_CLASSMEMBER_PRIVATE set. Lets a member access whose
+    // slot is already cached skip the private-access check entirely for classes without one.
     bool hasprivatemembers;
 
     // True if any entry in `memberflags` has LBC_CLASSMEMBER_CONST set. Same idea as
@@ -682,9 +685,37 @@ typedef struct LuauClass
     // class object; freed in luaR_freeclass and marked in traverseclass.
     TValue* memberdefaults;
 
-    // Debug name of the constructor closure (e.g. "Foo() constructor"), shown
-    // in stack traces. Owned by this class object; freed in luaR_freeclass.
-    char* ctordebugname;
+    // Luwu Traits (rfcs/classes/traits.md): this class value is a trait. A trait is never constructed, and none of its members
+    // can be read through it (the VM sets LBC_CLASSMEMBER_INITBLOCKED on all of them): implementing classes get copies.
+    bool istrait;
+
+    // Luwu Traits (rfcs/classes/traits.md): the class has an `implements` list that luaR_implementtraits hasn't finished implementing.
+    // Implementing grows the layout, so an object made before then would be too small for it: construction refuses.
+    // Code can reach the class that early -- its binding is set when its statement starts, and the statement runs user
+    // code before implementing (an `__index` in an `implements` expression, a trait's `needs`). A class whose
+    // implementing failed stays pending, so it never makes an object; one that succeeded is never implemented again.
+    bool traitspending;
+
+    // Luwu Traits (rfcs/classes/traits.md): the number of instance members the class itself declares. The fields of the
+    // traits it implements come after them (see luaR_implementtraits); the class's `__defaults` returns only its own.
+    uint32_t numberofownmembers;
+
+    // Luwu Traits (rfcs/classes/traits.md): every trait this class implements, listed or implied through `needs`, in the
+    // order luaR_implementtraits attached them. NULL when there are none. Owned by this class; marked in traverseclass.
+    struct LuauClass** traits;
+    uint32_t numtraits;
+
+    // Luwu Traits (rfcs/classes/traits.md): what construction calls to initialize the fields of the implemented traits
+    // (see luaR_inittraitfields). NULL when no trait has a field that needs computing. Owned by this class; marked in
+    // traverseclass.
+    // - The first `numdirecttraitinits` are this class's copies of the `__traitinit` of each trait that takes no
+    //   arguments, called with the object alone.
+    // - When there are more, the next is the class's `__inittraits`, and the rest are the copies it calls, one per
+    //   `implements` entry that passes arguments, in list order. It is called with the object, those copies, and the
+    //   constructor's arguments.
+    TValue* traitinits;
+    uint32_t numtraitinits;
+    uint32_t numdirecttraitinits;
 
 } LuauClass;
 
@@ -707,7 +738,7 @@ typedef struct LuauObject
 
 } LuauObject;
 
-// Luwu Classes (rfcs/classes.md): an object's members are allocated inline, immediately after its
+// Luwu Classes (rfcs/classes): an object's members are allocated inline, immediately after its
 // header (luaR_objectsize, luaR_newobject, luaR_newobjectuninit), so `members` always equals
 // `(TValue*)(object + 1)`. Native code addresses members from the object pointer with this offset
 // instead of loading `members`; anything that ever allocates members out of line must change both.

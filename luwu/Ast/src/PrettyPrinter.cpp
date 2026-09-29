@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/PrettyPrinter.h"
 
 #include "Luau/Cst.h"
@@ -10,7 +10,7 @@
 #include <limits>
 #include <math.h>
 
-LUAU_FASTFLAG(DebugLuauUserDefinedClasses)
+LUAU_FASTFLAG(LuwuClasses)
 LUAU_FASTFLAG(LuauExportValueSyntax)
 
 LUAU_FASTFLAG(LuauCstAttr)
@@ -326,6 +326,66 @@ struct Printer
         }
         else if (alwaysWrite)
             writer.write(s);
+    }
+
+    // Luwu Destructuring (rfcs/destructuring.md): `[name].{field: T, key as name: T, key as [name].{...}: T}: T`,
+    // from the source form the parser kept.
+    void visualizeDestructuring(const AstDestructurePattern& pattern)
+    {
+        if (pattern.local->name != kDestructuredLocalName)
+        {
+            advance(pattern.local->location.begin);
+            writer.identifier(pattern.local->name.value);
+        }
+
+        visualizeDestructurePattern(pattern);
+    }
+
+    // The `.{...}` of a pattern, if any, then the annotation on the local it binds.
+    void visualizeDestructurePattern(const AstDestructurePattern& pattern)
+    {
+        visualizeDestructureFields(pattern);
+
+        if (writeTypes && pattern.local->annotation)
+        {
+            writer.symbol(":");
+            visualizeTypeAnnotation(*pattern.local->annotation);
+        }
+    }
+
+    void visualizeDestructureFields(const AstDestructurePattern& pattern)
+    {
+        if (!pattern.location)
+            return;
+
+        advance(pattern.location->begin);
+        writer.symbol(".");
+        writer.symbol("{");
+
+        CommaSeparatorInserter comma(writer, nullptr);
+        for (const AstDestructureField& field : pattern.fields)
+        {
+            comma();
+            advance(field.keyLocation.begin);
+            writer.identifier(field.key.value);
+
+            if (field.asLocation)
+            {
+                advance(field.asLocation->begin);
+                writer.keyword("as");
+
+                if (field.target.local->name != kDestructuredLocalName)
+                {
+                    advance(field.target.local->location.begin);
+                    writer.identifier(field.target.local->name.value);
+                }
+            }
+
+            visualizeDestructurePattern(field.target);
+        }
+
+        advanceBefore(pattern.location->end, 1);
+        writer.symbol("}");
     }
 
     void visualize(const AstLocal& local, Position colonPosition)
@@ -672,6 +732,8 @@ struct Printer
                         writer.symbol(",");
                 }
 
+                visualizeAttributesOf(item.attributes, nullptr);
+
                 switch (item.kind)
                 {
                 case AstExprTable::Item::Kind::List:
@@ -915,6 +977,18 @@ struct Printer
 
     void visualize(AstStat& program)
     {
+        // Luwu Destructuring (rfcs/destructuring.md): the first statement a destructuring declaration desugars to
+        // prints the whole declaration, so the rest print nothing but a trailing `;`.
+        if (const auto& local = program.as<AstStatLocal>(); local && local->destructuredFrom)
+        {
+            if (program.hasSemicolon)
+            {
+                advanceBefore(program.location.end, 1);
+                writer.symbol(";");
+            }
+            return;
+        }
+
         advance(program.location.begin);
 
         if (const auto& block = program.as<AstStatBlock>())
@@ -992,6 +1066,17 @@ struct Printer
         else if (const auto& a = program.as<AstStatLocal>())
         {
             const auto cstNode = lookupCstNode<CstStatLocal>(a);
+
+            if (a->attributes.size > 0)
+            {
+                visualizeAttributesOf(a->attributes, nullptr);
+
+                // The statement starts at its attributes, so the `local`/`const` keyword has to be
+                // advanced to rather than written where we happen to be.
+                if (a->keywordLocation.has_value())
+                    advance(a->keywordLocation->begin);
+            }
+
             if (FFlag::LuauExportValueSyntax && a->isExported)
             {
                 writer.keyword("export");
@@ -1010,17 +1095,24 @@ struct Printer
                 writer.keyword("local");
             }
 
-            CommaSeparatorInserter varComma(writer, cstNode ? cstNode->varsCommaPositions.begin() : nullptr);
-            for (size_t i = 0; i < a->vars.size; i++)
+            if (a->destructure)
             {
-                varComma();
-                if (cstNode)
+                visualizeDestructuring(*a->destructure);
+            }
+            else
+            {
+                CommaSeparatorInserter varComma(writer, cstNode ? cstNode->varsCommaPositions.begin() : nullptr);
+                for (size_t i = 0; i < a->vars.size; i++)
                 {
-                    LUAU_ASSERT(cstNode->varsAnnotationColonPositions.size > i);
-                    visualize(*a->vars.data[i], cstNode->varsAnnotationColonPositions.data[i]);
+                    varComma();
+                    if (cstNode)
+                    {
+                        LUAU_ASSERT(cstNode->varsAnnotationColonPositions.size > i);
+                        visualize(*a->vars.data[i], cstNode->varsAnnotationColonPositions.data[i]);
+                    }
+                    else
+                        visualize(*a->vars.data[i], Position{0, 0});
                 }
-                else
-                    visualize(*a->vars.data[i], Position{0, 0});
             }
 
             if (a->equalsSignLocation)
@@ -1114,6 +1206,8 @@ struct Printer
         else if (const auto& a = program.as<AstStatAssign>())
         {
             const auto cstNode = lookupCstNode<CstStatAssign>(a);
+
+            visualizeAttributesOf(a->attributes, nullptr);
 
             CommaSeparatorInserter varComma(writer, cstNode ? cstNode->varsCommaPositions.begin() : nullptr);
             for (const auto& var : a->vars)
@@ -1261,6 +1355,8 @@ struct Printer
             {
                 const auto* cstNode = lookupCstNode<CstStatTypeAlias>(a);
 
+                visualizeAttributesOf(a->attributes, nullptr);
+
                 if (a->exported)
                     writer.keyword("export");
 
@@ -1382,36 +1478,53 @@ struct Printer
             writer.advance(a->nameLocation.begin);
             writer.identifier(a->name.value);
 
-            writer.symbol(":");
-            visualizeTypeAnnotation(*a->type);
+            if (a->type)
+            {
+                writer.symbol(":");
+                visualizeTypeAnnotation(*a->type);
+            }
         }
-        else if (const auto& c = program.as<AstStatClass>(); c && FFlag::DebugLuauUserDefinedClasses)
+        else if (const auto& c = program.as<AstStatClass>(); c && FFlag::LuwuClasses)
         {
+            visualizeAttributesOf(c->attributes, nullptr);
+
+            if (c->exported)
+                writer.keyword("export");
+
+            // With attributes the statement starts at them rather than at `class`, so advance to the
+            // keyword instead of assuming we are already sitting on it.
+            writer.advance(c->keywordLocation.begin);
             writer.keyword("class");
             writer.advance(c->name->location.begin);
             writer.identifier(c->name->name.value);
 
-            // Luwu Classes (rfcs/classes.md): the primary constructor's parameter list has to be
+            if (writeTypes)
+                visualizeClassGenerics(*c);
+
+            // Luwu Classes (rfcs/classes): the primary constructor's parameter list has to be
             // reproduced even when it is empty -- `class Counter()` and `class Counter` differ, the
             // former having no default table constructor.
             if (const AstClassPrimaryConstructor* primaryConstructor = c->primaryConstructor)
             {
-                if (primaryConstructor->qualifierLocation)
-                {
-                    writer.advance(primaryConstructor->qualifierLocation->begin);
-                    writer.keyword(primaryConstructor->visibility == AstClassMemberVisibility::Private ? "private" : "public");
-                }
+                visualizeClassQualifiers(primaryConstructor->qualifierLocation, primaryConstructor->visibility, std::nullopt);
 
                 writer.advance(primaryConstructor->argLocation.begin);
                 writer.symbol("(");
 
                 CommaSeparatorInserter comma(writer);
 
+                // the parser builds both parallel to `args`
+                LUAU_ASSERT(primaryConstructor->argsDefaults.size == primaryConstructor->args.size);
+                LUAU_ASSERT(primaryConstructor->argsQualifiers.size == primaryConstructor->args.size);
+
                 for (size_t i = 0; i < primaryConstructor->args.size; ++i)
                 {
                     AstLocal* arg = primaryConstructor->args.data[i];
 
                     comma();
+
+                    const AstClassPrimaryConstructorParamQualifiers& qualifiers = primaryConstructor->argsQualifiers.data[i];
+                    visualizeQualifiersAndAttributes(arg->attributes, qualifiers.qualifierLocation, qualifiers.visibility, qualifiers.constLocation);
 
                     advance(arg->location.begin);
                     writer.identifier(arg->name.value);
@@ -1439,16 +1552,7 @@ struct Printer
                     overloaded{
                         [&](const AstClassProperty& prop)
                         {
-                            if (prop.qualifierLocation)
-                            {
-                                writer.advance(prop.qualifierLocation->begin);
-                                writer.keyword(prop.visibility == AstClassMemberVisibility::Private ? "private" : "public");
-                            }
-                            if (prop.constLocation)
-                            {
-                                writer.advance(prop.constLocation->begin);
-                                writer.keyword("const");
-                            }
+                            visualizeQualifiersAndAttributes(prop.attributes, prop.qualifierLocation, prop.visibility, prop.constLocation);
                             writer.advance(prop.nameLocation.begin);
                             writer.identifier(prop.name.value);
                             if (writeTypes && prop.ty)
@@ -1458,13 +1562,41 @@ struct Printer
                                 writer.symbol(":");
                                 visualizeTypeAnnotation(*prop.ty);
                             }
+                            if (prop.defaultValue)
+                            {
+                                if (prop.equalsLocation)
+                                    writer.advance(prop.equalsLocation->begin);
+                                else
+                                    writer.maybeSpace(prop.defaultValue->location.begin, 2);
+                                writer.symbol("=");
+                                visualize(*prop.defaultValue);
+                            }
                         },
                         [&](const AstClassMethod& method)
                         {
+                            // A method's attributes may be written on either side of the access
+                            // specifier, so emit them in the order the source had them -- `advance`
+                            // never moves backwards, and writing them in the wrong order would run
+                            // them into the keyword.
+                            auto visualizeMethodAttributes = [&]()
+                            {
+                                const CstExprFunction* cstNode = lookupCstNode<CstExprFunction>(method.function);
+                                visualizeAttributesOf(method.function->attributes, cstNode ? &cstNode->attrLists : nullptr);
+                            };
+
+                            const bool attributesPrecedeQualifier = method.function->attributes.size > 0 && method.qualifierLocation &&
+                                                                    method.function->attributes.data[0]->location.begin <
+                                                                        method.qualifierLocation->begin;
+
+                            if (!method.qualifierLocation || attributesPrecedeQualifier)
+                                visualizeMethodAttributes();
+
                             if (method.qualifierLocation)
                             {
-                                writer.advance(method.qualifierLocation->begin);
-                                writer.keyword(method.visibility == AstClassMemberVisibility::Private ? "private" : "public");
+                                visualizeClassQualifiers(method.qualifierLocation, method.visibility, std::nullopt);
+
+                                if (!attributesPrecedeQualifier)
+                                    visualizeMethodAttributes();
                             }
                             writer.advance(method.keywordLocation.begin);
                             writer.keyword("function");
@@ -1491,6 +1623,127 @@ struct Printer
             advanceBefore(program.location.end, 1);
             writer.symbol(";");
         }
+    }
+
+    // Luwu Classes (rfcs/classes): the access specifier and `const` modifier of a class member, a
+    // primary constructor parameter or the primary constructor itself, each written only if the source had it.
+    void visualizeClassQualifiers(
+        const std::optional<Location>& qualifierLocation,
+        AstClassMemberVisibility visibility,
+        const std::optional<Location>& constLocation
+    )
+    {
+        if (qualifierLocation)
+        {
+            writer.advance(qualifierLocation->begin);
+            writer.keyword(visibility == AstClassMemberVisibility::Private ? "private" : "public");
+        }
+
+        if (constLocation)
+        {
+            writer.advance(constLocation->begin);
+            writer.keyword("const");
+        }
+    }
+
+    // Luwu Classes (rfcs/classes): a field's or a primary constructor parameter's attributes, access
+    // specifier and `const` modifier. Attributes may be written on either side of the specifier, and
+    // `advance` never moves backwards, so everything is emitted in source order.
+    void visualizeQualifiersAndAttributes(
+        const AstArray<AstAttr*>& attributes,
+        const std::optional<Location>& qualifierLocation,
+        AstClassMemberVisibility visibility,
+        const std::optional<Location>& constLocation
+    )
+    {
+        size_t next = 0;
+
+        auto visualizeAttributesBefore = [&](std::optional<Position> end)
+        {
+            size_t first = next;
+            while (next < attributes.size && (!end || attributes.data[next]->location.begin < *end))
+                next++;
+
+            if (next == first)
+                return;
+
+            visualizeAttributesOf(AstArray<AstAttr*>{attributes.data + first, next - first}, nullptr);
+        };
+
+        if (qualifierLocation)
+        {
+            visualizeAttributesBefore(qualifierLocation->begin);
+            writer.advance(qualifierLocation->begin);
+            writer.keyword(visibility == AstClassMemberVisibility::Private ? "private" : "public");
+        }
+
+        if (constLocation)
+        {
+            visualizeAttributesBefore(constLocation->begin);
+            writer.advance(constLocation->begin);
+            writer.keyword("const");
+        }
+
+        visualizeAttributesBefore(std::nullopt);
+    }
+
+    // Luwu Classes (rfcs/classes): `class Box<T, U = string, V...>`. Classes carry no CST node of
+    // their own, so the brackets and commas are written where they fall; each generic still advances to
+    // its own location.
+    void visualizeClassGenerics(const AstStatClass& c)
+    {
+        if (c.generics.size == 0 && c.genericPacks.size == 0)
+            return;
+
+        writer.symbol("<");
+        CommaSeparatorInserter comma(writer);
+
+        for (AstGenericType* generic : c.generics)
+        {
+            comma();
+
+            writer.advance(generic->location.begin);
+            writer.identifier(generic->name.value);
+
+            if (generic->defaultValue)
+            {
+                const CstGenericType* cstNode = lookupCstNode<CstGenericType>(generic);
+                if (cstNode && cstNode->defaultEqualsPosition.hasValue())
+                    advance(cstNode->defaultEqualsPosition);
+                else
+                    writer.maybeSpace(generic->defaultValue->location.begin, 2);
+
+                writer.symbol("=");
+                visualizeTypeAnnotation(*generic->defaultValue);
+            }
+        }
+
+        for (AstGenericTypePack* genericPack : c.genericPacks)
+        {
+            comma();
+
+            const CstGenericTypePack* cstNode = lookupCstNode<CstGenericTypePack>(genericPack);
+
+            writer.advance(genericPack->location.begin);
+            writer.identifier(genericPack->name.value);
+            if (cstNode)
+                maybeAdvanceAndWrite(cstNode->ellipsisPosition, "...");
+            else
+                writer.symbol("...");
+
+            if (genericPack->defaultValue)
+            {
+                if (cstNode && cstNode->defaultEqualsPosition.hasValue())
+                    advance(cstNode->defaultEqualsPosition);
+                else
+                    writer.maybeSpace(genericPack->defaultValue->location.begin, 2);
+
+                writer.symbol("=");
+                visualizeTypePackAnnotation(*genericPack->defaultValue, false);
+            }
+        }
+
+        writer.symbol(">");
     }
 
     void visualizeFunctionBody(AstExprFunction& func)
@@ -1541,6 +1794,8 @@ struct Printer
             AstLocal* local = func.args.data[i];
 
             comma();
+
+            visualizeAttributesOf(local->attributes, nullptr);
 
             advance(local->location.begin);
             writer.identifier(local->name.value);
@@ -1693,6 +1948,11 @@ struct Printer
                 if (cstNode->hasAt)
                     writer.symbol("@");
                 writer.identifier(attribute.name.value);
+
+                // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): arguments written
+                // after a bare `@name`, which the parser reports but keeps.
+                for (AstExpr* arg : attribute.args)
+                    visualize(*arg);
             }
             else if (const CstParametrizedAttr* cstParamNode = lookupCstNode<CstParametrizedAttr>(&attribute))
             {
@@ -1724,14 +1984,40 @@ struct Printer
         }
     }
 
+    // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): prints the attributes of any
+    // position, under either setting of LuauCstAttr. `attrLists` is the position's own record of its `@[...]`
+    // lists, for a position that keeps one.
+    void visualizeAttributesOf(const AstArray<AstAttr*>& attributes, const AstArray<CstAttrList*>* attrLists)
+    {
+        if (FFlag::LuauCstAttr)
+            visualizeAttributes(attributes, attrLists);
+        else
+        {
+            for (const auto& attribute : attributes)
+                visualizeAttribute(*attribute);
+        }
+    }
+
     void visualizeAttributes(const AstArray<AstAttr*>& attributes, const AstArray<CstAttrList*>* attrLists)
     {
         LUAU_ASSERT(FFlag::LuauCstAttr);
 
+        // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): a position that keeps no list
+        // of its own finds each `@[...]` through the attribute that opens it. Without CST there are no lists to
+        // find, and every attribute prints with its own `@`.
         if (attrLists == nullptr)
         {
-            for (const auto& attribute : attributes)
-                visualizeAttribute(*attribute);
+            std::vector<CstAttrList*> openedLists;
+            for (AstAttr* attribute : attributes)
+            {
+                if (const CstAttr* cstAttr = lookupCstNode<CstAttr>(attribute); cstAttr && cstAttr->openedList)
+                    openedLists.push_back(cstAttr->openedList);
+                else if (const CstParametrizedAttr* cstParam = lookupCstNode<CstParametrizedAttr>(attribute); cstParam && cstParam->openedList)
+                    openedLists.push_back(cstParam->openedList);
+            }
+
+            AstArray<CstAttrList*> anchored{openedLists.data(), openedLists.size()};
+            visualizeAttributes(attributes, &anchored);
             return;
         }
 
@@ -1883,6 +2169,7 @@ struct Printer
                 if (cstNode->isArray)
                 {
                     LUAU_ASSERT(a->props.size == 0 && indexType && indexType->name == "number");
+                    visualizeAttributesOf(a->indexer->attributes, nullptr);
                     if (a->indexer->accessLocation)
                     {
                         LUAU_ASSERT(a->indexer->access != AstTableAccess::ReadWrite);
@@ -1901,6 +2188,8 @@ struct Printer
                         if (item.kind == CstTypeTable::Item::Kind::Indexer)
                         {
                             LUAU_ASSERT(a->indexer);
+
+                            visualizeAttributesOf(a->indexer->attributes, nullptr);
 
                             if (a->indexer->accessLocation)
                             {
@@ -1928,6 +2217,8 @@ struct Printer
                         }
                         else
                         {
+                            visualizeAttributesOf(prop->attributes, nullptr);
+
                             if (prop->accessLocation)
                             {
                                 LUAU_ASSERT(prop->access != AstTableAccess::ReadWrite);
@@ -1983,6 +2274,7 @@ struct Printer
                     for (size_t i = 0; i < a->props.size; ++i)
                     {
                         comma();
+                        visualizeAttributesOf(a->props.data[i].attributes, nullptr);
                         advance(a->props.data[i].location.begin);
                         writer.identifier(a->props.data[i].name.value);
                         if (a->props.data[i].type)
@@ -1994,6 +2286,7 @@ struct Printer
                     if (a->indexer)
                     {
                         comma();
+                        visualizeAttributesOf(a->indexer->attributes, nullptr);
                         writer.symbol("[");
                         visualizeTypeAnnotation(*a->indexer->indexType);
                         writer.symbol("]");

@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #pragma once
 
 #include "Luau/AssemblyBuilderA64.h"
@@ -104,6 +104,10 @@ inline bool lowerImpl(
 
     bool outputEnabled = options.includeAssembly || options.includeIr;
 
+    // Luwu codegen logging: upstream checks `logger` for null only here. Before each
+    // `logger->formatAppend` below it tests only the output flag. That relies on callers that pass a
+    // null logger (CodeGenContext) never asking for IR or assembly output. Luwu also checks `logger` at
+    // each of those appends, and uses `build.logAppend` when it is null.
     std::string emptyLog;
     IrToStringContext ctx{
         FFlag::LuauCodegenSharedLog ? (logger ? logger->text : emptyLog) : build.text,

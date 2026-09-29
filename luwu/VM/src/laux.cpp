@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 // This code is based on Lua 5.x implementation licensed under MIT License; see lua_LICENSE.txt for details
 #include "lualib.h"
 
@@ -290,7 +290,7 @@ const LUA_VECTOR_TYPE* luaL_optvector(lua_State* L, int narg, const LUA_VECTOR_T
 
 int luaL_getmetafield(lua_State* L, int obj, const char* event)
 {
-    // Luwu Classes (rfcs/classes.md): lua_getmetatable never exposes an object's metatable, but its
+    // Luwu Classes (rfcs/classes): lua_getmetatable never exposes an object's metatable, but its
     // metamethods still apply (`__tostring` through luaL_tolstring, for one), so read the field
     // straight out of it. The metamethods are static members of the class anyway, so this reveals
     // nothing new.

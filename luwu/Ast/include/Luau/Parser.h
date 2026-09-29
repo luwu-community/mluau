@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #pragma once
 
 #include "Luau/Ast.h"
@@ -151,7 +151,8 @@ private:
         Location loc,
         const char* attributeName,
         const TempVector<AstAttr*>& attributes,
-        const AstArray<AstExpr*>& args
+        const AstArray<AstExpr*>& args,
+        AstAttr::Context context
     );
 
     Location getAttributeStartLocation(
@@ -161,14 +162,37 @@ private:
     );
 
     // attrlist = '@[' parattr {',' parattr} ']'
-    void parseAttrList(TempVector<AstAttr*>& attributes, TempVector<CstAttrList*>* cstAttrLists);
+    void parseAttrList(TempVector<AstAttr*>& attributes, TempVector<CstAttrList*>* cstAttrLists, AstAttr::Context context);
+
+    // A bare `@name` cannot take arguments; `@[name ...]` is the form that does. When arguments
+    // follow one anyway this reports precisely and parses them, so the attribute still means what was
+    // intended and that is the only error. Returns false when nothing was misplaced.
+    bool parseMisplacedBareAttributeArgs(const char* name, AstAttr::Context context, AstArray<AstExpr*>& args, Location& argsLocation);
 
     // attribute ::= '@' NAME | attrlist
-    void parseAttribute_DEPRECATED(TempVector<AstAttr*>& attribute); // TODO: Clip with LuauCstAttr
-    void parseAttribute(TempVector<AstAttr*>& attribute);
+    void parseAttribute_DEPRECATED(TempVector<AstAttr*>& attribute, AstAttr::Context context); // TODO: Clip with LuauCstAttr
+    void parseAttribute(TempVector<AstAttr*>& attribute, AstAttr::Context context);
 
     // attributes ::= {attribute}
-    AstArray<AstAttr*> parseAttributes(TempVector<CstAttrList*>* cstAttrLists = nullptr);
+    // `context` is the syntactic position being parsed; an attribute that doesn't allow it is
+    // reported here, so callers never have to check which attributes they can accept.
+    AstArray<AstAttr*> parseAttributes(AstAttr::Context context, TempVector<CstAttrList*>* cstAttrLists = nullptr);
+
+    // Re-checks already-parsed attributes against the position they turned out to be on. Used where
+    // the position isn't known until after the attributes are consumed, i.e. statements.
+    void validateAttributeContexts(const AstArray<AstAttr*>& attributes, AstAttr::Context context);
+
+    // "Attribute '@x' can only be applied to ..." / "... cannot be applied to ...".
+    void reportAttributeNotAllowed(const Location& location, const char* attributeName, const char* allowedPositionsHint, AstAttr::Context context);
+
+    // Attribute arguments must be literals.
+    void reportNonLiteralAttributeArgs(const AstArray<AstExpr*>& args, const Location& argsLocation);
+
+    // `first` followed by `second`, for attributes written on both sides of an access specifier.
+    AstArray<AstAttr*> concatAttributes(const AstArray<AstAttr*>& first, const AstArray<AstAttr*>& second);
+
+    // True if an attribute begins at the current lexeme, i.e. a member/field/parameter is attributed.
+    bool attributesFollow() const;
 
     // attributes local function Name funcbody
     // attributes function funcname funcbody
@@ -180,31 +204,78 @@ private:
     // local namelist [`=' explist]
     AstStat* parseLocal(
         const Location start,
-        const Position keywordPosition,
+        const Location& keywordLocation,
         const AstArray<AstAttr*>& attributes,
         bool isConst,
         TempVector<CstAttrList*>* cstAttrLists = nullptr
+    );
+
+    // Luwu Destructuring (rfcs/destructuring.md):
+    // destructuring ::= (`local' | `const') [Name] `.' `{' fieldlist `}' [`:' Type] `=' exp
+    // fieldlist ::= field {`,' field} [`,']
+    // field ::= Name [`.' `{' fieldlist `}'] [`:' Type] | Name `as' target
+    // target ::= Name [`.' `{' fieldlist `}'] [`:' Type] | `.' `{' fieldlist `}' [`:' Type]
+    // An annotation follows the binding it types; after a pattern, it types the value the pattern destructures.
+    struct DestructureTarget;
+
+    bool destructuringFollows();
+    bool destructurePatternFollows();
+    AstStat* parseDestructuring(const Location& start, const Location& keywordLocation, bool isConst, std::optional<Name> name = {});
+    void parseDestructurePattern(DestructureTarget& target);
+    struct DestructureField;
+    DestructureField parseDestructureField();
+    void reportDestructureKeyError();
+    void skipDestructureField();
+    AstDestructurePattern desugarDestructuring(
+        const DestructureTarget& target,
+        AstExpr* value,
+        const Location& location,
+        const Location& equalsLocation,
+        bool isConst,
+        std::vector<AstStat*>& out
     );
 
     // return [explist]
     AstStat* parseReturn();
 
     // type Name `=' Type
-    AstStat* parseTypeAlias(const Location& start, bool exported, Position typeKeywordPosition, const Location& typeKeywordLocation);
+    AstStat* parseTypeAlias(
+        const Location& start,
+        bool exported,
+        Position typeKeywordPosition,
+        const Location& typeKeywordLocation,
+        const AstArray<AstAttr*>& attributes = {nullptr, 0}
+    );
 
-    AstStat* parseClassStat(const Location& start, bool exported, const Location& classKeywordLocation);
+    // `declared` parses the shape of a `declare class` (see AstStatDeclareClass) and returns the AstStatClass for it.
+    // Luwu Traits (rfcs/classes/traits.md): `isTrait` parses `trait Name ... end`, which is a class with trait members.
+    AstStat* parseClassStat(
+        const Location& start,
+        bool exported,
+        const Location& classKeywordLocation,
+        const AstArray<AstAttr*>& classAttributes = {nullptr, 0},
+        bool declared = false,
+        bool isTrait = false
+    );
+
+    // Luwu Traits (rfcs/classes/traits.md): the entries of an `implements` or `needs` list, after the keyword.
+    AstArray<AstClassTraitRef> parseClassTraitRefs(bool allowArgs, AstClassPrimaryConstructor* primaryConstructor);
 
     // True when the class body is looking at something that reads as a statement rather than a class
     // member, which means the class was never closed. See its definition.
     bool classBodyLooksLikeStatement();
 
-    // Luwu Classes (rfcs/classes.md): parse a class's primary constructor parameter list, e.g. the
+    // Luwu Classes (rfcs/classes): parse a class's primary constructor parameter list, e.g. the
     // `(name: string, age = 0)` of `class Cat(name: string, age = 0)`.
-    AstClassPrimaryConstructor* parseClassPrimaryConstructor(const std::optional<Location>& qualifierLocation, AstClassMemberVisibility visibility);
+    AstClassPrimaryConstructor* parseClassPrimaryConstructor(
+        const std::optional<Location>& qualifierLocation,
+        AstClassMemberVisibility visibility,
+        bool declared
+    );
 
-    // Brings a primary constructor's parameters into scope, returning the offset to pass to
-    // restoreLocals once the expression that needed them has been parsed.
-    unsigned int pushClassPrimaryConstructorParams(AstClassPrimaryConstructor* primaryConstructor);
+    // Brings a primary constructor's parameters into scope; the caller takes a saveLocals() offset
+    // first and passes it to restoreLocals once the expression that needed them has been parsed.
+    void pushClassPrimaryConstructorParams(AstClassPrimaryConstructor* primaryConstructor);
 
     // type function Name ... end
     AstStat* parseTypeFunction(const Location& start, bool exported, Position typeKeywordPosition);
@@ -215,14 +286,26 @@ private:
 
     // `declare global' Name: Type |
     // `declare function' Name`(' [parlist] `)' [`:` Type]
-    AstStat* parseDeclaration(const Location& start, const AstArray<AstAttr*>& attributes);
+    AstStat* parseDeclaration(const Location& start, const AstArray<AstAttr*>& attributes, std::optional<Location> exportKeywordLocation = std::nullopt);
+    bool declarationsAllowed() const;
+    void checkDuplicateDeclaration(const Name& name);
+    void checkTypeName(const Name& name, bool declared);
+    bool declaresClass();
+
+    // Luwu Traits (rfcs/classes/traits.md): whether `trait` declarations parse.
+    bool traitsEnabled() const;
+    bool legacyDeclareClass();
+    void skipClassOnlyExternTypeKeywords();
+    AstType* untypedDeclarationType(const Location& location);
+    Binding parseDeclaredClassBinding(std::optional<Location>& declaredDefaultLocation);
+    void checkDeclaredClassMethod(AstExprFunction* function);
 
     // varlist `=' explist
     AstStat* parseAssignment(AstExpr* initial);
 
     AstStat* parseExportValue(
         const Location& start,
-        const Position keywordPosition,
+        const Location& keywordLocation,
         const AstArray<AstAttr*>& attributes,
         TempVector<CstAttrList*>* cstAttrLists = nullptr
     );
@@ -248,14 +331,22 @@ private:
         // 'local'/'const' instead) pass a separate lexeme here rather than mutating `matchFunction`,
         // since `matchFunction.location` is also used as the real, unadjusted 'function' keyword
         // location for the resulting AstExprFunction and its CST node.
-        const Lexeme* endMatchLexeme = nullptr
+        const Lexeme* endMatchLexeme = nullptr,
+        // Luwu Classes (rfcs/classes): set for a class function, whose first parameter, when named
+        // `self`, is bound const.
+        bool isClassFunction = false,
+        // Luwu Declare Statements (rfcs/declare-statements.md): a declared class's method is a signature with no body
+        // and no `end`.
+        bool signatureOnly = false
     );
 
     // explist ::= {exp `,'} exp
     void parseExprList(TempVector<AstExpr*>& result, TempVector<Position>* commaPositions = nullptr);
 
     // binding ::= Name [`:` Type] [`=` Default]
-    Binding parseBinding(bool isConst = false, bool allowDefault = false);
+    // `allowAttributes` is set for parameter lists only; a `local` or `for` binding cannot carry
+    // attributes (an attribute on a local goes above the `local` keyword, on the statement).
+    Binding parseBinding(bool isConst = false, bool allowDefault = false, bool allowAttributes = false);
     AstArray<Position> extractAnnotationColonPositions(const TempVector<Binding>& bindings);
 
     // bindinglist ::= (binding | `...') {`,' bindinglist}
@@ -267,7 +358,8 @@ private:
         AstArray<Position>* commaPositions = nullptr,
         Position* initialCommaPosition = nullptr,
         Position* varargAnnotationColonPosition = nullptr,
-        bool isConst = false
+        bool isConst = false,
+        bool allowAttributes = false
     );
 
     AstType* parseOptionalType();
@@ -455,6 +547,8 @@ private:
 
     void incrementRecursionCounter(const char* context);
 
+    void checkTraitsDeclaredBeforeUse(AstStatBlock* chunk);
+
     void report(const Location& location, const char* format, va_list args);
     void report(const Location& location, const char* format, ...) LUAU_PRINTF_ATTR(3, 4);
 
@@ -531,21 +625,43 @@ private:
         Position colonPosition;
         bool isConst;
         AstExpr* defaultValue;
+        AstArray<AstAttr*> attributes;
 
         explicit Binding(
             const Name& name,
             AstType* annotation = nullptr,
             Position colonPosition = {0, 0},
             bool isConst = false,
-            AstExpr* defaultValue = nullptr
+            AstExpr* defaultValue = nullptr,
+            AstArray<AstAttr*> attributes = {nullptr, 0}
         )
             : name(name)
             , annotation(annotation)
             , colonPosition(colonPosition)
             , isConst(isConst)
             , defaultValue(defaultValue)
+            , attributes(attributes)
         {
         }
+    };
+
+    // Luwu Destructuring (rfcs/destructuring.md): a parsed `.{ ... }` pattern, see parseDestructuring.
+    struct DestructureTarget
+    {
+        // The local the value is bound to. Unnamed, the value goes to a hidden local.
+        std::optional<Name> name;
+        // Where the `.{ ... }` is, when the value is destructured further.
+        std::optional<Location> patternLocation;
+        // `: Type` after the binding, typing the local it binds.
+        AstType* annotation = nullptr;
+        bool closed = true;
+        std::vector<DestructureField> fields;
+    };
+    struct DestructureField
+    {
+        Name key;
+        std::optional<Location> asLocation;
+        DestructureTarget target;
     };
 
     ParseOptions options;
@@ -562,7 +678,10 @@ private:
 
     AstName nameSelf;
     AstName nameNumber;
+    AstName nameAny;
     AstName nameError;
+    // Luwu Destructuring (rfcs/destructuring.md): the hidden local an unnamed pattern binds its value to.
+    AstName nameDestructured;
     AstName nameNil;
 
     MatchLexeme endMismatchSuspect;
@@ -607,9 +726,46 @@ private:
     std::vector<Position> scratchPosition;
     std::vector<Position> scratchPosition2;
     std::vector<CstAttrList*> scratchCstAttrList;
+    std::vector<AstDestructureField> scratchDestructureField;
     std::string scratchData;
 
     CstNodeMap cstNodeMap;
+
+    // Luwu Destructuring (rfcs/destructuring.md): a destructuring declaration desugars to several
+    // statements. parseStat returns the first, and parseBlockNoScope appends these right after it.
+    std::vector<AstStat*> pendingStatements;
+
+    // Luwu Declare Statements (rfcs/declare-statements.md): whether the block being parsed may contain `declare`
+    // (the top level, or a `do` block there), and what the next block parseBlockNoScope starts should allow.
+    // fileDeclarations holds each global this file declares, so a second declaration of it is an error.
+    bool blockAllowsDeclarations = false;
+    bool nextBlockAllowsDeclarations = false;
+    DenseHashMap<AstName, Location> fileDeclarations{AstName()};
+    // The types this file declares, and the ones it defines (aliases, type functions, classes), for checkTypeName.
+    DenseHashMap<AstName, Location> fileTypeDeclarations{AstName()};
+    DenseHashMap<AstName, Location> fileTypeNames{AstName()};
+
+    // Set while parsing the parameters of a declared function or method, where `name = T` is a parameter of type T that
+    // may be left out: its type is `T?`. See DeclaredParameters.
+    bool parsingDeclaredParameters = false;
+    struct DeclaredParameters
+    {
+        explicit DeclaredParameters(Parser& parser);
+        ~DeclaredParameters();
+
+        Parser& parser;
+        bool outer;
+    };
+
+    // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): attributes a table entry parsed
+    // in front of `function`, which belong to the function expression parseSimpleExpr parses next rather than to
+    // the entry.
+    struct PendingFunctionAttributes
+    {
+        AstArray<AstAttr*> attributes;
+        TempVector<CstAttrList*>* cstAttrLists;
+    };
+    std::optional<PendingFunctionAttributes> pendingFunctionAttributes;
 };
 
 } // namespace Luau

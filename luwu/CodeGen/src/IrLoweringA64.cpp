@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "IrLoweringA64.h"
 
 #include "Luau/Bytecode.h"
@@ -299,22 +299,33 @@ static uint32_t getFloatBits(float value)
     return result;
 }
 
-// Luwu Classes (rfcs/classes.md): a64 counterpart of emitClassMemberAuthX64 -- authorize
-// private/const access to the member at `slotReg` on `classReg` (an object's lclass, or a class
-// object directly), or jump to `mismatch` (the interpreter fallback, which raises the error). A
-// member with no access bits is unrestricted; a private/const member takes the fast path only when
-// `classReg == currentClosure->l.p->ownerclass` (exactly luaR_closureownsprivateaccess); a const
-// write additionally requires the closure to be the class's __init (luaR_closureisinit). `slotReg`
-// holds the raw member offset and must stay live across this call.
+// Luwu Classes (rfcs/classes): the a64 counterpart of emitClassMemberAuthX64. Authorizes
+// private/const access to the member at `slotReg` on `classReg`, which is an object's lclass or a
+// class object. When access is not authorized, it jumps to `mismatch`, the interpreter fallback that
+// raises the error.
+//
+// - A member with no access bits is unrestricted.
+// - A private or const member passes only when `classReg == currentClosure->l.p->ownerclass`. This is
+//   exactly luaR_closureownsprivateaccess.
+// - A const write also requires the closure to be the class's `__init` (luaR_closureisinit), and the
+//   object being written to be the `self` in register 0 of its frame (luaR_checkconstassign).
+//   `writtenObject` is the object being written, or noreg for a read.
+//
+// `slotReg` holds the raw member offset and must stay live across this call.
+//
+// Every temporary is reserved before the first branch. The branch to `authorized` rejoins the main
+// line, so a register evicted after it would be stored only on the path that didn't take it.
 static void emitClassMemberAuthA64(
     AssemblyBuilderA64& build,
     IrRegAllocA64& regs,
     RegisterA64 classReg,
     RegisterA64 slotReg,
-    bool isWrite,
+    RegisterA64 writtenObject,
     Label& mismatch
 )
 {
+    bool isWrite = writtenObject != noreg;
+
     // See emitClassMemberAuthX64 for why a read also stops on LBC_CLASSMEMBER_INITBLOCKED.
     uint32_t restrictBits = isWrite ? (LBC_CLASSMEMBER_PRIVATE | LBC_CLASSMEMBER_CONST) : (LBC_CLASSMEMBER_PRIVATE | LBC_CLASSMEMBER_INITBLOCKED);
 
@@ -350,23 +361,32 @@ static void emitClassMemberAuthA64(
         build.tst(flagw, uint32_t(LBC_CLASSMEMBER_CONST));
         build.b(ConditionA64::Equal, authorized); // private but not const: authorized
 
-        RegisterA64 tempw = regs.allocTemp(KindA64::w);
+        // the flag and the mask are dead from here on, so they hold the index arithmetic
+        RegisterA64 tempw = maskw;
         build.ldrb(tempw, mem(owner, offsetof(LuauClass, hascustominit)));
         build.cbz(tempw, mismatch); // no custom __init -> const is never writable
 
         // require currentClosure == owner->staticmembers[initoffset - numberofinstancemembers]
-        RegisterA64 idxw = regs.allocTemp(KindA64::w);
+        RegisterA64 idxw = flagw;
         RegisterA64 idxx = castReg(KindA64::x, idxw);
         build.ldr(idxw, mem(owner, offsetof(LuauClass, initoffset)));
         build.ldr(tempw, mem(owner, offsetof(LuauClass, numberofinstancemembers)));
         build.sub(idxw, idxw, tempw);
 
-        RegisterA64 initcl = regs.allocTemp(KindA64::x);
-        build.ldr(initcl, mem(owner, offsetof(LuauClass, staticmembers)));
-        build.add(initcl, initcl, idxx, kTValueSizeLog2);
-        build.ldr(initcl, mem(initcl, offsetof(TValue, value.gc)));
-        build.cmp(initcl, rClosure);
+        // owner is not read again, so it walks to the `__init` closure itself
+        build.ldr(owner, mem(owner, offsetof(LuauClass, staticmembers)));
+        build.add(owner, owner, idxx, kTValueSizeLog2);
+        build.ldr(owner, mem(owner, offsetof(TValue, value.gc)));
+        build.cmp(owner, rClosure);
         build.b(ConditionA64::NotEqual, mismatch); // const write from a non-__init method
+
+        // require R0 (the `self` __init is constructing) to be the object being written
+        build.ldr(tempw, mem(rBase, offsetof(TValue, tt)));
+        build.cmp(tempw, uint16_t(LUA_TOBJECT));
+        build.b(ConditionA64::NotEqual, mismatch);
+        build.ldr(owner, mem(rBase, offsetof(TValue, value.gc)));
+        build.cmp(owner, writtenObject);
+        build.b(ConditionA64::NotEqual, mismatch); // const write to an object other than __init's own `self`
     }
 
     build.setLabel(authorized);
@@ -1918,9 +1938,9 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
     }
     case IrCmd::CLASS_ISINSTANCE:
     {
-        // result = (tag == object) && (value->lclass == class); the deref is guarded by the tag check
-        // constant propagation can replace the tag with a known constant (e.g. after CHECKSELFCLASS
-        // has already established that the value is an object), in which case the guard folds away
+        // result = (tag == object) && (value->lclass == class). The deref is guarded by the tag check.
+        // Constant propagation can replace the tag with a known constant (e.g. after CHECKSELFCLASS
+        // has established that the value is an object), and then the guard folds away.
         CODEGEN_ASSERT(OP_A(inst).kind == IrOpKind::Inst || OP_A(inst).kind == IrOpKind::Constant);
         bool knownTag = OP_A(inst).kind == IrOpKind::Constant;
 
@@ -1931,6 +1951,8 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         if (knownTag && tagOp(OP_A(inst)) != LUA_TOBJECT)
             break;
 
+        // reserved before the tag branch, which skips to `done` on the main line
+        RegisterA64 temp = regs.allocTemp(KindA64::x);
         Label done;
 
         if (!knownTag)
@@ -1939,7 +1961,6 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
             build.b(ConditionA64::NotEqual, done);
         }
 
-        RegisterA64 temp = regs.allocTemp(KindA64::x);
         build.ldr(temp, mem(regOp(OP_B(inst)), offsetof(LuauObject, lclass)));
         build.cmp(temp, regOp(OP_C(inst)));
         build.cset(inst.regA64, ConditionA64::Equal);
@@ -2820,6 +2841,7 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         RegisterA64 lclass = regs.allocTemp(KindA64::x);
         RegisterA64 tempw = regs.allocTemp(KindA64::w);
         RegisterA64 tempx = castReg(KindA64::x, tempw);
+        RegisterA64 key = regs.allocTemp(KindA64::x);
 
         // slotw = live cached member slot from the current bytecode instruction (patched by the interpreter or the native fallbacks)
         if (uintOp(OP_B(inst)) <= AddressA64::kMaxOffset)
@@ -2834,21 +2856,21 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
 
         build.ldr(lclass, mem(regOp(OP_A(inst)), offsetof(LuauObject, lclass)));
 
-        // bounds check: slot must be a valid instance member offset
+        // bounds check: slot must be a valid instance member offset; a static member read through an object
+        // (`obj.method`, not a call) deliberately misses into the fallback, keeping field reads to one check
         build.ldr(tempw, mem(lclass, offsetof(LuauClass, numberofinstancemembers)));
         build.cmp(slotw, tempw);
         build.b(ConditionA64::CarrySet, mismatch);
 
-        // authorize private/const access (or bail) instead of unconditionally bailing on any
-        // private/const member (see emitClassMemberAuthA64)
-        emitClassMemberAuthA64(build, regs, lclass, slotx, HAS_OP_E(inst) && uintOp(OP_E(inst)) != 0, mismatch);
+        // authorize private/const access (or bail), see emitClassMemberAuthA64
+        bool isWrite = HAS_OP_E(inst) && uintOp(OP_E(inst)) != 0;
+        emitClassMemberAuthA64(build, regs, lclass, slotx, isWrite ? regOp(OP_A(inst)) : noreg, mismatch);
 
         // key check: offsettomember[slot] must name the expected member
         build.ldr(tempx, mem(lclass, offsetof(LuauClass, offsettomember)));
         build.add(tempx, tempx, slotx, 3); // pointer-sized elements: 1 << 3 == 8
         build.ldr(tempx, mem(tempx, 0));
 
-        RegisterA64 key = regs.allocTemp(KindA64::x);
         build.ldr(key, tempAddr(OP_C(inst), offsetof(TValue, value)));
         build.cmp(tempx, key);
         build.b(ConditionA64::NotEqual, mismatch);
@@ -2888,25 +2910,17 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
     {
         // See the X64 lowering.
         Label fresh;
-        Label& fail = getTargetLabel(OP_C(inst), index, fresh);
+        Label& fail = getTargetLabel(OP_B(inst), index, fresh);
         RegisterA64 classReg = regOp(OP_A(inst));
         RegisterA64 tempw = regs.allocTemp(KindA64::w);
         RegisterA64 tempx = regs.allocTemp(KindA64::x);
 
-        build.ldr(tempw, mem(classReg, offsetof(LuauClass, numberofinstancemembers)));
-        build.cmp(tempw, uint16_t(uintOp(OP_B(inst))));
-        build.b(ConditionA64::NotEqual, fail);
         build.ldr(tempx, mem(classReg, offsetof(LuauClass, memberdefaults)));
         build.cbnz(tempx, fail);
-        build.ldrb(tempw, mem(classReg, offsetof(LuauClass, haspoddefaultsfn)));
-        build.cbnz(tempw, fail);
 
         Label constructible;
         build.ldrb(tempw, mem(classReg, offsetof(LuauClass, hascustominit)));
         build.cbz(tempw, constructible);
-
-        build.ldrb(tempw, mem(classReg, offsetof(LuauClass, hasprimaryinit)));
-        build.cbz(tempw, fail);
 
         build.ldr(tempx, mem(classReg, offsetof(LuauClass, memberflags)));
         build.ldr(tempw, mem(classReg, offsetof(LuauClass, initoffset)));
@@ -2921,7 +2935,7 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         build.b(ConditionA64::NotEqual, fail);
 
         build.setLabel(constructible);
-        finalizeTargetLabel(OP_C(inst), index, fresh);
+        finalizeTargetLabel(OP_B(inst), index, fresh);
         break;
     }
     case IrCmd::NEW_OBJECT:
@@ -2946,6 +2960,7 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         RegisterA64 slotx = castReg(KindA64::x, slotw);
         RegisterA64 tempw = regs.allocTemp(KindA64::w);
         RegisterA64 tempx = castReg(KindA64::x, tempw);
+        RegisterA64 key = regs.allocTemp(KindA64::x);
 
         // slotw = live cached member slot from the current bytecode instruction (patched by the interpreter or the native fallbacks)
         if (uintOp(OP_B(inst)) <= AddressA64::kMaxOffset)
@@ -2967,14 +2982,13 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         build.b(ConditionA64::CarrySet, mismatch);
 
         // authorize private static-member access (or bail); static access is read-only (isWrite = false)
-        emitClassMemberAuthA64(build, regs, regOp(OP_A(inst)), slotx, /* isWrite */ false, mismatch);
+        emitClassMemberAuthA64(build, regs, regOp(OP_A(inst)), slotx, /* writtenObject */ noreg, mismatch);
 
         // key check: offsettomember[slot] must name the expected member
         build.ldr(tempx, mem(regOp(OP_A(inst)), offsetof(LuauClass, offsettomember)));
         build.add(tempx, tempx, slotx, 3); // pointer-sized elements: 1 << 3 == 8
         build.ldr(tempx, mem(tempx, 0));
 
-        RegisterA64 key = regs.allocTemp(KindA64::x);
         build.ldr(key, tempAddr(OP_C(inst), offsetof(TValue, value)));
         build.cmp(tempx, key);
         build.b(ConditionA64::NotEqual, mismatch);
@@ -3001,6 +3015,8 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         RegisterA64 lclass = regs.allocTemp(KindA64::x);
         RegisterA64 tempw = regs.allocTemp(KindA64::w);
         RegisterA64 tempx = castReg(KindA64::x, tempw);
+        RegisterA64 key = regs.allocTemp(KindA64::x);
+        RegisterA64 ninstance = regs.allocTemp(KindA64::w);
 
         if (uintOp(OP_B(inst)) <= AddressA64::kMaxOffset)
             build.ldr(tempw, mem(rCode, uintOp(OP_B(inst)) * sizeof(Instruction)));
@@ -3020,21 +3036,19 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         build.b(ConditionA64::CarrySet, mismatch);
 
         // authorize private method access (or bail); method resolution is a read (isWrite = false)
-        emitClassMemberAuthA64(build, regs, lclass, slotx, /* isWrite */ false, mismatch);
+        emitClassMemberAuthA64(build, regs, lclass, slotx, /* writtenObject */ noreg, mismatch);
 
         // key check: offsettomember[slot] must name the expected member
         build.ldr(tempx, mem(lclass, offsetof(LuauClass, offsettomember)));
         build.add(tempx, tempx, slotx, 3); // pointer-sized elements: 1 << 3 == 8
         build.ldr(tempx, mem(tempx, 0));
 
-        RegisterA64 key = regs.allocTemp(KindA64::x);
         build.ldr(key, tempAddr(OP_C(inst), offsetof(TValue, value)));
         build.cmp(tempx, key);
         build.b(ConditionA64::NotEqual, mismatch);
 
         Label isStatic;
         Label done;
-        RegisterA64 ninstance = regs.allocTemp(KindA64::w);
         build.ldr(ninstance, mem(lclass, offsetof(LuauClass, numberofinstancemembers)));
         build.cmp(slotw, ninstance);
         build.b(ConditionA64::CarrySet, isStatic);
@@ -3559,9 +3573,17 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         emitFallback(build, offsetof(NativeContext, executeDUPCLOSURE), uintOp(OP_A(inst)));
         break;
     case IrCmd::FALLBACK_NEWOBJECT:
+        CODEGEN_ASSERT(OP_B(inst).kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(OP_C(inst).kind == IrOpKind::VmReg);
+
+        regs.spill(index);
         emitFallback(build, offsetof(NativeContext, executeNEWOBJECT), uintOp(OP_A(inst)));
         break;
     case IrCmd::FALLBACK_NEWCLASSMEMBER:
+        CODEGEN_ASSERT(OP_B(inst).kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(OP_C(inst).kind == IrOpKind::VmReg);
+
+        regs.spill(index);
         emitFallback(build, offsetof(NativeContext, executeNEWCLASSMEMBER), uintOp(OP_A(inst)));
         break;
     case IrCmd::FALLBACK_FORGPREP:
@@ -3944,10 +3966,19 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
     }
     case IrCmd::GET_TYPE:
     {
+        // Luwu Traits (rfcs/classes/traits.md): a class value whose class is a trait has the type "trait", which its tag can't tell
+        bool mayBeTrait = HAS_OP_B(inst) && OP_B(inst).kind == IrOpKind::VmReg &&
+                          (OP_A(inst).kind == IrOpKind::Inst || tagOp(OP_A(inst)) == LUA_TCLASS);
+
+        // compared before the result register is written, so the tag is intact whichever register the allocator picks
+        if (mayBeTrait && OP_A(inst).kind == IrOpKind::Inst)
+            build.cmp(regOp(OP_A(inst)), uint16_t(LUA_TCLASS));
+
         inst.regA64 = regs.allocReg(KindA64::x, index);
 
         CODEGEN_ASSERT(sizeof(TString*) == 8);
 
+        // neither instruction below touches the flags
         if (OP_A(inst).kind == IrOpKind::Inst)
             build.add(inst.regA64, rGlobalState, regOp(OP_A(inst)), 3); // implicit uxtw
         else if (OP_A(inst).kind == IrOpKind::Constant)
@@ -3956,6 +3987,23 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
             CODEGEN_ASSERT(!"Unsupported instruction form");
 
         build.ldr(inst.regA64, mem(inst.regA64, offsetof(global_State, ttypename)));
+
+        if (mayBeTrait)
+        {
+            Label notTrait;
+
+            if (OP_A(inst).kind == IrOpKind::Inst)
+                build.b(ConditionA64::NotEqual, notTrait);
+
+            RegisterA64 temp = regs.allocTemp(KindA64::x);
+            build.ldr(temp, mem(rBase, vmRegOp(OP_B(inst)) * sizeof(TValue) + offsetof(TValue, value)));
+            build.ldrb(castReg(KindA64::w, temp), mem(temp, offsetof(LuauClass, istrait)));
+            build.cbz(castReg(KindA64::w, temp), notTrait);
+
+            build.ldr(inst.regA64, mem(rGlobalState, offsetof(global_State, traittypename)));
+
+            build.setLabel(notTrait);
+        }
         break;
     }
     case IrCmd::GET_TYPEOF:

@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 // This code is based on Lua 5.x implementation licensed under MIT License; see lua_LICENSE.txt for details
 #include "ldebug.h"
 
@@ -315,7 +315,7 @@ l_noret luaG_indexerror(lua_State* L, const TValue* p1, const TValue* p2)
         luaG_runerror(L, "attempt to index %s with %s", t1, t2);
 }
 
-// Luwu Classes (rfcs/classes.md): a name the value does not have. The RFC's glossary splits the two
+// Luwu Classes (rfcs/classes): a name the value does not have. The RFC's glossary splits the two
 // halves of this: objects carry *fields*, while a class's namespace holds *members* -- its static
 // functions plus the field names its objects are laid out with. Neither is a table, so neither has
 // "keys". A class also gets pointed at the object case, because reaching for a field through the
@@ -326,6 +326,10 @@ l_noret luaG_missingmembererror(lua_State* L, const TValue* p1, const TValue* p2
         luaG_runerrorL(L, "cannot index %s with a %s", luaT_objtypename(L, p1), luaT_objtypename(L, p2));
 
     const char* key = getstr(tsvalue(p2));
+
+    // Luwu Traits (rfcs/classes/traits.md): a trait has no objects of its own to point at
+    if (ttisclass(p1) && classvalue(p1)->istrait)
+        luaG_runerrorL(L, "trait '%s' does not have a member named '%s'", getstr(classvalue(p1)->name), key);
 
     if (ttisclass(p1))
         luaG_runerrorL(
@@ -341,12 +345,21 @@ l_noret luaG_missingmembererror(lua_State* L, const TValue* p1, const TValue* p2
     luaG_runerrorL(L, "this %s does not have a field named '%s'", luaT_objtypename(L, p1), key);
 }
 
-// Luwu Classes (rfcs/classes.md): `Cat.age` where `age` is one of Cat's *fields*. The class knows the
+// Luwu Classes (rfcs/classes): `Cat.age` where `age` is one of Cat's *fields*. The class knows the
 // name perfectly well -- it lays its objects out with it -- so this deserves better than being told
 // the class has never heard of it.
 l_noret luaG_instancefieldonclasserror(lua_State* L, const TValue* p1, const TValue* p2)
 {
     const char* className = getstr(classvalue(p1)->name);
+
+    // Luwu Traits (rfcs/classes/traits.md): a trait's fields only exist in the objects of implementing classes
+    if (classvalue(p1)->istrait)
+        luaG_runerrorL(
+            L,
+            "cannot read field '%s' of trait '%s': a trait's fields only exist in objects of the classes that implement it",
+            getstr(tsvalue(p2)),
+            className
+        );
 
     luaG_runerrorL(
         L,
@@ -381,13 +394,40 @@ l_noret luaG_constassignerror(lua_State* L, const TValue* p2, const TString* cla
     luaG_runerrorL(L, "'%s' is a const member of '%s' and cannot be assigned outside %s's '__init' constructor", getstr(tsvalue(p2)), t1, t1);
 }
 
+l_noret luaG_constassignnotselferror(lua_State* L, const TValue* p2, const TString* className)
+{
+    const char* t1 = getstr(className);
+    luaG_runerrorL(
+        L, "'%s' is a const member of '%s'; %s's '__init' can only assign it on the object it is constructing", getstr(tsvalue(p2)), t1, t1
+    );
+}
+
 l_noret luaG_blockedinitaccesserror(lua_State* L, const TString* className)
 {
     const char* t1 = getstr(className);
-    luaG_runerrorL(L, "'__init' of '%s' cannot be accessed or called explicitly because %s has const fields", t1, t1);
+    luaG_runerrorL(L, "'__init' of '%s' cannot be accessed or called explicitly; construct a new object with %s(...) instead", t1, t1);
 }
 
-// Luwu Classes (rfcs/classes.md): raised by CHECKSELFCLASS when `self` isn't an object of the method's class.
+static void pusherrorat(lua_State* L, CallInfo* ci, const char* msg);
+
+// Luwu Classes (rfcs/classes): raised by construction, which may be running in the class's C
+// constructor (`pcall(C)`), so the location is the Lua code constructing rather than the running frame.
+l_noret luaG_privateconstructorerror(lua_State* L, const TString* className)
+{
+    const char* t1 = getstr(className);
+    char result[LUA_BUFFERSIZE];
+    snprintf(result, sizeof(result), "the constructor of '%s' is private; '%s' can only be constructed inside %s's class scope", t1, t1, t1);
+
+    CallInfo* ci = L->ci;
+    while (ci > L->base_ci && !isLua(ci))
+        ci--;
+
+    lua_rawcheckstack(L, 1);
+    pusherrorat(L, ci, result);
+    luaD_throw(L, LUA_ERRRUN);
+}
+
+// Luwu Classes (rfcs/classes): raised by CHECKSELFCLASS when `self` isn't an object of the method's class.
 // `selfCall` is true when the check was emitted at an O2 inline site for a `:` call, and only changes the message.
 //
 // An inline site fails when the receiver's annotation names the wrong class, e.g. a VecDeque passed to
@@ -396,10 +436,7 @@ l_noret luaG_blockedinitaccesserror(lua_State* L, const TString* className)
 // user their call site or annotation is wrong and isn't getting the O2 optimization they asked for.
 l_noret luaG_selfclasserror(lua_State* L, const TValue* self, const LuauClass* expected, const TString* methodName, bool selfCall)
 {
-    // `expected` is NULL only if malformed bytecode put a LBC_SELFCLASS_OWNER-form CHECKSELFCLASS in
-    // a proto that is not a class method, so its Proto::ownerclass was never stamped. The check then
-    // fails (nothing compares equal to NULL) and lands here; name it rather than dereferencing NULL.
-    const char* expectedName = expected ? getstr(expected->name) : "?";
+    const char* expectedName = getstr(expected->name);
     const char* method = getstr(methodName);
 
     if (!ttisobject(self))
@@ -428,9 +465,8 @@ l_noret luaG_selfclasserror(lua_State* L, const TValue* self, const LuauClass* e
     luaG_runerrorL(L, "attempt to call method '%s.%s' with 'self' of class '%s'", expectedName, method, actualName);
 }
 
-static void pusherror(lua_State* L, const char* msg)
+static void pusherrorat(lua_State* L, CallInfo* ci, const char* msg)
 {
-    CallInfo* ci = L->ci;
     if (isLua(ci))
     {
         TString* source = getluaproto(ci)->source;
@@ -443,6 +479,11 @@ static void pusherror(lua_State* L, const char* msg)
     {
         lua_pushstring(L, msg);
     }
+}
+
+static void pusherror(lua_State* L, const char* msg)
+{
+    pusherrorat(L, L->ci, msg);
 }
 
 l_noret luaG_runerrorL(lua_State* L, const char* fmt, ...)

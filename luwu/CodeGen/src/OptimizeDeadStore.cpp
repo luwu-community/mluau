@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/OptimizeDeadStore.h"
 
 #include "Luau/IrBuilder.h"
@@ -53,6 +53,7 @@ static bool isUnsafeToSink(IrCmd cmd)
 
     // Reads VM register: STORE_TAG/STORE_TVALUE/etc. to the same VM register
     case IrCmd::GET_TYPEOF:
+    case IrCmd::GET_TYPE:
 
     // Mutates table array part, invalidating reads
     case IrCmd::TABLE_SETNUM:
@@ -1218,7 +1219,7 @@ static void markDeadStoresInInst(RemoveDeadStoreState& state, IrBuilder& build, 
         break;
     case IrCmd::CHECK_CLASS_FIELDS_CONSTRUCTIBLE:
         // This instruction has several jumps to the exit in the lowering and that prevents exit sync record from being generated
-        state.checkLiveIns(OP_C(inst), index, false);
+        state.checkLiveIns(OP_B(inst), index, false);
         break;
     case IrCmd::CHECK_BUFFER_LEN:
         state.checkLiveIns(OP_F(inst), index, true);

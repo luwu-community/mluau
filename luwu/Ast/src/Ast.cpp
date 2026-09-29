@@ -1,4 +1,4 @@
-// This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/Ast.h"
 
 #include "Luau/Common.h"
@@ -22,6 +22,14 @@ static AstAttr* findAttributeInArray(const AstArray<AstAttr*> attributes, AstAtt
 static bool hasAttributeInArray(const AstArray<AstAttr*> attributes, AstAttr::Type attributeType)
 {
     return findAttributeInArray(attributes, attributeType) != nullptr;
+}
+
+std::optional<AstAttr::DeprecatedInfo> findDeprecatedInfo(const AstArray<AstAttr*>& attributes)
+{
+    if (const AstAttr* attr = findAttributeInArray(attributes, AstAttr::Type::Deprecated))
+        return attr->deprecatedInfo();
+
+    return std::nullopt;
 }
 
 static void visitTypeList(AstVisitor* visitor, const AstTypeList& list)
@@ -61,7 +69,22 @@ AstAttr::AstAttr(const Location& location, Type type, AstArray<AstExpr*> args, A
 
 void AstAttr::visit(AstVisitor* visitor)
 {
-    visitor->visit(this);
+    // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): upstream visits only the attribute
+    // itself. Its arguments are visited too, for a visitor that opts in to attributes (see AstVisitor).
+    if (visitor->visit(this))
+    {
+        for (AstExpr* arg : args)
+            arg->visit(visitor);
+    }
+}
+
+// Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): upstream never visits a node's
+// attributes. Luwu does, and AstVisitor::visit(AstAttr*) returns false unless a visitor opts in, so only the
+// visitors that look for what is at a position see them.
+static void visitAttributes(const AstArray<AstAttr*>& attributes, AstVisitor* visitor)
+{
+    for (AstAttr* attr : attributes)
+        attr->visit(visitor);
 }
 
 AstAttr::DeprecatedInfo AstAttr::deprecatedInfo() const
@@ -334,12 +357,23 @@ AstExprFunction::AstExprFunction(
     , debugname(debugname)
     , argLocation(argLocation)
 {
+    // Luwu Function Default Arguments (rfcs/function-default-arguments.md): upstream Luau has no default arguments.
+    for (AstExpr* argDefault : argsDefaults)
+    {
+        if (argDefault)
+            luwuOnly = true;
+    }
 }
 
 void AstExprFunction::visit(AstVisitor* visitor)
 {
     if (visitor->visit(this))
     {
+        visitAttributes(attributes, visitor);
+
+        for (AstLocal* arg : args)
+            visitAttributes(arg->attributes, visitor);
+
         for (AstLocal* arg : args)
         {
             if (arg->annotation)
@@ -397,6 +431,8 @@ void AstExprTable::visit(AstVisitor* visitor)
     {
         for (const Item& item : items)
         {
+            visitAttributes(item.attributes, visitor);
+
             if (item.key)
                 item.key->visit(visitor);
 
@@ -770,6 +806,8 @@ void AstStatLocal::visit(AstVisitor* visitor)
 {
     if (visitor->visit(this))
     {
+        visitAttributes(attributes, visitor);
+
         for (AstLocal* var : vars)
         {
             if (var->annotation)
@@ -872,6 +910,8 @@ void AstStatAssign::visit(AstVisitor* visitor)
 {
     if (visitor->visit(this))
     {
+        visitAttributes(attributes, visitor);
+
         for (AstExpr* lvalue : vars)
             lvalue->visit(visitor);
 
@@ -964,6 +1004,8 @@ void AstStatTypeAlias::visit(AstVisitor* visitor)
 {
     if (visitor->visit(this))
     {
+        visitAttributes(attributes, visitor);
+
         for (AstGenericType* el : generics)
         {
             el->visit(visitor);
@@ -1018,7 +1060,7 @@ AstStatDeclareGlobal::AstStatDeclareGlobal(
 
 void AstStatDeclareGlobal::visit(AstVisitor* visitor)
 {
-    if (visitor->visit(this))
+    if (visitor->visit(this) && type)
         type->visit(visitor);
 }
 
@@ -1071,18 +1113,32 @@ AstStatClass::AstStatClass(
     , primaryConstructor(primaryConstructor)
     , keywordLocation(keywordLocation)
 {
-    LUAU_ASSERT(FFlag::DebugLuauUserDefinedClasses);
+    LUAU_ASSERT(FFlag::LuwuClasses);
+
+    // Luwu Classes (rfcs/classes): upstream Luau is designing its own class syntax, and we don't know what
+    // it will settle on, so every class declaration counts as Luwu-only.
+    luwuOnly = true;
 }
 
 void AstStatClass::visit(AstVisitor* visitor)
 {
-    LUAU_ASSERT(FFlag::DebugLuauUserDefinedClasses);
+    LUAU_ASSERT(FFlag::LuwuClasses);
     if (visitor->visit(this))
     {
+        visitAttributes(attributes, visitor);
+
+        for (AstGenericType* generic : generics)
+            generic->visit(visitor);
+
+        for (AstGenericTypePack* genericPack : genericPacks)
+            genericPack->visit(visitor);
+
         if (primaryConstructor)
         {
             for (AstLocal* arg : primaryConstructor->args)
             {
+                visitAttributes(arg->attributes, visitor);
+
                 if (arg->annotation)
                     arg->annotation->visit(visitor);
             }
@@ -1094,12 +1150,36 @@ void AstStatClass::visit(AstVisitor* visitor)
             }
         }
 
+        auto visitTraitRefs = [&](const AstArray<AstClassTraitRef>& refs)
+        {
+            for (const AstClassTraitRef& ref : refs)
+            {
+                ref.trait->visit(visitor);
+
+                for (const AstTypeOrPack& param : ref.typeArguments)
+                {
+                    if (param.type)
+                        param.type->visit(visitor);
+                    else if (param.typePack)
+                        param.typePack->visit(visitor);
+                }
+
+                for (AstExpr* arg : ref.args)
+                    arg->visit(visitor);
+            }
+        };
+
+        visitTraitRefs(needs);
+        visitTraitRefs(implements);
+
         for (const auto& member : members)
         {
             Luau::visit(
                 overloaded{
                     [&](const AstClassProperty& prop)
                     {
+                        visitAttributes(prop.attributes, visitor);
+
                         if (prop.ty)
                             prop.ty->visit(visitor);
                         if (prop.defaultValue)
@@ -1174,6 +1254,8 @@ void AstStatDeclareFunction::visit(AstVisitor* visitor)
 {
     if (visitor->visit(this))
     {
+        visitAttributes(attributes, visitor);
+
         visitTypeList(visitor, params);
         retTypes->visit(visitor);
     }
@@ -1223,6 +1305,19 @@ AstStatDeclareExternType::AstStatDeclareExternType(
     , classLocation(classLocation)
     , extendsLocation(extendsLocation)
 {
+    // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): upstream Luau parses no generic parameters on an
+    // extern type or on its methods.
+    // A method isn't a node of its own, so a generic method marks the whole declaration.
+    if (generics.size > 0 || genericPacks.size > 0)
+        luwuOnly = true;
+
+    for (const AstDeclaredExternTypeProperty& prop : props)
+    {
+        const AstTypeFunction* method = prop.isMethod ? prop.ty->as<AstTypeFunction>() : nullptr;
+        bool isGenericMethod = method && (method->generics.size > 0 || method->genericPacks.size > 0);
+        if (isGenericMethod)
+            luwuOnly = true;
+    }
 }
 
 void AstStatDeclareExternType::visit(AstVisitor* visitor)
@@ -1231,6 +1326,67 @@ void AstStatDeclareExternType::visit(AstVisitor* visitor)
     {
         for (const AstDeclaredExternTypeProperty& prop : props)
             prop.ty->visit(visitor);
+    }
+}
+
+AstStatDeclareClass::AstStatDeclareClass(const Location& location, AstStatClass* shape, const Location& declareLocation)
+    : AstStat(ClassIndex(), location)
+    , shape(shape)
+    , declareLocation(declareLocation)
+{
+    luwuOnly = true;
+}
+
+// Only the declared class's type annotations: its functions have no bodies, and its name is not a local.
+void AstStatDeclareClass::visit(AstVisitor* visitor)
+{
+    if (!visitor->visit(this))
+        return;
+
+    for (AstGenericType* generic : shape->generics)
+        generic->visit(visitor);
+
+    for (AstGenericTypePack* genericPack : shape->genericPacks)
+        genericPack->visit(visitor);
+
+    if (shape->primaryConstructor)
+    {
+        for (AstLocal* arg : shape->primaryConstructor->args)
+        {
+            if (arg->annotation)
+                arg->annotation->visit(visitor);
+        }
+    }
+
+    for (const AstClassMember& member : shape->members)
+    {
+        if (const AstClassProperty* prop = member.get_if<AstClassProperty>())
+        {
+            if (prop->ty)
+                prop->ty->visit(visitor);
+        }
+        else if (const AstClassMethod* method = member.get_if<AstClassMethod>())
+        {
+            AstExprFunction* function = method->function;
+
+            for (AstGenericType* generic : function->generics)
+                generic->visit(visitor);
+
+            for (AstGenericTypePack* genericPack : function->genericPacks)
+                genericPack->visit(visitor);
+
+            for (AstLocal* arg : function->args)
+            {
+                if (arg->annotation)
+                    arg->annotation->visit(visitor);
+            }
+
+            if (function->varargAnnotation)
+                function->varargAnnotation->visit(visitor);
+
+            if (function->returnAnnotation)
+                function->returnAnnotation->visit(visitor);
+        }
     }
 }
 
@@ -1300,10 +1456,14 @@ void AstTypeTable::visit(AstVisitor* visitor)
     if (visitor->visit(this))
     {
         for (const AstTableProp& prop : props)
+        {
+            visitAttributes(prop.attributes, visitor);
             prop.type->visit(visitor);
+        }
 
         if (indexer)
         {
+            visitAttributes(indexer->attributes, visitor);
             indexer->indexType->visit(visitor);
             indexer->resultType->visit(visitor);
         }
@@ -1353,6 +1513,8 @@ void AstTypeFunction::visit(AstVisitor* visitor)
 {
     if (visitor->visit(this))
     {
+        visitAttributes(attributes, visitor);
+
         visitTypeList(visitor, argTypes);
         returnTypes->visit(visitor);
     }
