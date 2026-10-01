@@ -20,6 +20,8 @@
 #include <stdio.h>
 #include <string.h>
 
+LUAU_FASTFLAG(LuauCIProto)
+
 // Continuation for luaR_createobject: runs after a custom __init returns (possibly across a yield),
 // leaving the freshly-constructed object as the constructor's single result. See luaR_createobject.
 static int luaR_createobjectcont(lua_State* L, int status);
@@ -64,6 +66,7 @@ LuauClass* luaR_newclass(
     classdef->traitinits = NULL;
     classdef->numtraitinits = 0;
     classdef->numdirecttraitinits = 0;
+    classdef->traitdefaults = NULL;
 
     classdef->offsettomember = luaM_newarray(L, classdef->numberofallmembers, TString*, classdef->memcat);
     for (uint32_t i = 0; i < classdef->numberofallmembers; i++)
@@ -195,8 +198,13 @@ bool luaR_closureisinit(const LuauClass* classdef, const Closure* cl)
             return true;
     }
 
-    // Luwu Traits (rfcs/classes/traits.md): the class's copies of its traits' `__traitinit` initialize the trait fields, const
-    // ones included. The class's `__inittraits`, which only calls them, doesn't count.
+    return luaR_closureistraitinit(classdef, cl);
+}
+
+bool luaR_closureistraitinit(const LuauClass* classdef, const Closure* cl)
+{
+    // The class's copies of its traits' `__traitinit` initialize the trait fields, const and final ones included. The
+    // class's `__inittraits`, which only calls them, doesn't count.
     for (uint32_t i = 0; i < classdef->numtraitinits; i++)
     {
         bool isinittraits = classdef->numtraitinits > classdef->numdirecttraitinits && i == classdef->numdirecttraitinits;
@@ -254,11 +262,11 @@ void luaR_checkprivateaccess(lua_State* L, const TValue* key, const LuauClass* c
 
             if (classdef->memberflags[offset] & LBC_CLASSMEMBER_EXPECTED)
                 luaG_runerror(
-                    L, "cannot read '%s' of trait '%s': the trait expects implementing classes to define it", name, getstr(classdef->name)
+                    L, "cannot read '%s' of trait '%s': it is expected, not defined", name, getstr(classdef->name)
                 );
 
             if (offset == classdef->initoffset)
-                luaG_runerror(L, "trait '%s' has no '__init'; construct a class that implements it", getstr(classdef->name));
+                luaG_runerror(L, "trait '%s' has no '__init'", getstr(classdef->name));
 
             // the functions only the VM calls (see luaR_sealclassshape)
             luaG_runerror(L, "cannot read '%s' of trait '%s'", name, getstr(classdef->name));
@@ -313,10 +321,18 @@ void luaR_checkconstassign(lua_State* L, const TValue* key, const LuauObject* ob
     if ((classdef->memberflags[offset] & LBC_CLASSMEMBER_CONST) == 0)
         return;
 
+    // Luwu Traits (rfcs/classes/traits.md): a final field belongs to its trait, so only the trait's initializer writes it,
+    // not the class's `__init`
+    bool isfinal = (classdef->memberflags[offset] & LBC_CLASSMEMBER_FINAL) != 0;
+    if (isfinal && (!cl || !luaR_closureistraitinit(classdef, cl)))
+        luaG_runerror(
+            L, "'%s' is a final field of '%s' and can't be assigned", ttisstring(key) ? svalue(key) : "?", getstr(classdef->name)
+        );
+
     // deviaze: embedder code isn't allowed to bypass `const` access (unlike private access) because
     // allowing such could lead to UB in future const optimizations.
     // also if you're using `const` just to have embedder-only-assignable fields please just use userdata
-    if (!cl || !luaR_closureisinit(classdef, cl))
+    if (!cl || (!isfinal && !luaR_closureisinit(classdef, cl)))
         luaG_constassignerror(L, key, classdef->name);
 
     // `__init` constructs the object in its `self` parameter, which is register 0 of its frame. This
@@ -342,8 +358,8 @@ static void luaR_stampownerclass(lua_State* L, Proto* p, LuauClass* classdef)
 }
 
 // Luwu Traits (rfcs/classes/traits.md): the function `Trait.method` reads as. Its upvalues are the trait, the method's name and the trait's
-// own closure (which luaR_implementtraits copies into implementing classes). It calls the receiver's class's
-// implementation of the method: the class's own override, or its copy of the trait's default.
+// own closure (which luaR_implementtraits copies into implementing classes). It calls the receiver's class's copy of
+// the trait's method, even when the class overrides it: `Trait.method(obj)` is how an override reaches the default.
 static int luaR_traitmethod(lua_State* L)
 {
     Closure* dispatcher = clvalue(L->ci->func);
@@ -357,7 +373,7 @@ static int luaR_traitmethod(lua_State* L)
     if (!implements)
         luaL_error(
             L,
-            "'%s.%s' expects 'self' to be an object of a class that implements '%s', got %s",
+            "'%s.%s' expects an object implementing '%s', got %s",
             getstr(trait->name),
             getstr(name),
             getstr(trait->name),
@@ -383,7 +399,14 @@ static int luaR_traitmethod(lua_State* L)
         luaR_checkprivateaccess(L, &key, cls, caller, memberoffset);
     }
 
+    // The class's slot holds its copy of the default, unless the class overrides it: then the copy is in traitdefaults
     const TValue* fn = &cls->staticmembers[memberoffset - cls->numberofinstancemembers];
+    if (cls->traitdefaults)
+    {
+        const TValue* overridden = luaH_get(cls->traitdefaults, &dispatcher->c.upvals[2]);
+        if (!ttisnil(overridden))
+            fn = overridden;
+    }
 
     luaL_checkstack(L, 1, "trait method call");
     luaC_threadbarrier(L);
@@ -474,6 +497,15 @@ void luaR_addclassmember(lua_State* L, LuauClass* classdef, TString* name, TValu
     }
 }
 
+// Luwu Traits (rfcs/classes/traits.md): a constructor's table can't set a final field, which only its trait sets
+static void luaR_checknotfinal(lua_State* L, const LuauClass* classdef, uint32_t idx)
+{
+    if (classdef->memberflags[idx] & LBC_CLASSMEMBER_FINAL)
+        luaG_runerror(
+            L, "'%s' is a final field of '%s' and can't be assigned", getstr(classdef->offsettomember[idx]), getstr(classdef->name)
+        );
+}
+
 void luaR_applyobjectfields(lua_State* L, LuauClass* classdef, LuauObject* object, LuaTable* arg)
 {
     for (uint32_t idx = 0; idx < classdef->numberofinstancemembers; idx++)
@@ -485,7 +517,10 @@ void luaR_applyobjectfields(lua_State* L, LuauClass* classdef, LuauObject* objec
         // A field absent from the table (or explicitly nil) keeps whatever's already in
         // object->members[idx] -- nil, or that field's default.
         if (!ttisnil(value))
+        {
+            luaR_checknotfinal(L, classdef, idx);
             setobj(L, &object->members[idx], value);
+        }
     }
 }
 
@@ -516,6 +551,7 @@ static void luaR_applyobjectfieldsas(lua_State* L, LuauClass* classdef, LuauObje
         // A field absent from the argument (or nil) keeps its default.
         if (!ttisnil(value))
         {
+            luaR_checknotfinal(L, classdef, idx);
             setobj(L, &object->members[idx], value);
             // An __index call can run the collector, so `object` may already be black. Once the next
             // field's lookup overwrites the stack slot, this member is the value's only reference, so
@@ -763,14 +799,12 @@ void luaR_freeobject(lua_State* L, LuauObject* object, lua_Page* page)
 void luaR_checktraitsimplemented(lua_State* L, const LuauClass* classdef)
 {
     if (classdef->traitspending)
-        luaG_runerror(L, "class '%s' can't be constructed before it has implemented its traits", getstr(classdef->name));
+        luaG_runerror(L, "class '%s' can't be constructed until its traits are implemented", getstr(classdef->name));
 }
 
 l_noret luaR_traitconstructionerror(lua_State* L, const LuauClass* trait)
 {
-    luaG_runerror(
-        L, "trait '%s' cannot be called: it has no '__create'; construct a class that implements it instead", getstr(trait->name)
-    );
+    luaG_runerror(L, "trait '%s' can't be called: it has no '__create'", getstr(trait->name));
 }
 
 // The static member of `classdef` named `name`, or NULL when it has none.
@@ -832,6 +866,14 @@ static Proto* luaR_copyproto(lua_State* L, Proto* p)
         memcpy(c->code, p->code, sizeof(Instruction) * p->sizecode);
     c->sizecode = p->sizecode;
     c->codeentry = c->code;
+
+    // A breakpoint replaces its instruction with LOP_BREAK, which reads the original opcode back from `debuginsn`. The
+    // code was copied with any breakpoints in it, so the copy needs the original opcodes too.
+    if (p->debuginsn)
+    {
+        c->debuginsn = luaM_newarray(L, p->sizecode, uint8_t, c->memcat);
+        memcpy(c->debuginsn, p->debuginsn, p->sizecode);
+    }
 
     c->k = luaM_newarray(L, p->sizek, TValue, c->memcat);
     for (int i = 0; i < p->sizek; i++)
@@ -946,12 +988,38 @@ static const char* luaR_visibilityname(uint8_t flags)
 static const double LUAR_NEEDS_VISITING = 1;
 static const double LUAR_NEEDS_DONE = 2;
 
+// Raises for traits that need each other, naming every trait in the cycle in the order it goes: "traits 'A', 'B' and
+// 'C' are codependent. ..." Analysis words its error the same way (codependentTraitsMessage).
+static l_noret luaR_codependenterror(lua_State* L, LuauClass* const* cycle, int count)
+{
+    char names[512] = {0};
+    for (int i = 0; i < count; i++)
+    {
+        size_t used = strlen(names);
+        const char* separator = "";
+        if (i + 1 == count)
+            separator = " and ";
+        else if (i > 0)
+            separator = ", ";
+
+        snprintf(names + used, sizeof(names) - used, "%s'%s'", separator, getstr(cycle[i]->name));
+    }
+
+    luaG_runerror(
+        L,
+        "traits %s are codependent. This is an unhealthy relationship; consider merging these traits or factoring out common "
+        "members into a new trait",
+        names
+    );
+}
+
 // Raises when `trait` is part of a cycle of `needs`. Traits that need each other are always implemented together, so
 // they should be one trait. `edges` maps each trait to an array of the traits it needs; `state` marks the traits the
-// search is inside of (LUAR_NEEDS_VISITING) and the ones already cleared (LUAR_NEEDS_DONE).
-static void luaR_checkneedscycles(lua_State* L, LuaTable* edges, LuaTable* state, LuauClass* trait, LuauClass* parent, int depth)
+// search is inside of (LUAR_NEEDS_VISITING) and the ones already cleared (LUAR_NEEDS_DONE). `path` holds the traits the
+// search is inside of, `trait` at `depth`, so a cycle can be named in full.
+static void luaR_checkneedscycles(lua_State* L, LuaTable* edges, LuaTable* state, LuauClass* trait, LuauClass** path, int depth)
 {
-    if (depth > LUAR_MAX_NEEDS_DEPTH)
+    if (depth >= LUAR_MAX_NEEDS_DEPTH)
         luaG_runerror(L, "trait '%s' needs traits nested more than %d deep", getstr(trait->name), LUAR_MAX_NEEDS_DEPTH);
 
     TValue key;
@@ -961,6 +1029,7 @@ static void luaR_checkneedscycles(lua_State* L, LuaTable* edges, LuaTable* state
     if (!ttistable(list))
         return;
 
+    path[depth] = trait;
     setnvalue(luaH_set(L, state, &key), LUAR_NEEDS_VISITING);
 
     for (int i = 1; i <= luaH_getn(hvalue(list)); i++)
@@ -979,23 +1048,39 @@ static void luaR_checkneedscycles(lua_State* L, LuaTable* edges, LuaTable* state
             if (needed == trait)
                 luaG_runerror(L, "trait '%s' needs itself", getstr(trait->name));
 
-            if (needed == parent)
-                luaG_runerror(
-                    L, "traits '%s' and '%s' need each other; combine them into one trait", getstr(needed->name), getstr(trait->name)
-                );
+            // `needed` is on the path, since the search is inside of it: the cycle runs from there to here
+            int start = depth;
+            while (start > 0 && path[start] != needed)
+                start--;
 
-            luaG_runerror(
-                L,
-                "trait '%s' needs itself through trait '%s'; traits that need each other should be combined into one trait",
-                getstr(needed->name),
-                getstr(trait->name)
-            );
+            luaR_codependenterror(L, path + start, depth - start + 1);
         }
 
-        luaR_checkneedscycles(L, edges, state, needed, trait, depth + 1);
+        luaR_checkneedscycles(L, edges, state, needed, path, depth + 1);
     }
 
     setnvalue(luaH_set(L, state, &key), LUAR_NEEDS_DONE);
+}
+
+// What a value that should be a trait is instead, for an error: "nil", "none", "true", "class 'Foo'", "a table",
+// "an object". The single-valued types are named by their value, with no article.
+static void luaR_describenontrait(lua_State* L, const TValue* t, char* buf, size_t size)
+{
+    if (ttisnil(t))
+        snprintf(buf, size, "nil");
+    else if (ttissymnone(t))
+        snprintf(buf, size, "none");
+    else if (ttisboolean(t))
+        snprintf(buf, size, "%s", bvalue(t) ? "true" : "false");
+    else if (ttisclass(t))
+        snprintf(buf, size, "class '%s'", getstr(classvalue(t)->name));
+    else
+    {
+        const char* name = luaT_objtypename(L, t);
+        // strchr also finds the terminator, so an empty name is checked first
+        bool startsWithVowel = name[0] != 0 && strchr("aeiouAEIOU", name[0]) != nullptr;
+        snprintf(buf, size, "%s %s", startsWithVowel ? "an" : "a", name);
+    }
 }
 
 // The name entry `i` of the running class statement's `implements` list was read from ("global 'Item'",
@@ -1009,10 +1094,12 @@ static bool luaR_implementsentryname(lua_State* L, uint32_t i, char* buf, size_t
     if (!isLua(L->ci))
         return false;
 
-    Proto* p = clvalue(L->ci->func)->l.p;
+    // the proto the frame is running, which `savedpc` points into: the closure's may have been promoted since it started
+    Proto* p = FFlag::LuauCIProto ? L->ci->p : clvalue(L->ci->func)->l.p;
     const Instruction* implements = L->ci->savedpc - 2;
 
-    if (implements < p->code || LUAU_INSN_OP(*implements) != LOP_NEWCLASSMEMBER || LUAU_INSN_B(*implements) != LBC_NEWCLASSMEMBER_IMPLEMENTS)
+    bool inside = implements >= p->code && implements < p->code + p->sizecode;
+    if (!inside || LUAU_INSN_OP(*implements) != LOP_NEWCLASSMEMBER || LUAU_INSN_B(*implements) != LBC_NEWCLASSMEMBER_IMPLEMENTS)
         return false;
 
     uint32_t reg = LUAU_INSN_C(*implements) + i;
@@ -1104,14 +1191,8 @@ static int luaR_collecttraits(lua_State* L, LuauClass* classdef, ptrdiff_t liste
 
         if (!ttisclass(t) || !classvalue(t)->istrait)
         {
-            // what the entry is: "nil", "class 'Foo'", "a table"
             char what[160];
-            if (ttisnil(t))
-                snprintf(what, sizeof(what), "nil");
-            else if (ttisclass(t))
-                snprintf(what, sizeof(what), "class '%s'", getstr(classvalue(t)->name));
-            else
-                snprintf(what, sizeof(what), "a %s", luaT_objtypename(L, t));
+            luaR_describenontrait(L, t, what, sizeof(what));
 
             char entry[320];
             if (luaR_implementsentryname(L, i, entry, sizeof(entry)))
@@ -1161,13 +1242,20 @@ static int luaR_collecttraits(lua_State* L, LuauClass* classdef, ptrdiff_t liste
             const TValue* needed = L->base + r;
             seen = hvalue(L->base + first - 1);
 
-            if (!ttisclass(needed) || !classvalue(needed)->istrait)
+            if (ttisclass(needed) && !classvalue(needed)->istrait)
                 luaG_runerror(
                     L,
-                    "trait '%s' needs a %s, which is not a trait",
+                    "trait '%s' can't need class '%s': traits can only need other traits",
                     getstr(classvalue(L->base + cur)->name),
-                    ttisclass(needed) ? "class" : luaT_objtypename(L, needed)
+                    getstr(classvalue(needed)->name)
                 );
+
+            if (!ttisclass(needed))
+            {
+                char what[160];
+                luaR_describenontrait(L, needed, what, sizeof(what));
+                luaG_runerror(L, "trait '%s' needs %s, which is not a trait", getstr(classvalue(L->base + cur)->name), what);
+            }
 
             setobj2t(L, luaH_setnum(L, neededlist, r - resultsbase + 1), needed);
 
@@ -1194,11 +1282,160 @@ static int luaR_collecttraits(lua_State* L, LuauClass* classdef, ptrdiff_t liste
     sethvalue(L, L->top, state);
     L->top++;
 
+    LuauClass* path[LUAR_MAX_NEEDS_DEPTH];
     for (int i = 0; i < numtraits; i++)
-        luaR_checkneedscycles(L, hvalue(L->base + first - 2), state, classvalue(L->base + first + i), NULL, 0);
+        luaR_checkneedscycles(L, hvalue(L->base + first - 2), state, classvalue(L->base + first + i), path, 0);
 
     L->top--;
     return numtraits;
+}
+
+// The offset of `trait`'s member `name`, which it has
+static uint32_t luaR_traitmemberoffset(const LuauClass* trait, TString* name)
+{
+    const TValue* offset = luaH_getstr(trait->memberstooffset, name);
+    LUAU_ASSERT(ttisnumber(offset));
+    return uint32_t(nvalue(offset));
+}
+
+// Whether `from` needs `to`, directly or through the traits it needs. `edges` maps each trait to an array of the traits
+// it needs (luaR_collecttraits, which refused cycles and chains deeper than LUAR_MAX_NEEDS_DEPTH, so this ends at that
+// depth). `visited` holds the traits already searched, so a graph with many diamonds is walked once.
+static bool luaR_traitneeds(lua_State* L, LuaTable* edges, LuaTable* visited, LuauClass* from, LuauClass* to)
+{
+    TValue key;
+    setclassvalue(L, &key, from);
+    setbvalue(luaH_set(L, visited, &key), 1);
+
+    const TValue* list = luaH_get(edges, &key);
+    if (!ttistable(list))
+        return false;
+
+    for (int i = 1; i <= luaH_getn(hvalue(list)); i++)
+    {
+        LuauClass* needed = classvalue(luaH_getnum(hvalue(list), i));
+        if (needed == to)
+            return true;
+
+        TValue neededkey;
+        setclassvalue(L, &neededkey, needed);
+        if (ttisnil(luaH_get(visited, &neededkey)) && luaR_traitneeds(L, edges, visited, needed, to))
+            return true;
+    }
+
+    return false;
+}
+
+// Of the traits in `providers` (an array, in the order the class attaches them) that all provide `name`, the one whose
+// member the class gets: the one that needs every other. Raises when there is none, when a field would be overridden,
+// or when an override breaks what the overridden trait promised (it is `final`, or public where the override isn't).
+static LuauClass* luaR_overridingtrait(lua_State* L, LuaTable* edges, LuaTable* providers, const LuauClass* classdef, TString* name)
+{
+    int count = luaH_getn(providers);
+    auto providerat = [&](int i)
+    {
+        return classvalue(luaH_getnum(providers, i));
+    };
+
+    LuauClass* winner = NULL;
+    for (int i = 1; i <= count && !winner; i++)
+    {
+        bool needsall = true;
+        for (int j = 1; j <= count && needsall; j++)
+            needsall = i == j || luaR_traitneeds(L, edges, luaH_new(L, 0, 0), providerat(i), providerat(j));
+
+        if (needsall)
+            winner = providerat(i);
+    }
+
+    // the clash reported names the first two providers neither of which needs the other
+    if (!winner)
+    {
+        for (int i = 1; i <= count; i++)
+        {
+            for (int j = i + 1; j <= count; j++)
+            {
+                bool related = luaR_traitneeds(L, edges, luaH_new(L, 0, 0), providerat(i), providerat(j)) ||
+                               luaR_traitneeds(L, edges, luaH_new(L, 0, 0), providerat(j), providerat(i));
+                if (related)
+                    continue;
+
+                const LuauClass* a = providerat(i);
+                const LuauClass* b = providerat(j);
+                if (luaR_traitmemberoffset(a, name) < a->numberofinstancemembers)
+                    luaG_runerror(L, "traits '%s' and '%s' both provide '%s'", getstr(a->name), getstr(b->name), getstr(name));
+
+                luaG_runerror(
+                    L,
+                    "traits '%s' and '%s' both provide '%s' and neither needs the other; define '%s' in class '%s' to choose",
+                    getstr(a->name),
+                    getstr(b->name),
+                    getstr(name),
+                    getstr(name),
+                    getstr(classdef->name)
+                );
+            }
+        }
+    }
+
+    LUAU_ASSERT(winner);
+    uint32_t winneroff = luaR_traitmemberoffset(winner, name);
+    uint8_t winnerflags = winner->memberflags[winneroff];
+
+    for (int i = 1; i <= count; i++)
+    {
+        const LuauClass* overridden = providerat(i);
+        if (overridden == winner)
+            continue;
+
+        uint32_t off = luaR_traitmemberoffset(overridden, name);
+        uint8_t flags = overridden->memberflags[off];
+
+        if (off < overridden->numberofinstancemembers || winneroff < winner->numberofinstancemembers)
+            luaG_runerror(L, "trait '%s' can't redefine '%s': fields of trait '%s' can't be overridden", getstr(winner->name), getstr(name), getstr(overridden->name));
+
+        if (flags & LBC_CLASSMEMBER_FINAL)
+            luaG_runerror(L, "'%s' is final in trait '%s' and can't be overridden", getstr(name), getstr(overridden->name));
+
+        if ((flags ^ winnerflags) & LBC_CLASSMEMBER_PRIVATE)
+            luaG_runerror(
+                L,
+                "'%s' must be %s in trait '%s' to override it from trait '%s'",
+                getstr(name),
+                luaR_visibilityname(flags),
+                getstr(winner->name),
+                getstr(overridden->name)
+            );
+    }
+
+    return winner;
+}
+
+// "missing field 'x' required for 'C' to implement 'T'"; `name` is NULL for a constructor
+static l_noret luaR_traitmissingerror(
+    lua_State* L,
+    const char* kind,
+    TString* name,
+    const LuauClass* classdef,
+    const LuauClass* trait
+)
+{
+    if (!name)
+        luaG_runerror(L, "missing %s required for '%s' to implement '%s'", kind, getstr(classdef->name), getstr(trait->name));
+
+    luaG_runerror(L, "missing %s '%s' required for '%s' to implement '%s'", kind, getstr(name), getstr(classdef->name), getstr(trait->name));
+}
+
+// "'x' must be public for 'C' to implement 'T'"
+static l_noret luaR_traitrequirementerror(
+    lua_State* L,
+    TString* name,
+    const char* requirement,
+    const LuauClass* classdef,
+    const LuauClass* trait
+)
+{
+    luaG_runerror(L, "'%s' must be %s for '%s' to implement '%s'", getstr(name), requirement, getstr(classdef->name), getstr(trait->name));
 }
 
 // Raises unless every expectation of the traits is met by the class being implemented, whoever provides the member: the
@@ -1219,12 +1456,7 @@ static void luaR_checktraitexpectations(lua_State* L, LuauClass* classdef, StkId
         // (see luaR_sealclassshape), so it isn't met in the loop below.
         bool expectsinit = (trait->memberflags[trait->initoffset] & LBC_CLASSMEMBER_EXPECTED) != 0;
         if (expectsinit && !classdef->hascustominit)
-            luaG_runerror(
-                L,
-                "class '%s' implements trait '%s', which expects a constructor; define '__init' or a primary constructor",
-                getstr(classdef->name),
-                getstr(trait->name)
-            );
+            luaR_traitmissingerror(L, "constructor", NULL, classdef, trait);
 
         for (uint32_t off = 0; off < trait->numberofallmembers; off++)
         {
@@ -1262,58 +1494,20 @@ static void luaR_checktraitexpectations(lua_State* L, LuauClass* classdef, StkId
             }
             else
             {
-                luaG_runerror(
-                    L,
-                    "class '%s' implements trait '%s', which expects a %s named '%s'",
-                    getstr(classdef->name),
-                    getstr(trait->name),
-                    luaR_memberkind(isfield),
-                    getstr(name)
-                );
+                luaR_traitmissingerror(L, luaR_memberkind(isfield), name, classdef, trait);
             }
 
             if (foundisfield != isfield)
-                luaG_runerror(
-                    L,
-                    "trait '%s' expects '%s' to be a %s, but class '%s' makes it a %s",
-                    getstr(trait->name),
-                    getstr(name),
-                    luaR_memberkind(isfield),
-                    getstr(classdef->name),
-                    luaR_memberkind(foundisfield)
-                );
+                luaR_traitrequirementerror(L, name, isfield ? "a field" : "a function", classdef, trait);
 
             if (isplaceholder && !(expected & LBC_CLASSMEMBER_OPTIONAL))
-                luaG_runerror(
-                    L,
-                    "class '%s' implements trait '%s', which expects a function named '%s'",
-                    getstr(classdef->name),
-                    getstr(trait->name),
-                    getstr(name)
-                );
+                luaR_traitmissingerror(L, "function", name, classdef, trait);
 
             if (!isplaceholder && ((flags ^ expected) & LBC_CLASSMEMBER_PRIVATE))
-                luaG_runerror(
-                    L,
-                    "trait '%s' expects %s '%s' to be %s, but it is %s in class '%s'",
-                    getstr(trait->name),
-                    luaR_memberkind(isfield),
-                    getstr(name),
-                    luaR_visibilityname(expected),
-                    luaR_visibilityname(flags),
-                    getstr(classdef->name)
-                );
+                luaR_traitrequirementerror(L, name, luaR_visibilityname(expected), classdef, trait);
 
             if (isfield && ((flags ^ expected) & LBC_CLASSMEMBER_CONST))
-                luaG_runerror(
-                    L,
-                    "trait '%s' expects field '%s' %s, but it is %s in class '%s'",
-                    getstr(trait->name),
-                    getstr(name),
-                    (expected & LBC_CLASSMEMBER_CONST) ? "to be const" : "not to be const",
-                    (flags & LBC_CLASSMEMBER_CONST) ? "const" : "not const",
-                    getstr(classdef->name)
-                );
+                luaR_traitrequirementerror(L, name, (expected & LBC_CLASSMEMBER_CONST) ? "const" : "non-const", classdef, trait);
         }
     }
 }
@@ -1357,7 +1551,12 @@ void luaR_implementtraits(lua_State* L, LuauClass* classdef, StkId listed, uint3
     uint32_t newfields = 0;
     uint32_t newstatics = 0;
 
-    // Pass 1: the provided fields and the defined functions of every trait
+    // Every trait that provides each name, for choosing the one whose member the class gets
+    LuaTable* providers = luaH_new(L, 0, 8);
+    sethvalue(L, L->top, providers);
+    L->top++;
+
+    // Pass 1: the provided fields and the defined functions of every trait, by name
     for (int i = 0; i < numtraits; i++)
     {
         LuauClass* trait = traitat(i);
@@ -1380,48 +1579,51 @@ void luaR_implementtraits(lua_State* L, LuauClass* classdef, StkId listed, uint3
 
                 if (isfield || ownisfield)
                     luaG_runerror(
-                        L,
-                        "class '%s' declares '%s', which trait '%s' also provides as a %s",
-                        getstr(classdef->name),
-                        getstr(name),
-                        getstr(trait->name),
-                        luaR_memberkind(isfield)
+                        L, "class '%s' can't declare '%s': trait '%s' already provides it", getstr(classdef->name), getstr(name), getstr(trait->name)
                     );
 
                 if (flags & LBC_CLASSMEMBER_FINAL)
-                    luaG_runerror(
-                        L, "class '%s' cannot define '%s': trait '%s' defines it as final", getstr(classdef->name), getstr(name), getstr(trait->name)
-                    );
+                    luaG_runerror(L, "'%s' is final in trait '%s' and can't be overridden", getstr(name), getstr(trait->name));
 
                 // whether the function is public is part of what the trait promises about every class implementing it
                 uint8_t ownflags = classdef->memberflags[uint32_t(nvalue(own))];
                 if ((ownflags ^ flags) & LBC_CLASSMEMBER_PRIVATE)
-                    luaG_runerror(
-                        L,
-                        "class '%s' cannot make '%s' %s: trait '%s' defines it as %s",
-                        getstr(classdef->name),
-                        getstr(name),
-                        luaR_visibilityname(ownflags),
-                        getstr(trait->name),
-                        luaR_visibilityname(flags)
-                    );
+                    luaR_traitrequirementerror(L, name, luaR_visibilityname(flags), classdef, trait);
 
                 // the class's own function overrides the trait's default
                 continue;
             }
 
-            const TValue* previous = luaH_getstr(added, name);
-            if (!ttisnil(previous))
-                luaG_runerror(
-                    L,
-                    "class '%s' implements traits '%s' and '%s', which both provide '%s'",
-                    getstr(classdef->name),
-                    getstr(classvalue(previous)->name),
-                    getstr(trait->name),
-                    getstr(name)
-                );
+            TValue* list = luaH_setstr(L, providers, name);
+            if (!ttistable(list))
+                sethvalue(L, list, luaH_new(L, 2, 0));
 
-            setclassvalue(L, luaH_setstr(L, added, name), trait);
+            LuaTable* names = hvalue(list);
+            setclassvalue(L, luaH_setnum(L, names, luaH_getn(names) + 1), trait);
+        }
+    }
+
+    // Pass 1b: which trait's member the class gets for each name. A trait's function overrides the function of a trait
+    // it needs, so the provider that needs every other provider wins; with none, the class has to choose by defining
+    // the function itself. Fields are never overridden.
+    LuaTable* edges = hvalue(L->base + first - 2);
+
+    for (int i = 0; i < numtraits; i++)
+    {
+        LuauClass* trait = traitat(i);
+
+        for (uint32_t off = 0; off < trait->numberofallmembers; off++)
+        {
+            TString* name = trait->offsettomember[off];
+            const TValue* list = name ? luaH_getstr(providers, name) : luaO_nilobject;
+            bool undecided = ttistable(list) && ttisnil(luaH_getstr(added, name));
+            if (!undecided)
+                continue;
+
+            LuauClass* winner = luaR_overridingtrait(L, edges, hvalue(list), classdef, name);
+            bool isfield = luaR_traitmemberoffset(winner, name) < winner->numberofinstancemembers;
+
+            setclassvalue(L, luaH_setstr(L, added, name), winner);
 
             if (isfield)
                 newfields++;
@@ -1548,7 +1750,9 @@ void luaR_implementtraits(lua_State* L, LuauClass* classdef, StkId listed, uint3
 
             newnames[target] = name;
             // access and constness carry over; the other bits describe the member's role in the trait
-            newflags[target] = trait->memberflags[off] & (LBC_CLASSMEMBER_PRIVATE | LBC_CLASSMEMBER_CONST);
+            // (and a field's finality)
+            uint8_t carried = LBC_CLASSMEMBER_PRIVATE | LBC_CLASSMEMBER_CONST | (isfield ? LBC_CLASSMEMBER_FINAL : 0);
+            newflags[target] = trait->memberflags[off] & carried;
             luaC_objbarrier(L, classdef, name);
 
             if (isfield && (flags & LBC_CLASSMEMBER_CONSTDEFAULT))
@@ -1619,6 +1823,49 @@ void luaR_implementtraits(lua_State* L, LuauClass* classdef, StkId listed, uint3
             setclvalue(L, L->top, luaR_copytraitfunction(L, clvalue(fn)));
             L->top++;
             luaR_addclassmember(L, classdef, name, L->top - 1);
+            L->top--;
+        }
+    }
+
+    // A default the class overrides still gets a copy stamped with the class, for `Trait.method(obj)` to run
+    for (int i = 0; i < numtraits; i++)
+    {
+        LuauClass* trait = traitat(i);
+
+        for (uint32_t off = trait->numberofinstancemembers; off < trait->numberofallmembers; off++)
+        {
+            TString* name = trait->offsettomember[off];
+            if (!name || (trait->memberflags[off] & LBC_CLASSMEMBER_EXPECTED))
+                continue;
+
+            // only a method reads as a dispatcher; a static is called as itself
+            const TValue* fn = &trait->staticmembers[off - trait->numberofinstancemembers];
+            if (!ttisfunction(fn) || !clvalue(fn)->isC)
+                continue;
+
+            // pass 1 credits the trait with every default the class doesn't define itself
+            const TValue* provider = luaH_getstr(added, name);
+            if (ttisclass(provider) && classvalue(provider) == trait)
+                continue;
+
+            const TValue* traitfn = &clvalue(fn)->c.upvals[2];
+            LUAU_ASSERT(ttisfunction(traitfn) && !clvalue(traitfn)->isC);
+
+            if (!classdef->traitdefaults)
+            {
+                classdef->traitdefaults = luaH_new(L, 0, 1);
+                luaC_objbarrier(L, classdef, classdef->traitdefaults);
+            }
+
+            Closure* copy = luaR_copytraitfunction(L, clvalue(traitfn));
+            luaD_checkstack(L, 1);
+            setclvalue(L, L->top, copy);
+            L->top++;
+            luaR_stampownerclass(L, copy->l.p, classdef);
+
+            TValue* slot = luaH_set(L, classdef->traitdefaults, traitfn);
+            setclvalue(L, slot, copy);
+            luaC_barriert(L, classdef->traitdefaults, L->top - 1);
             L->top--;
         }
     }

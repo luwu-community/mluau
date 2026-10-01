@@ -240,6 +240,8 @@ public:
         // Luwu @noinline (rfcs/noinline-attribute.md): upstream's `DebugNoinline` (`@debugnoinline`), shipped as
         // `@noinline`.
         Noinline,
+        // Luwu user-defined refinements: `@[truthy(param, Type)]`
+        Truthy,
         Unknown
     };
 
@@ -325,6 +327,13 @@ public:
     Type type;
     AstArray<AstExpr*> args;
     AstName name;
+
+    // Luwu user-defined refinements: `@[truthy(param, Type)]` (behind DebugLuwuUserDefinedRefinements) says that when
+    // the function returns a truthy value, the argument for its parameter `param` is a `Type`. Only a `Truthy`
+    // attribute has them; its `args` stay empty, since `Type` is a type, not an expression.
+    AstName refinedParam;
+    Location refinedParamLocation;
+    AstType* refinedType = nullptr;
 };
 
 // The `@deprecated` attribute's payload, or nullopt when the array has no `@deprecated`.
@@ -1371,6 +1380,9 @@ struct AstClassProperty
     // Luwu Traits (rfcs/classes/traits.md): location of `expect` in a trait's `expect name: T`, a field every implementing
     // class must declare itself. nullopt for a provided field, and always in a class.
     std::optional<Location> expectLocation = std::nullopt;
+    // Luwu Traits (rfcs/classes/traits.md): location of `final` in a trait's `final name = value`: a const field only the
+    // trait sets, from its default; not even an implementing class's `__init` can write it. nullopt in a class.
+    std::optional<Location> finalLocation = std::nullopt;
 };
 
 struct AstClassMethod

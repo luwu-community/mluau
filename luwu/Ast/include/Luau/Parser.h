@@ -163,6 +163,8 @@ private:
 
     // attrlist = '@[' parattr {',' parattr} ']'
     void parseAttrList(TempVector<AstAttr*>& attributes, TempVector<CstAttrList*>* cstAttrLists, AstAttr::Context context);
+    // Luwu user-defined refinements: `truthy(param, Type)` in an attribute list
+    AstAttr* parseTruthyAttribute(const TempVector<AstAttr*>& attributes, const Name& name, AstAttr::Context context);
 
     // A bare `@name` cannot take arguments; `@[name ...]` is the form that does. When arguments
     // follow one anyway this reports precisely and parses them, so the attribute still means what was
@@ -270,7 +272,8 @@ private:
     AstClassPrimaryConstructor* parseClassPrimaryConstructor(
         const std::optional<Location>& qualifierLocation,
         AstClassMemberVisibility visibility,
-        bool declared
+        bool declared,
+        bool isTrait
     );
 
     // Brings a primary constructor's parameters into scope; the caller takes a saveLocals() offset

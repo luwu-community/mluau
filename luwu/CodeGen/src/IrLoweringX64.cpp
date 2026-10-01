@@ -107,6 +107,11 @@ static void emitClassMemberAuthX64(
         build.test(byteReg(flag.reg), int8_t(LBC_CLASSMEMBER_CONST));
         build.jcc(ConditionX64::Zero, authorized);
 
+        // Luwu Traits (rfcs/classes/traits.md): a final field is written only by a trait initializer, which the interpreter
+        // authorizes (luaR_checkconstassign)
+        build.test(byteReg(flag.reg), int8_t(LBC_CLASSMEMBER_FINAL));
+        build.jcc(ConditionX64::NotZero, mismatch);
+
         build.cmp(byte[owner.reg + offsetof(LuauClass, hascustominit)], 0);
         build.jcc(ConditionX64::Equal, mismatch); // no custom __init -> const is never writable
 
@@ -3508,13 +3513,15 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         {
             Label notTrait;
 
+            // before the branch: taking a register may spill another value, which both paths have to see
+            ScopedRegX64 tmp{regs, SizeX64::qword};
+
             if (OP_A(inst).kind == IrOpKind::Inst)
             {
                 build.cmp(regOp(OP_A(inst)), LUA_TCLASS);
                 build.jcc(ConditionX64::NotEqual, notTrait);
             }
 
-            ScopedRegX64 tmp{regs, SizeX64::qword};
             build.mov(tmp.reg, luauRegValue(vmRegOp(OP_B(inst))));
             build.cmp(byte[tmp.reg + offsetof(LuauClass, istrait)], 0);
             build.jcc(ConditionX64::Equal, notTrait);

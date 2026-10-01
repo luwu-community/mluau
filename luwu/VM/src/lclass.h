@@ -86,9 +86,14 @@ LUAI_FUNC void luaR_initpodobject(lua_State* L, LuauClass* classdef, LuauObject*
 
 /**
  * Returns true if `cl` is `classdef`'s own `__init` closure specifically (stricter than
- * luaR_closureownsprivateaccess, which accepts any method of the class).
+ * luaR_closureownsprivateaccess, which accepts any method of the class), or one of its trait initializers
+ * (luaR_closureistraitinit).
  */
 LUAI_FUNC bool luaR_closureisinit(const LuauClass* classdef, const Closure* cl);
+
+// Luwu Traits (rfcs/classes/traits.md): true if `cl` is one of `classdef`'s copies of its traits' `__traitinit`, the only
+// closures that may write a final field (luaR_closureisinit accepts them too, for const fields)
+LUAI_FUNC bool luaR_closureistraitinit(const LuauClass* classdef, const Closure* cl);
 
 /**
  * Returns true if `cl` is one of `classdef`'s own method closures (including `__init`), or a

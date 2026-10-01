@@ -3760,6 +3760,9 @@ struct Compiler
                             flags |= LBC_CLASSMEMBER_HASDEFAULT;
                         if (prop.expectLocation)
                             flags |= LBC_CLASSMEMBER_EXPECTED;
+                        // Luwu Traits (rfcs/classes/traits.md): a final field is const, and only the trait's own initializer writes it
+                        if (decl->isTrait && prop.finalLocation)
+                            flags |= LBC_CLASSMEMBER_FINAL | LBC_CLASSMEMBER_CONST;
 
                         // A POD class whose defaults are all constants carries them in its own shape
                         // (see classPodConstDefaults), so the VM copies them into each instance rather
@@ -3932,8 +3935,9 @@ struct Compiler
         if (decl->implements.size > 0)
         {
             size_t count = decl->implements.size;
-            // checked by the parser's limit on an expression list long before this
-            LUAU_ASSERT(count <= 255);
+            // each entry takes two registers (the trait and its argument count), and the parser doesn't limit the list
+            if (count * 2 > kMaxRegisterCount)
+                CompileError::raise(decl->location, "Class '%s' implements more than %d traits", decl->name->name.value, int(kMaxRegisterCount / 2));
 
             uint8_t traitRegs = allocReg(decl, unsigned(count * 2));
 

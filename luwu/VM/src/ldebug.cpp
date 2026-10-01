@@ -356,7 +356,7 @@ l_noret luaG_instancefieldonclasserror(lua_State* L, const TValue* p1, const TVa
     if (classvalue(p1)->istrait)
         luaG_runerrorL(
             L,
-            "cannot read field '%s' of trait '%s': a trait's fields only exist in objects of the classes that implement it",
+            "cannot read field '%s' of trait '%s': fields exist only on objects",
             getstr(tsvalue(p2)),
             className
         );
