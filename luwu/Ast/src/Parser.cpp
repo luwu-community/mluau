@@ -37,6 +37,12 @@ LUAU_FASTFLAGVARIABLE(LuwuAttributesEverywhere)
 // Luwu Destructuring (rfcs/destructuring.md): `local`/`const` declarations that bind fields of a value,
 // `const fs.{readfile, path} = require("@std/fs")`. Still in progress.
 LUAU_FASTFLAGVARIABLE(LuwuDestructuring)
+// Luwu If Local (rfcs/if-local.md): `if local`/`if const` bindings and `when` chains in `if`/`elseif` conditions, in
+// statements and expressions. A language feature still in progress.
+LUAU_FASTFLAGVARIABLE(LuwuIfLocal)
+// Luwu Do Expressions (rfcs/do-expressions.md): `do ... give exp` expressions. Experimental.
+LUAU_FASTFLAGVARIABLE(DebugLuwuDoExpr)
+LUAU_FASTFLAG(LuwuTableComprehensions)
 // Luwu Declare Statements (rfcs/declare-statements.md): `declare` in ordinary source, where upstream only accepts it
 // in definition files. Still in progress.
 LUAU_FASTFLAGVARIABLE(LuwuDeclareStatements)
@@ -205,16 +211,66 @@ std::vector<std::pair<Location, std::string>> deprecatedArgsValidator(Location a
     return errors;
 }
 
+// Luwu: `@[nolint(...)]` and `@[lint(...)]` take lint names, written bare like `--!nolint` takes them
+// (`@[nolint(LocalUnused)]`), or as strings. The linter checks that the names exist; the parser doesn't know them.
+std::vector<std::pair<Location, std::string>> lintNamesArgsValidator(Location attrLoc, const AstArray<AstExpr*>& args)
+{
+    std::vector<std::pair<Location, std::string>> errors;
+    for (AstExpr* arg : args)
+    {
+        bool isName = arg->is<AstExprGlobal>() || arg->is<AstExprLocal>() || arg->is<AstExprConstantString>();
+        if (!isName)
+            errors.emplace_back(arg->location, "Lint attributes take lint names, like '@[nolint(LocalUnused)]'");
+    }
+    return errors;
+}
+
+// Luwu: `@nodiscard`, or `@[nodiscard("reason")]` with one string saying what to do with the result
+std::vector<std::pair<Location, std::string>> nodiscardArgsValidator(Location attrLoc, const AstArray<AstExpr*>& args)
+{
+    bool valid = args.size == 0 || (args.size == 1 && args.data[0]->is<AstExprConstantString>());
+    if (!valid)
+        return {{attrLoc, "@nodiscard takes at most one string, the reason: '@[nodiscard(\"use the returned copy\")]'"}};
+
+    return {};
+}
+
+// Luwu: `@[lint]` has to name what it turns on. "Every lint" would include the ones the type checking mode turns off
+// because the checker already reports them, such as UnknownGlobal in strict mode.
+std::vector<std::pair<Location, std::string>> lintOnArgsValidator(Location attrLoc, const AstArray<AstExpr*>& args)
+{
+    if (args.size == 0)
+        return {{attrLoc, "@lint needs the lints to turn on, like '@[lint(LocalUnused)]'"}};
+
+    return lintNamesArgsValidator(attrLoc, args);
+}
+
+// Luwu: the attributes whose arguments are names rather than literals
+static bool takesNameArguments(const char* attributeName)
+{
+    return strcmp(attributeName, "nolint") == 0 || strcmp(attributeName, "lint") == 0;
+}
+
 // @checked and @native describe how a function is compiled or typechecked, so they mean nothing
 // anywhere else. @deprecated marks an API as one callers should stop using, which every position
 // can have.
 // The fields deprecatedArgsValidator accepts.
 const char* const kDeprecatedArgumentFields[] = {"use", "reason", nullptr};
 
+// Luwu: where `@[nolint]` and `@[lint]` may be written: anything with a body whose warnings they scope, and a `local`
+// or `const`, whose bindings they cover wherever a lint reports their use
+const AstAttr::Context kLintScopeContexts = AstAttr::Context(
+    unsigned(AstAttr::Context::AnyFunction) | unsigned(AstAttr::Context::Class) | unsigned(AstAttr::Context::ClassField) |
+    unsigned(AstAttr::Context::Local)
+);
+
 AttributeEntry kAttributeEntries[] = {
     {"checked", AstAttr::Type::Checked, AstAttr::Context::AnyFunction, "functions", nullptr, {}},
     {"native", AstAttr::Type::Native, AstAttr::Context::AnyFunction, "functions", nullptr, {}},
     {"deprecated", AstAttr::Type::Deprecated, AstAttr::Context::Any, nullptr, kDeprecatedArgumentFields, deprecatedArgsValidator},
+    {"nolint", AstAttr::Type::Nolint, kLintScopeContexts, "functions, classes, class fields and locals", nullptr, lintNamesArgsValidator},
+    {"lint", AstAttr::Type::Lint, kLintScopeContexts, "functions, classes, class fields and locals", nullptr, lintOnArgsValidator},
+    {"nodiscard", AstAttr::Type::Nodiscard, AstAttr::Context::AnyFunction, "functions", nullptr, nodiscardArgsValidator},
     {nullptr, AstAttr::Type::Checked, AstAttr::Context::None, nullptr, nullptr, {}}
 };
 
@@ -490,6 +546,7 @@ Parser::Parser(const char* buffer, size_t bufferSize, AstNameTable& names, Alloc
     functionStack.push_back(top);
 
     nameSelf = names.getOrAdd("self");
+    nameContinue = names.getOrAdd("continue");
     nameNumber = names.getOrAdd("number");
     nameAny = names.getOrAdd("any");
     nameError = names.getOrAdd(kParseNameError);
@@ -535,12 +592,35 @@ AstStatBlock* Parser::parseChunk()
     AstStatBlock* result = parseBlock();
 
     if (lexer.current().type != Lexeme::Eof)
-        expectAndConsumeFail(Lexeme::Eof, nullptr);
+        reportLeftoverAtEndOfChunk();
+
+    resolveOrContinues();
 
     if (traitsEnabled())
         checkTraitsDeclaredBeforeUse(result);
 
     return result;
+}
+
+// Luwu: the chunk ended before the file did. An `end` noted after an if-else or `do` expression (noteStrayEnd) closed
+// an enclosing block early, leaving that block's own `end` (or `else`, `elseif`, `until`) over: blame the stray `end`,
+// or stay quiet when its error was already reported.
+void Parser::reportLeftoverAtEndOfChunk()
+{
+    if (blockFollow(lexer.current()) && !strayEnds.empty())
+    {
+        for (const StrayEnd& stray : strayEnds)
+        {
+            if (stray.reported)
+                return;
+        }
+
+        const StrayEnd& stray = strayEnds.front();
+        report(stray.location, "%s doesn't end with 'end'; this 'end' closes the block around it instead", stray.construct);
+        return;
+    }
+
+    expectAndConsumeFail(Lexeme::Eof, nullptr);
 }
 
 // Luwu Traits (rfcs/classes/traits.md): a class reads its traits when its statement runs, so a trait declared further down
@@ -589,12 +669,16 @@ AstStatBlock* Parser::parseBlock()
 
 static bool isStatLast(AstStat* stat)
 {
-    return stat->is<AstStatBreak>() || stat->is<AstStatContinue>() || stat->is<AstStatReturn>();
+    // Luwu Do Expressions (rfcs/do-expressions.md): `give` ends its block like `return`
+    return stat->is<AstStatBreak>() || stat->is<AstStatContinue>() || stat->is<AstStatReturn>() || stat->is<AstStatGive>();
 }
 
-AstStatBlock* Parser::parseBlockNoScope()
+AstStatBlock* Parser::parseBlockNoScope(bool doExprBody)
 {
     TempVector<AstStat*> body(scratchStat);
+
+    bool outerDoExprTopLevel = doExprTopLevel;
+    doExprTopLevel = doExprBody;
 
     bool outerBlockAllowsDeclarations = blockAllowsDeclarations;
     blockAllowsDeclarations = nextBlockAllowsDeclarations;
@@ -602,7 +686,7 @@ AstStatBlock* Parser::parseBlockNoScope()
 
     const Position prevPosition = lexer.previousLocation().end;
 
-    while (!blockFollow(lexer.current()))
+    while (!blockFollow(lexer.current()) && !(doExprBody && doExprBodyFollow(lexer.current())))
     {
         unsigned int oldRecursionCount = recursionCounter;
 
@@ -634,6 +718,7 @@ AstStatBlock* Parser::parseBlockNoScope()
     }
 
     blockAllowsDeclarations = outerBlockAllowsDeclarations;
+    doExprTopLevel = outerDoExprTopLevel;
 
     const Location location = Location(prevPosition, lexer.current().location.begin);
 
@@ -690,6 +775,23 @@ AstStat* Parser::parseStat()
     }
 
     Location start = lexer.current().location;
+
+    // Luwu Do Expressions (rfcs/do-expressions.md): inside a `do` expression, `give` and `continue` are hard keywords,
+    // decided on the token. Parsing a primary expression first, as for contextual keywords, would read
+    // `give (f)(x)` or `continue` followed by a line starting with `(` as a call.
+    if (functionStack.back().doExprDepth > 0 && lexer.current().type == Lexeme::Name)
+    {
+        AstName keyword(lexer.current().name);
+
+        if (keyword == "give")
+            return parseGive();
+
+        if (keyword == "continue")
+        {
+            nextLexeme();
+            return parseContinue(start);
+        }
+    }
 
     // Luwu Destructuring (rfcs/destructuring.md): `.{x} = t` with no `local`/`const`. Parsed as a `local` so the
     // rest of the file still sees its names.
@@ -802,7 +904,11 @@ AstStat* Parser::parseStat()
 
 
     if (ident == "continue")
+    {
+        // The statement keyword, which parsePrimaryExpr counted as a use of the name
+        continueNameUses--;
         return parseContinue(expr->location);
+    }
 
     if (ident == "const")
         return parseLocal(expr->location, expr->location, AstArray<AstAttr*>({nullptr, 0}), true);
@@ -814,6 +920,21 @@ AstStat* Parser::parseStat()
     if (start == lexer.current().location)
         nextLexeme();
 
+    // Luwu Do Expressions (rfcs/do-expressions.md): in a `do` expression, a value where a statement goes was usually meant
+    // as the result. The rest of an operator chain (`do x + 1`) is part of the same mistake, not more statements.
+    if (functionStack.back().doExprDepth > 0)
+    {
+        while (parseBinaryOp(lexer.current()))
+        {
+            nextLexeme();
+            parseExpr();
+        }
+
+        return reportStatError(
+            expr->location, copy({expr}), {}, "Incomplete statement: to give a value from a 'do' expression, write 'give <value>'"
+        );
+    }
+
     return reportStatError(expr->location, copy({expr}), {}, "Incomplete statement: expected assignment or a function call");
 }
 
@@ -824,7 +945,9 @@ AstStat* Parser::parseIf()
 
     nextLexeme(); // if / elseif
 
-    AstExpr* cond = parseExpr();
+    unsigned int localsBegin = saveLocals();
+    AstArray<AstIfClause> clauses{nullptr, 0};
+    AstExpr* cond = parseIfCondition(clauses);
 
     Lexeme matchThen = lexer.current();
     std::optional<Location> thenLocation;
@@ -832,6 +955,9 @@ AstStat* Parser::parseIf()
         thenLocation = matchThen.location;
 
     AstStatBlock* thenbody = parseBlock();
+
+    // Luwu If Local (rfcs/if-local.md): the chain's bindings end with the branch they guard
+    restoreLocals(localsBegin);
 
     AstStat* elsebody = nullptr;
     Location end = start;
@@ -875,7 +1001,211 @@ AstStat* Parser::parseIf()
             thenbody->hasEnd = hasEnd;
     }
 
-    return allocator.alloc<AstStatIf>(Location(start, end), cond, thenbody, elsebody, thenLocation, elseLocation, start);
+    AstStatIf* node = allocator.alloc<AstStatIf>(Location(start, end), cond, thenbody, elsebody, thenLocation, elseLocation, start);
+    node->clauses = clauses;
+    node->luwuOnly = clauses.size != 0;
+    return node;
+}
+
+// Luwu If Local (rfcs/if-local.md): parses an `if`/`elseif` condition, in a statement or an expression. An
+// ordinary condition is returned as is, with `clauses` left empty. A `when` chain fills `clauses` and returns
+// the first clause's expression. Each binding is pushed as soon as its initializer is parsed, so the clauses
+// after it and the branch can see it; the caller restores the locals after the branch.
+//
+// Upstream's `if local` (DebugLuauIfLocalSyntax, 0.737) takes a single binding and no `when`, and stores it as
+// AstStatIf::conditionLocal; it has no expression form. Luwu's chain covers it: `if local x = e then` is a
+// chain of one clause.
+//
+// condition ::= exp | clause {`when' clause}
+// clause ::= (`local' | `const') (binding | destructuring) `=' exp | exp
+AstExpr* Parser::parseIfCondition(AstArray<AstIfClause>& clauses)
+{
+    Location start = lexer.current().location;
+    AstExpr* plainFirst = nullptr;
+
+    if (!ifBindingFollows())
+    {
+        plainFirst = parseExpr();
+
+        if (!whenFollows())
+            return plainFirst;
+    }
+
+    std::vector<AstIfClause> chain;
+    std::optional<Location> whenLocation;
+
+    while (true)
+    {
+        if (plainFirst)
+        {
+            AstIfClause clause;
+            clause.expr = plainFirst;
+            chain.push_back(clause);
+            plainFirst = nullptr;
+        }
+        else if (ifBindingFollows())
+        {
+            parseIfBindingClause(chain, whenLocation);
+        }
+        else
+        {
+            AstIfClause clause;
+            clause.expr = parseExpr();
+            clause.whenLocation = whenLocation;
+            chain.push_back(clause);
+        }
+
+        if (!whenFollows())
+            break;
+
+        whenLocation = lexer.current().location;
+        nextLexeme();
+    }
+
+    // On the first keyword only Luwu has: the first binding's `local`/`const`, or the first `when`
+    if (!FFlag::LuwuIfLocal)
+    {
+        const AstIfClause& first = chain.front();
+        Location keyword = start;
+
+        if (first.declaration && first.declaration->keywordLocation)
+            keyword = *first.declaration->keywordLocation;
+        else if (chain.size() > 1 && chain[1].whenLocation)
+            keyword = *chain[1].whenLocation;
+
+        report(keyword, "'if local' and 'when' are Luwu features; enable the 'LuwuIfLocal' fast flag to use them");
+    }
+
+    clauses = copy(chain.data(), chain.size());
+    return clauses.data[0].expr;
+}
+
+// Luwu If Local (rfcs/if-local.md): parses one `local`/`const` clause, from the keyword through its value, and
+// appends it to `chain`. A destructuring clause appends one clause per name it binds.
+void Parser::parseIfBindingClause(std::vector<AstIfClause>& chain, const std::optional<Location>& whenLocation)
+{
+    bool isConst = lexer.current().type != Lexeme::ReservedLocal;
+    const char* keyword = isConst ? "const" : "local";
+    Location keywordLocation = lexer.current().location;
+    nextLexeme(); // local / const
+
+    if (destructuringFollows())
+    {
+        DestructureTarget target;
+        Location equalsLocation;
+        AstExpr* value = parseDestructuringDeclaration(keywordLocation, target, equalsLocation);
+        Location location(keywordLocation, value->location);
+
+        std::vector<AstStat*> statements;
+        AstDestructurePattern pattern = desugarDestructuring(target, value, location, equalsLocation, isConst, statements);
+
+        AstStatLocal* first = statements.front()->as<AstStatLocal>();
+        LUAU_ASSERT(first);
+        first->keywordLocation = keywordLocation;
+        first->destructure = allocator.alloc<AstDestructurePattern>(pattern);
+
+        // Each desugared `local name = read` becomes a clause, so every name has to be truthy for the branch to run.
+        for (AstStat* statement : statements)
+        {
+            AstStatLocal* declaration = statement->as<AstStatLocal>();
+            LUAU_ASSERT(declaration && declaration->vars.size == 1 && declaration->values.size == 1);
+
+            declaration->luwuOnly = true;
+            if (declaration != first)
+                declaration->destructuredFrom = first;
+
+            AstIfClause clause;
+            clause.declaration = declaration;
+            clause.local = declaration->vars.data[0];
+            clause.expr = declaration->values.data[0];
+            clause.whenLocation = declaration == first ? whenLocation : std::nullopt;
+            chain.push_back(clause);
+        }
+
+        return;
+    }
+
+    Binding binding = parseBinding(isConst);
+    bool extraNames = lexer.current().type == ',';
+
+    if (extraNames)
+    {
+        Location extra = lexer.current().location;
+        TempVector<Binding> rest(scratchBinding);
+        nextLexeme();
+        parseBindingList(rest, false, false, nullptr, nullptr, nullptr, isConst);
+        report(
+            Location(extra, lexer.previousLocation()),
+            "'if %s' binds one name; bind the next one in a 'when' clause: 'if %s a = x() when %s b = y() then'",
+            keyword,
+            keyword,
+            keyword
+        );
+    }
+
+    std::optional<Location> equalsLocation;
+    AstExpr* value = nullptr;
+
+    if (lexer.current().type == '=')
+    {
+        equalsLocation = lexer.current().location;
+        nextLexeme();
+        value = parseExpr();
+    }
+    else
+    {
+        value = reportExprError(lexer.current().location, {}, "Expected '=' and a value after '%s %s'", keyword, binding.name.name.value);
+    }
+
+    if (lexer.current().type == ',')
+    {
+        Location extra = lexer.current().location;
+        TempVector<AstExpr*> rest(scratchExpr);
+        nextLexeme();
+        parseExprList(rest);
+
+        // `if local a, b = x(), y()` already got the error that says how to bind both
+        if (!extraNames)
+            report(Location(extra, lexer.previousLocation()), "'if %s' takes exactly one value", keyword);
+    }
+
+    AstLocal* local = pushLocal(binding);
+    AstStatLocal* declaration =
+        allocator.alloc<AstStatLocal>(Location(keywordLocation, value->location), copy({local}), copy({value}), equalsLocation, isConst);
+    declaration->keywordLocation = keywordLocation;
+
+    AstIfClause clause;
+    clause.declaration = declaration;
+    clause.local = local;
+    clause.expr = value;
+    clause.whenLocation = whenLocation;
+    chain.push_back(clause);
+}
+
+// Luwu If Local (rfcs/if-local.md): does a `local`/`const` binding clause start here? `local` is reserved, but
+// `const` is not: `if const then`, `if const.x then` and `if const {1} then` read a variable named `const`.
+// `const name` and `const .{` can't start an expression, so only those are bindings.
+bool Parser::ifBindingFollows()
+{
+    if (lexer.current().type == Lexeme::ReservedLocal)
+        return true;
+
+    if (lexer.current().type != Lexeme::Name || AstName(lexer.current().name) != "const")
+        return false;
+
+    Lexeme next = lexer.lookahead();
+
+    if (next.type == Lexeme::Name)
+        return true;
+
+    return next.type == '.' && lexer.lookaheadSecond().type == '{';
+}
+
+// Luwu If Local (rfcs/if-local.md): `when` is only a keyword right after a clause in a condition, where a name
+// can't continue the expression.
+bool Parser::whenFollows()
+{
+    return lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "when";
 }
 
 // while exp do block end
@@ -1341,7 +1671,8 @@ void Parser::parseAttrList(TempVector<AstAttr*>& attributes, TempVector<CstAttrL
                 auto [args, argsLocation, _exprLocation] =
                     options.storeCstData ? parseCallList(&argCommaPositions, &closeParenPosition) : parseCallList(nullptr, nullptr);
 
-                reportNonLiteralAttributeArgs(args, argsLocation);
+                if (!takesNameArguments(attrName))
+                    reportNonLiteralAttributeArgs(args, argsLocation);
 
                 std::optional<AstAttr::Type> type = validateAttribute(nameLoc, attrName, attributes, args, context);
 
@@ -1494,7 +1825,8 @@ void Parser::parseAttribute_DEPRECATED(TempVector<AstAttr*>& attributes, AstAttr
 
                     auto [args, argsLocation, _exprLocation] = parseCallList(nullptr);
 
-                    reportNonLiteralAttributeArgs(args, argsLocation);
+                    if (!takesNameArguments(attrName))
+                        reportNonLiteralAttributeArgs(args, argsLocation);
 
                     std::optional<AstAttr::Type> type = validateAttribute(nameLoc, attrName, attributes, args, context);
 
@@ -1995,47 +2327,10 @@ AstStat* Parser::parseDestructuring(const Location& start, const Location& keywo
 {
     DestructureTarget target;
     target.name = name;
-    if (!target.name && lexer.current().type == Lexeme::Name)
-        target.name = parseName("variable name");
 
-    // JavaScript's `local {x, y} = t`
-    if (lexer.current().type == '{')
-        report(lexer.current().location, "Destructuring needs a '.' before '{': 'local .{x, y} = t'");
-
-    parseDestructurePattern(target);
-
-    if (lexer.current().type == ':')
-    {
-        nextLexeme();
-        target.annotation = parseType();
-    }
-
-    Location equalsLocation = lexer.current().location;
-    AstExpr* value = nullptr;
-
-    if (lexer.current().type == '=')
-    {
-        nextLexeme();
-        value = parseExpr();
-    }
-    else
-    {
-        value = reportExprError(lexer.current().location, {}, "Expected '=' and a value after the destructuring pattern");
-    }
-
-    if (lexer.current().type == ',')
-    {
-        Location extra = lexer.current().location;
-        TempVector<AstExpr*> rest(scratchExpr);
-        nextLexeme();
-        parseExprList(rest);
-        report(Location(extra, lexer.previousLocation()), "A destructuring declaration takes exactly one value");
-    }
-
+    Location equalsLocation;
+    AstExpr* value = parseDestructuringDeclaration(start, target, equalsLocation);
     Location location(start, value->location);
-
-    if (!FFlag::LuwuDestructuring)
-        report(location, "Destructuring is a Luwu feature; enable the 'LuwuDestructuring' fast flag to use it");
 
     std::vector<AstStat*> statements;
     AstDestructurePattern pattern = desugarDestructuring(target, value, location, equalsLocation, isConst, statements);
@@ -2057,6 +2352,54 @@ AstStat* Parser::parseDestructuring(const Location& start, const Location& keywo
     pendingStatements.insert(pendingStatements.end(), statements.begin() + 1, statements.end());
 
     return first;
+}
+
+// Parses everything after the `local`/`const` keyword of a destructuring binding: the optional name (unless the
+// caller already parsed it into `target`), the pattern, an optional annotation, `=` and the value. Returns the
+// value. `start` is where the declaration starts. Shared by destructuring declarations and `if local` clauses.
+AstExpr* Parser::parseDestructuringDeclaration(const Location& start, DestructureTarget& target, Location& equalsLocation)
+{
+    if (!target.name && lexer.current().type == Lexeme::Name)
+        target.name = parseName("variable name");
+
+    // JavaScript's `local {x, y} = t`
+    if (lexer.current().type == '{')
+        report(lexer.current().location, "Destructuring needs a '.' before '{': 'local .{x, y} = t'");
+
+    parseDestructurePattern(target);
+
+    if (lexer.current().type == ':')
+    {
+        nextLexeme();
+        target.annotation = parseType();
+    }
+
+    equalsLocation = lexer.current().location;
+    AstExpr* value = nullptr;
+
+    if (lexer.current().type == '=')
+    {
+        nextLexeme();
+        value = parseExpr();
+    }
+    else
+    {
+        value = reportExprError(lexer.current().location, {}, "Expected '=' and a value after the destructuring pattern");
+    }
+
+    if (lexer.current().type == ',')
+    {
+        Location extra = lexer.current().location;
+        TempVector<AstExpr*> rest(scratchExpr);
+        nextLexeme();
+        parseExprList(rest);
+        report(Location(extra, lexer.previousLocation()), "A destructuring declaration takes exactly one value");
+    }
+
+    if (!FFlag::LuwuDestructuring)
+        report(Location(start, value->location), "Destructuring is a Luwu feature; enable the 'LuwuDestructuring' fast flag to use it");
+
+    return value;
 }
 
 // Parses `.{ fieldlist }` into `target`, starting at the `.` (or at the `{`, when the caller already reported
@@ -2322,14 +2665,28 @@ AstStat* Parser::parseReturn()
     TempVector<AstExpr*> list(scratchExpr);
     TempVector<Position> commaPositions(scratchPosition);
 
-    if (!blockFollow(lexer.current()) && lexer.current().type != ';')
+    // Luwu Do Expressions (rfcs/do-expressions.md): `(do return)` has no values; the `)` belongs to the expression
+    bool endsDoExpr = functionStack.back().doExprDepth > 0 && doExprBodyFollow(lexer.current());
+
+    if (!blockFollow(lexer.current()) && lexer.current().type != ';' && !endsDoExpr)
         parseExprList(list, options.storeCstData ? &commaPositions : nullptr);
 
+    return finishReturn(start, list, commaPositions);
+}
+
+// Builds a `return` statement from its parsed values, for parseReturn and the `or return` shorthand.
+AstStatReturn* Parser::finishReturn(const Location& start, TempVector<AstExpr*>& list, TempVector<Position>& commaPositions)
+{
     Location end = list.empty() ? start : list.back()->location;
 
     AstStatReturn* node = allocator.alloc<AstStatReturn>(Location(start, end), copy(list), start);
     if (options.storeCstData)
         cstNodeMap[node] = allocator.alloc<CstStatReturn>(copy(commaPositions));
+
+    // Luwu Do Expressions (rfcs/do-expressions.md): only a `do` expression (or `or return`) can put a `return` in a
+    // default value
+    if (functionStack.back().defaultValue)
+        report(node->location, "A default value can't 'return': it runs before the function's body does");
 
     if (FFlag::LuauExportValueSyntax && functionStack.size() == 1)
     {
@@ -2452,6 +2809,7 @@ LUAU_NOINLINE AstClassPrimaryConstructor* Parser::parseClassPrimaryConstructor(
     // dummyFunction push.
     static Function dummyFunction;
     functionStack.emplace_back(dummyFunction);
+    functionStack.back().defaultValue = true;
 
     while (lexer.current().type != ')')
     {
@@ -3192,6 +3550,7 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(
                 // push for default argument expressions elsewhere in this file).
                 static Function dummyFunction;
                 functionStack.emplace_back(dummyFunction);
+                functionStack.back().defaultValue = true;
 
                 // A field initializer is the only place a primary constructor's parameters are
                 // visible; they are not in scope for the class's methods.
@@ -3589,6 +3948,7 @@ AstArray<AstClassTraitRef> Parser::parseClassTraitRefs(bool allowArgs, AstClassP
             // scope, like a field default; they get the same function depth for the same reason (see parseClassStat).
             static Function dummyFunction;
             functionStack.emplace_back(dummyFunction);
+            functionStack.back().defaultValue = true;
 
             unsigned int localsBegin = saveLocals();
 
@@ -4803,6 +5163,7 @@ Parser::Binding Parser::parseBinding(bool isConst, bool allowDefault, bool allow
         // is not legal in a default argument expression.
         static Function dummyFunction;
         functionStack.emplace_back(dummyFunction);
+        functionStack.back().defaultValue = true;
 
         defaultValue = parseExpr();
 
@@ -6089,9 +6450,18 @@ AstExpr* Parser::parseExpr(unsigned int limit)
         nextLexeme();
 
         // read sub-expression with higher priority
-        AstExpr* next = parseExpr(binaryPriority[*op].right);
+        AstExpr* next = nullptr;
+
+        // Luwu Do Expressions (rfcs/do-expressions.md): `x or return v`, `x or break`, `x or continue`
+        bool orContinue = *op == AstExprBinary::Or && orContinueFollows();
+        if (*op == AstExprBinary::Or && (orLeaveFollows() || orContinue))
+            next = parseOrLeave();
+        else
+            next = parseExpr(binaryPriority[*op].right);
 
         expr = allocator.alloc<AstExprBinary>(Location(start, next->location), *op, expr, next);
+        if (orContinue)
+            orContinues.push_back(&static_cast<AstExprBinary*>(expr)->right);
         if (options.storeCstData)
             cstNodeMap[expr] = allocator.alloc<CstExprOp>(opPosition);
         op = parseBinaryOp(lexer.current());
@@ -6115,6 +6485,11 @@ AstExpr* Parser::parseNameExpr(const char* context)
 
     if (!name)
         return allocator.alloc<AstExprError>(lexer.current().location, copy<AstExpr*>({}), unsigned(parseErrors.size() - 1));
+
+    checkDoExprKeywordAsName(*name);
+
+    if (name->name == "continue")
+        continueNameUses++;
 
     AstLocal* const* value = localMap.find(name->name);
 
@@ -6141,7 +6516,12 @@ AstExpr* Parser::parsePrefixExpr()
         MatchLexeme matchParen = lexer.current();
         nextLexeme();
 
+        std::optional<Position> outerParenthesizedExprStart = parenthesizedExprStart;
+        parenthesizedExprStart = lexer.current().location.begin;
+
         AstExpr* expr = parseExpr();
+
+        parenthesizedExprStart = outerParenthesizedExprStart;
 
         Position end = lexer.current().location.end;
 
@@ -6554,6 +6934,10 @@ AstExpr* Parser::parseSimpleExpr()
     {
         return parseIfElseExpr();
     }
+    else if (lexer.current().type == Lexeme::ReservedDo)
+    {
+        return parseDoExpr();
+    }
     else
     {
         return parsePrimaryExpr(/* asStatement= */ false);
@@ -6719,10 +7103,23 @@ AstExpr* Parser::parseTableConstructor()
     // Clip with LuauTableEntriesDontNeedToMatchIndent
     unsigned lastElementIndent_DEPRECATED = 0;
 
+    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): `for` can't start an expression, so a table that
+    // starts with it is a comprehension.
+    if (lexer.current().type == Lexeme::ReservedFor)
+        return parseTableComprehension(start, matchBrace);
+
     while (lexer.current().type != '}')
     {
         if (!FFlag::LuauTableEntriesDontNeedToMatchIndent)
             lastElementIndent_DEPRECATED = lexer.current().location.begin.column;
+
+        if (lexer.current().type == Lexeme::ReservedFor)
+        {
+            report(lexer.current().location, "A table comprehension must be the only item in its table");
+            AstExpr* comprehension = parseTableComprehension(lexer.current().location, lexer.current());
+            items.push_back({AstExprTable::Item::Kind::List, nullptr, comprehension});
+            break;
+        }
 
         AstArray<AstAttr*> attributes{nullptr, 0};
         TempVector<CstAttrList*> cstAttrLists(scratchCstAttrList);
@@ -6846,6 +7243,280 @@ AstExpr* Parser::parseTableConstructor()
     return node;
 }
 
+// Luwu Table Comprehensions (rfcs/table-comprehensions.md):
+// comprehension ::= `{' clause {clause} `give' item `}'
+// clause ::= `for' binding `=' exp `,' exp [`,' exp] {`when' condition}
+//          | `for' bindinglist `in' explist {`when' condition}
+// item ::= exp | `[' exp `]' `=' exp | `[' exp `]' compoundop exp
+// Starts at `for`; `start` and `matchBrace` are the `{`. Builds the loop the comprehension runs (see
+// AstExprTableComprehension) and consumes the closing `}`.
+AstExpr* Parser::parseTableComprehension(const Location& start, const MatchLexeme& matchBrace)
+{
+    if (!FFlag::LuwuTableComprehensions)
+        report(
+            lexer.current().location,
+            "Table comprehensions are a Luwu feature; enable the 'LuwuTableComprehensions' fast flag to use them"
+        );
+
+    struct Clause
+    {
+        Location forLocation;
+        // Numeric clause: `var`, `from`, `to` and `step` (step may be null).
+        AstLocal* var = nullptr;
+        AstExpr* from = nullptr;
+        AstExpr* to = nullptr;
+        AstExpr* step = nullptr;
+        // Generic clause.
+        AstArray<AstLocal*> vars{nullptr, 0};
+        AstArray<AstExpr*> values{nullptr, 0};
+        bool hasIn = false;
+        Location inLocation;
+        // The `when` chain: clauses and where it starts. Empty without one.
+        AstArray<AstIfClause> when{nullptr, 0};
+        Location whenLocation;
+        // The loop's CST node, when CST data is stored.
+        CstNode* cst = nullptr;
+    };
+
+    std::vector<Clause> clauses;
+    unsigned int localsBegin = saveLocals();
+    unsigned int loopDepthBefore = functionStack.back().loopDepth;
+
+    while (lexer.current().type == Lexeme::ReservedFor)
+    {
+        Clause clause;
+        clause.forLocation = lexer.current().location;
+        nextLexeme(); // for
+
+        Binding varname = parseBinding();
+
+        if (lexer.current().type == '=')
+        {
+            Position equalsPosition = lexer.current().location.begin;
+            nextLexeme();
+            clause.from = parseExpr();
+
+            bool hasEndComma = expectAndConsume(',', "index range");
+            Position endCommaPosition = hasEndComma ? lexer.previousLocation().begin : Position::missing();
+            clause.to = parseExpr();
+
+            Position stepCommaPosition = Position::missing();
+            if (lexer.current().type == ',')
+            {
+                stepCommaPosition = lexer.current().location.begin;
+                nextLexeme();
+                clause.step = parseExpr();
+            }
+
+            clause.var = pushLocal(varname);
+
+            if (options.storeCstData)
+                clause.cst = allocator.alloc<CstStatFor>(varname.colonPosition, equalsPosition, endCommaPosition, stepCommaPosition);
+        }
+        else
+        {
+            TempVector<Binding> names(scratchBinding);
+            AstArray<Position> varsCommaPosition;
+            names.push_back(varname);
+
+            if (lexer.current().type == ',')
+            {
+                if (options.storeCstData)
+                {
+                    Position initialCommaPosition = lexer.current().location.begin;
+                    nextLexeme();
+                    parseBindingList(names, false, false, &varsCommaPosition, &initialCommaPosition);
+                }
+                else
+                {
+                    nextLexeme();
+                    parseBindingList(names);
+                }
+            }
+
+            clause.inLocation = lexer.current().location;
+            clause.hasIn = expectAndConsume(Lexeme::ReservedIn, "table comprehension");
+
+            TempVector<AstExpr*> values(scratchExpr);
+            TempVector<Position> valuesCommaPositions(scratchPosition);
+            parseExprList(values, options.storeCstData ? &valuesCommaPositions : nullptr);
+            clause.values = copy(values);
+
+            TempVector<AstLocal*> vars(scratchLocal);
+            for (const Binding& name : names)
+                vars.push_back(pushLocal(name));
+            clause.vars = copy(vars);
+
+            if (options.storeCstData)
+                clause.cst =
+                    allocator.alloc<CstStatForIn>(extractAnnotationColonPositions(names), varsCommaPosition, copy(valuesCommaPositions));
+        }
+
+        // Everything after the iterator belongs to this clause's loop: `continue` in a `when` skips the element.
+        functionStack.back().loopDepth++;
+
+        if (whenFollows())
+        {
+            clause.whenLocation = lexer.current().location;
+            std::vector<AstIfClause> chain;
+            std::optional<Location> whenLocation;
+
+            while (whenFollows())
+            {
+                whenLocation = lexer.current().location;
+                nextLexeme(); // when
+
+                if (ifBindingFollows())
+                {
+                    parseIfBindingClause(chain, whenLocation);
+                }
+                else
+                {
+                    AstIfClause plain;
+                    plain.expr = parseExpr();
+                    plain.whenLocation = whenLocation;
+                    chain.push_back(plain);
+                }
+            }
+
+            clause.when = copy(chain.data(), chain.size());
+        }
+
+        clauses.push_back(clause);
+    }
+
+    // `give` is contextual here: after an expression list or a `when` condition, a bare name can't continue it
+    Location doLocation = lexer.current().location;
+    bool giveFollows = lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "give";
+
+    if (giveFollows)
+    {
+        nextLexeme();
+    }
+    else if (lexer.current().type == Lexeme::ReservedDo)
+    {
+        // `do` would read as a loop body; a comprehension gives one item
+        report(lexer.current().location, "A table comprehension's item follows 'give', not 'do'");
+        nextLexeme();
+    }
+    else
+    {
+        report(lexer.current().location, "Expected 'give' when parsing table comprehension, got %s", lexer.current().toString().c_str());
+    }
+
+    AstExpr* key = nullptr;
+    AstExpr* value = nullptr;
+    std::optional<AstExprBinary::Op> accumulate;
+    Location itemStart = lexer.current().location;
+
+    CstExprTable::Item cstItem{Position::missing(), Position::missing(), Position::missing(), CstExprTable::Separator::Missing, Position::missing()};
+
+    if (lexer.current().type == '[')
+    {
+        cstItem.indexerOpenPosition = lexer.current().location.begin;
+        MatchLexeme matchBracket = lexer.current();
+        nextLexeme();
+        key = parseExpr();
+
+        if (expectMatchAndConsume(']', matchBracket))
+            cstItem.indexerClosePosition = lexer.previousLocation().begin;
+
+        // `[k] += v` accumulates into the key; only operators with a natural starting value are allowed
+        if (std::optional<AstExprBinary::Op> op = parseCompoundOp(lexer.current()))
+        {
+            bool hasStart = *op == AstExprBinary::Add || *op == AstExprBinary::Sub || *op == AstExprBinary::Mul || *op == AstExprBinary::Concat;
+            if (!hasStart)
+                report(lexer.current().location, "A table comprehension can accumulate with '+=', '-=', '*=' or '..=', not '%s='", toString(*op).c_str());
+
+            accumulate = op;
+            cstItem.equalsPosition = lexer.current().location.begin;
+            nextLexeme();
+        }
+        else if (expectAndConsume('=', "table comprehension item"))
+        {
+            cstItem.equalsPosition = lexer.previousLocation().begin;
+        }
+
+        value = parseExpr();
+    }
+    else if (lexer.current().type == Lexeme::Name && lexer.lookahead().type == '=')
+    {
+        // `name = v` would write the same key on every iteration.
+        report(lexer.current().location, "A table comprehension's item is a value or '[key] = value'; 'name = value' writes one key");
+        nextLexeme();
+        nextLexeme();
+        value = parseExpr();
+    }
+    else
+    {
+        value = parseExpr();
+    }
+
+    functionStack.back().loopDepth = loopDepthBefore;
+    restoreLocals(localsBegin);
+
+    Location end = lexer.current().location;
+
+    if (lexer.current().type == ',' || lexer.current().type == ';')
+        report(lexer.current().location, "A table comprehension must be the only item in its table");
+
+    if (!expectMatchAndConsume('}', matchBrace))
+        end = lexer.previousLocation();
+
+    Location itemLocation(itemStart, value->location);
+    AstStatComprehensionItem* item = allocator.alloc<AstStatComprehensionItem>(itemLocation, key, value);
+    item->accumulate = accumulate;
+    item->luwuOnly = true;
+
+    // Build the loops from the innermost clause out.
+    AstStat* inner = item;
+
+    for (size_t i = clauses.size(); i-- > 0;)
+    {
+        const Clause& clause = clauses[i];
+        Location loopLocation(clause.forLocation, itemLocation);
+
+        AstStatBlock* body = allocator.alloc<AstStatBlock>(inner->location, copy(&inner, 1), false);
+
+        if (clause.when.size != 0)
+        {
+            AstStatIf* guard = allocator.alloc<AstStatIf>(
+                Location(clause.whenLocation, inner->location), clause.when.data[0].expr, body, nullptr, std::nullopt, std::nullopt, clause.whenLocation
+            );
+            // a single plain condition is an ordinary `if`, which gets every shortcut an ordinary condition does (constant
+            // folding, fused compares); a chain with a binding or several conditions keeps its clauses
+            bool plainCondition = clause.when.size == 1 && !clause.when.data[0].declaration;
+            if (!plainCondition)
+                guard->clauses = clause.when;
+            guard->luwuOnly = true;
+            body = allocator.alloc<AstStatBlock>(guard->location, copy({static_cast<AstStat*>(guard)}), false);
+        }
+
+        if (clause.var)
+            inner = allocator.alloc<AstStatFor>(
+                loopLocation, clause.var, clause.from, clause.to, clause.step, body, true, doLocation, clause.forLocation
+            );
+        else
+            inner = allocator.alloc<AstStatForIn>(
+                loopLocation, clause.vars, clause.values, body, clause.hasIn, clause.inLocation, true, doLocation, clause.forLocation
+            );
+
+        inner->luwuOnly = true;
+
+        if (clause.cst)
+            cstNodeMap[inner] = clause.cst;
+    }
+
+    AstExprTableComprehension* node =
+        allocator.alloc<AstExprTableComprehension>(Location(start, end), inner, item, unsigned(clauses.size()));
+    node->luwuOnly = true;
+
+    // the item's `[`, `]` and `=`, in the table constructor's own CST shape
+    if (options.storeCstData)
+        cstNodeMap[node] = allocator.alloc<CstExprTable>(copy(&cstItem, 1));
+    return node;
+}
+
 AstExpr* Parser::parseIfElseExpr()
 {
     bool hasElse = false;
@@ -6853,13 +7524,32 @@ AstExpr* Parser::parseIfElseExpr()
 
     nextLexeme(); // skip if / elseif
 
-    AstExpr* condition = parseExpr();
+    unsigned int localsBegin = saveLocals();
+    AstArray<AstIfClause> clauses{nullptr, 0};
+    AstExpr* condition = parseIfCondition(clauses);
 
-    bool hasThen = expectAndConsume(Lexeme::ReservedThen, "if then else expression");
+    // Luwu: a missing `then` or `else` is reported on the `if`/`elseif` keyword, and the arm it would start isn't parsed.
+    // Upstream reports it on whatever token follows and parses that token onwards as the arm, which, while the
+    // expression is still being written, swallows the next statement and paints it as an error.
+    IfElseKeyword thenKeyword = expectIfElseKeyword(Lexeme::ReservedThen, start);
+    bool hasThen = thenKeyword == IfElseKeyword::Found;
     std::optional<Location> thenLocation = hasThen ? std::optional<Location>(lexer.previousLocation()) : std::nullopt;
     Position thenPosition = hasThen ? lexer.previousLocation().begin : Position::missing();
 
-    AstExpr* trueExpr = parseExpr();
+    // Luwu Do Expressions (rfcs/do-expressions.md): `then break`, `then return v`, `then continue`
+    bool thenContinue = thenKeyword != IfElseKeyword::Missing && orContinueFollows();
+    bool thenLeaves = thenKeyword != IfElseKeyword::Missing && (orLeaveFollows() || thenContinue);
+
+    AstExpr* trueExpr = nullptr;
+    if (thenKeyword == IfElseKeyword::Missing)
+        trueExpr = missingIfElseArm();
+    else if (thenLeaves)
+        trueExpr = parseOrLeave("then");
+    else
+        trueExpr = parseExpr();
+
+    // Luwu If Local (rfcs/if-local.md): the chain's bindings end with the branch they guard
+    restoreLocals(localsBegin);
     AstExpr* falseExpr = nullptr;
 
     Position elsePosition = lexer.current().location.begin;
@@ -6867,7 +7557,12 @@ AstExpr* Parser::parseIfElseExpr()
     // token, so this node has no `else` keyword of its own to record.
     std::optional<Location> elseLocation = std::nullopt;
     bool isElseIf = false;
-    if (lexer.current().type == Lexeme::ReservedElseif)
+    bool elseContinue = false;
+    if (thenKeyword == IfElseKeyword::Missing)
+    {
+        falseExpr = missingIfElseArm();
+    }
+    else if (lexer.current().type == Lexeme::ReservedElseif)
     {
         unsigned int oldRecursionCount = recursionCounter;
         incrementRecursionCounter("expression");
@@ -6878,19 +7573,412 @@ AstExpr* Parser::parseIfElseExpr()
     }
     else
     {
-        hasElse = expectAndConsume(Lexeme::ReservedElse, "if then else expression");
+        IfElseKeyword elseKeyword = expectIfElseKeyword(Lexeme::ReservedElse, start);
+        hasElse = elseKeyword == IfElseKeyword::Found;
         if (hasElse)
             elseLocation = lexer.previousLocation();
-        falseExpr = parseExpr();
+
+        // Luwu Do Expressions (rfcs/do-expressions.md): `else break`, `else return v`, `else continue`
+        elseContinue = elseKeyword != IfElseKeyword::Missing && orContinueFollows();
+        bool elseLeaves = elseKeyword != IfElseKeyword::Missing && (orLeaveFollows() || elseContinue);
+
+        if (elseKeyword == IfElseKeyword::Missing)
+            falseExpr = missingIfElseArm();
+        else if (elseLeaves)
+            falseExpr = parseOrLeave("else");
+        else
+            falseExpr = parseExpr();
     }
 
     Location end = falseExpr->location;
 
+    if (!isElseIf)
+        noteStrayEnd("An if-else expression", /* reported= */ false);
+
     AstExprIfElse* node =
         allocator.alloc<AstExprIfElse>(Location(start, end), condition, hasThen, trueExpr, hasElse, falseExpr, start, thenLocation, elseLocation);
+    if (thenContinue)
+        orContinues.push_back(&node->trueExpr);
+    if (elseContinue)
+        orContinues.push_back(&node->falseExpr);
+    node->clauses = clauses;
+    node->luwuOnly = clauses.size != 0;
     if (options.storeCstData)
         cstNodeMap[node] = allocator.alloc<CstExprIfElse>(thenPosition, elsePosition, isElseIf);
     return node;
+}
+
+// Luwu: `then` or `else` in an if-else expression. Present, it is consumed. One stray token before it is skipped, as
+// upstream's expectAndConsume does. Missing, the error goes on `keyword` (the `if` or `elseif`), and what follows is
+// parsed as the arm only when it is a value on the same line (`if a 1 else 2`, a typo). Anything else, such as the
+// next line while the expression is still being written, is left alone.
+Parser::IfElseKeyword Parser::expectIfElseKeyword(Lexeme::Type type, const Location& keyword)
+{
+    if (lexer.current().type == type)
+    {
+        nextLexeme();
+        return IfElseKeyword::Found;
+    }
+
+    if (lexer.lookahead().type == type)
+    {
+        expectAndConsumeFailWithLookahead(type, "if then else expression");
+        return IfElseKeyword::Recovered;
+    }
+
+    if (lexer.current().type == Lexeme::ReservedEnd)
+    {
+        std::string typeString = Lexeme(Location(Position(0, 0), 0), type).toString();
+        report(keyword, "Expected %s when parsing if then else expression, got 'end'; an if-else expression doesn't end with 'end'", typeString.c_str());
+        noteStrayEnd("An if-else expression", /* reported= */ true);
+        return IfElseKeyword::Missing;
+    }
+
+    reportExpected(keyword, type, "if then else expression");
+
+    bool armOnSameLine = lexer.current().location.begin.line == lexer.previousLocation().end.line && !valueEnds(lexer.current());
+    return armOnSameLine ? IfElseKeyword::Recovered : IfElseKeyword::Missing;
+}
+
+// Luwu: an `end` right after an if-else or `do` expression, which takes none. It may still close an enclosing block
+// legitimately (`return if a then 1 else 2` and then the function's `end`), so it is only noted here, and blamed when
+// the file turns out to have an `end` left over (see parseChunk). `reported` means an error already explains it.
+void Parser::noteStrayEnd(const char* construct, bool reported)
+{
+    if (lexer.current().type == Lexeme::ReservedEnd)
+        strayEnds.push_back({lexer.current().location, construct, reported});
+}
+
+// Luwu: the arm of an if-else expression whose `then` or `else` is missing: empty, at the current token
+AstExpr* Parser::missingIfElseArm()
+{
+    Position at = lexer.current().location.begin;
+    return allocator.alloc<AstExprError>(Location(at, at), copy<AstExpr*>({}), unsigned(parseErrors.size() - 1));
+}
+
+// Luwu Do Expressions (rfcs/do-expressions.md): `do block`, where the block ends in `give exp`, `return`, `break` or
+// `continue`. That last statement is how the parser knows where the expression ends, since there is no `end`.
+AstExpr* Parser::parseDoExpr()
+{
+    Location start = lexer.current().location;
+    bool directlyParenthesized = parenthesizedExprStart == start.begin;
+
+    nextLexeme(); // do
+
+    // `do 1`, `do "x"`, `do {}`: a value can't start a statement, so it was meant as the result. Report it once and
+    // parse it as that `give`, so nothing after it cascades.
+    Lexeme::Type next = lexer.current().type;
+    bool valueStarts = next == Lexeme::Number || next == Lexeme::QuotedString || next == Lexeme::RawString || next == Lexeme::InterpStringBegin ||
+                       next == Lexeme::InterpStringSimple || next == '{' || next == '-' || next == '#' || next == Lexeme::ReservedNot ||
+                       next == Lexeme::ReservedTrue || next == Lexeme::ReservedFalse || next == Lexeme::ReservedNil || next == Lexeme::Dot3;
+
+    if (valueStarts)
+    {
+        report(lexer.current().location, "A 'do' expression's block holds statements; to give a value, write 'do give <value>'");
+
+        AstExpr* value = parseExpr();
+        AstStatGive* give = allocator.alloc<AstStatGive>(value->location, value);
+        AstStatBlock* body = allocator.alloc<AstStatBlock>(value->location, copy<AstStat*>({give}));
+        AstExprDo* node = allocator.alloc<AstExprDo>(Location(start, value->location), body);
+        node->luwuOnly = true;
+        return node;
+    }
+
+    // Nothing inside the `do` is parenthesized by the `(` around it
+    std::optional<Position> outerParenthesizedExprStart = parenthesizedExprStart;
+    parenthesizedExprStart.reset();
+
+    functionStack.back().doExprDepth++;
+    unsigned int localsBegin = saveLocals();
+    size_t errorsBefore = parseErrors.size();
+
+    AstStatBlock* body = parseBlockNoScope(/* doExprBody= */ true);
+
+    restoreLocals(localsBegin);
+    functionStack.back().doExprDepth--;
+    parenthesizedExprStart = outerParenthesizedExprStart;
+
+    AstStat* last = body->body.size != 0 ? body->body.data[body->body.size - 1] : nullptr;
+    Location location(start, last ? last->location : start);
+
+    // A `break` or `continue` outside a loop has already been reported, and is wrapped in an error statement
+    AstStatError* lastError = last ? last->as<AstStatError>() : nullptr;
+    bool reportedTerminator = lastError && lastError->statements.size != 0 && isStatLast(lastError->statements.data[lastError->statements.size - 1]);
+    bool terminated = last && (isStatLast(last) || reportedTerminator);
+
+    // An error inside the block already explains it; the missing terminator is usually a consequence
+    bool bodyReportedErrors = parseErrors.size() > errorsBefore;
+
+    if (!terminated)
+    {
+        if (!bodyReportedErrors && lexer.current().type == Lexeme::ReservedEnd)
+        {
+            report(start, "A 'do' expression doesn't end with 'end'; end it with 'give <value>', 'return', 'break' or 'continue'");
+            noteStrayEnd("A 'do' expression", /* reported= */ true);
+        }
+        else if (!bodyReportedErrors)
+        {
+            // `error(...)` doesn't return, but the parser can't know that (`error` can be shadowed)
+            AstStatExpr* lastExpr = last ? last->as<AstStatExpr>() : nullptr;
+            AstExprCall* lastCall = lastExpr ? lastExpr->expr->as<AstExprCall>() : nullptr;
+            bool endsInError = lastCall && getIdentifier(lastCall->func) == "error";
+
+            // On the `do` alone: the rest of the expression is still being written, and isn't wrong
+            report(
+                start,
+                "A 'do' expression must end with 'give <value>', 'return', 'break' or 'continue'%s",
+                endsInError ? "; to raise an error there, write 'give error(...)'" : ""
+            );
+        }
+
+        // It is still being written: it reaches to where its block stopped, which is where the cursor is
+        location = Location(start.begin, lexer.current().location.begin);
+    }
+    else if (AstStatReturn* ret = last->as<AstStatReturn>(); ret && ret->list.size == 0)
+    {
+        bool parenthesized = directlyParenthesized && lexer.current().type == ')';
+
+        if (!parenthesized)
+            report(
+                ret->location,
+                "A 'do' expression that ends in a bare 'return' must be parenthesized, '(do return)', so a value on the next line "
+                "isn't read as the value to return"
+            );
+    }
+
+    if (terminated)
+        noteStrayEnd("A 'do' expression", /* reported= */ false);
+
+    // On the `do` alone, like every error about the expression as a whole
+    if (!FFlag::DebugLuwuDoExpr)
+        report(start, "'do' expressions are a Luwu feature; enable the 'DebugLuwuDoExpr' fast flag to use them");
+
+    AstExprDo* node = allocator.alloc<AstExprDo>(location, body);
+    node->luwuOnly = true;
+    return node;
+}
+
+// Luwu Do Expressions (rfcs/do-expressions.md): `return` or `break` right after `or`, bare or in parentheses
+bool Parser::orLeaveFollows()
+{
+    auto isLeave = [](const Lexeme& l)
+    {
+        return l.type == Lexeme::ReservedReturn || l.type == Lexeme::ReservedBreak;
+    };
+
+    if (isLeave(lexer.current()))
+        return true;
+
+    return lexer.current().type == '(' && isLeave(lexer.lookahead());
+}
+
+// Luwu Do Expressions (rfcs/do-expressions.md): `continue` right after `or` is the shorthand for `or do continue`, inside a
+// loop, unless `continue` is a variable there: a local in scope, a name followed by a call or an index, or, decided at
+// the end of the module (resolveOrContinues), a name the module uses anywhere. In valid Luau, `x or continue` reads a
+// variable named `continue`, which a module that never names it can't be relying on.
+bool Parser::orContinueFollows()
+{
+    if (!FFlag::DebugLuwuDoExpr || functionStack.back().loopDepth == 0)
+        return false;
+
+    if (lexer.current().type != Lexeme::Name || AstName(lexer.current().name) != "continue")
+        return false;
+
+    if (AstLocal* const* local = localMap.find(AstName(lexer.current().name)); local && *local)
+        return false;
+
+    Lexeme::Type next = lexer.lookahead().type;
+    bool continuesAsExpression = next == '(' || next == '.' || next == ':' || next == '[' || next == '{' || next == Lexeme::QuotedString ||
+                                 next == Lexeme::RawString || next == Lexeme::InterpStringBegin || next == Lexeme::InterpStringSimple;
+    return !continuesAsExpression;
+}
+
+// Luwu Do Expressions (rfcs/do-expressions.md): a module that uses `continue` as a name anywhere keeps Luau's meaning for
+// `x or continue`, a read of that variable. No local was in scope at any of them (orContinueFollows checked), so each is
+// a global read.
+void Parser::resolveOrContinues()
+{
+    if (continueNameUses == 0)
+        return;
+
+    for (AstExpr** slot : orContinues)
+    {
+        Location location = (*slot)->location;
+        *slot = allocator.alloc<AstExprGlobal>(location, nameContinue);
+    }
+}
+
+// Luwu Do Expressions (rfcs/do-expressions.md): the shorthand after `or`, and after the `else` of an if-else expression
+// (`introducer`, for the error messages):
+//
+//   x or return v      x or (do return v)
+//   x or break         x or (do break)
+//   x or continue      x or (do continue)       (see orContinueFollows)
+//   x or (return a, b) x or (do return a, b)
+//
+// Unparenthesized, `return` takes exactly one value: in `local a, b = x or return y, z` the `, z` belongs to the
+// `local`. More values, or none, need the parentheses (`x or (return)`), for the same reason `(do return)` does.
+AstExpr* Parser::parseOrLeave(const char* introducer)
+{
+    std::optional<MatchLexeme> matchParen;
+    Position parenStart = lexer.current().location.begin;
+
+    if (lexer.current().type == '(')
+    {
+        matchParen = MatchLexeme(lexer.current());
+        nextLexeme();
+    }
+
+    AstStat* leave = nullptr;
+    Location keyword = lexer.current().location;
+
+    if (lexer.current().type == Lexeme::ReservedBreak)
+    {
+        leave = parseBreak();
+    }
+    else if (lexer.current().type == Lexeme::Name)
+    {
+        // `continue`, see orContinueFollows
+        nextLexeme();
+        leave = parseContinue(keyword);
+    }
+    else
+    {
+        Location start = lexer.current().location;
+        nextLexeme(); // return
+
+        TempVector<AstExpr*> list(scratchExpr);
+        TempVector<Position> commaPositions(scratchPosition);
+
+        if (matchParen)
+        {
+            if (lexer.current().type != ')')
+                parseExprList(list, options.storeCstData ? &commaPositions : nullptr);
+        }
+        else if (valueEnds(lexer.current()))
+        {
+            // `then return else x`: the arm ends at `else`, so no value on the next line can be mistaken for its value
+            bool endsThenArm = strcmp(introducer, "then") == 0 &&
+                               (lexer.current().type == Lexeme::ReservedElse || lexer.current().type == Lexeme::ReservedElseif);
+            if (!endsThenArm)
+            {
+                report(
+                    start,
+                    "'%s return' with no value must be parenthesized, '%s (return)', so a value on the next line isn't read as the value to return",
+                    introducer,
+                    introducer
+                );
+            }
+        }
+        else
+        {
+            list.push_back(parseExpr());
+        }
+
+        leave = finishReturn(start, list, commaPositions);
+    }
+
+    AstStatBlock* body = allocator.alloc<AstStatBlock>(leave->location, copy({leave}));
+    AstExprDo* expr = allocator.alloc<AstExprDo>(leave->location, body);
+    expr->shorthand = true;
+    expr->luwuOnly = true;
+
+    if (!FFlag::DebugLuwuDoExpr)
+        report(
+            keyword,
+            "'%s return', '%s break' and '%s continue' are Luwu features; enable the 'DebugLuwuDoExpr' fast flag to use them",
+            introducer,
+            introducer,
+            introducer
+        );
+
+    if (!matchParen)
+        return expr;
+
+    Position end = lexer.current().location.end;
+    bool closeParenFound = lexer.current().type == ')';
+
+    if (closeParenFound)
+        nextLexeme();
+    else
+        expectMatchAndConsumeFail(static_cast<Lexeme::Type>(')'), *matchParen);
+
+    AstExpr* group = allocator.alloc<AstExprGroup>(Location(parenStart, closeParenFound ? end : lexer.previousLocation().end), expr);
+    if (options.storeCstData)
+        cstNodeMap[group] = allocator.alloc<CstExprGroup>(closeParenFound ? lexer.previousLocation().begin : Position::missing());
+
+    return group;
+}
+
+// Luwu Do Expressions (rfcs/do-expressions.md): give exp
+AstStat* Parser::parseGive()
+{
+    Location start = lexer.current().location;
+    Name keyword(AstName(lexer.current().name), start);
+    nextLexeme(); // give
+
+    // `give.x = 1`, `give = 1`, `give, a = ...`: code using a variable named `give`, which a `do` expression can't
+    Lexeme::Type next = lexer.current().type;
+    bool usedAsName = next == '.' || next == ':' || next == '[' || next == '=' || next == ',';
+
+    AstExpr* value = nullptr;
+
+    if (usedAsName)
+    {
+        checkDoExprKeywordAsName(keyword);
+        value = reportExprError(lexer.current().location, {}, "Expected a value after 'give'");
+    }
+    else if (valueEnds(lexer.current()))
+    {
+        value = reportExprError(lexer.current().location, {}, "Expected a value after 'give'");
+    }
+    else
+    {
+        value = parseExpr();
+    }
+
+    // At the top of the block, the `give` ends the expression, and the `,` belongs to the list around it:
+    // `f(a, do give b, c)`. Nested deeper, nothing else can own it.
+    if (lexer.current().type == ',' && !doExprTopLevel)
+    {
+        Location extra = lexer.current().location;
+        TempVector<AstExpr*> rest(scratchExpr);
+        nextLexeme();
+        parseExprList(rest);
+        report(Location(extra, lexer.previousLocation()), "'give' gives exactly one value");
+    }
+
+    AstStatGive* node = allocator.alloc<AstStatGive>(Location(start, value->location), value);
+    node->luwuOnly = true;
+    return node;
+}
+
+// Luwu Do Expressions (rfcs/do-expressions.md): tokens that end the expression a `do` expression is part of, so its
+// block can't continue past them. Reaching one before the block's last statement is an error.
+bool Parser::doExprBodyFollow(const Lexeme& l)
+{
+    return l.type == ')' || l.type == ']' || l.type == '}' || l.type == ',' || l.type == Lexeme::ReservedThen;
+}
+
+// Luwu Do Expressions (rfcs/do-expressions.md): no value can start at `l`, so a `give` or `or return` there has none
+bool Parser::valueEnds(const Lexeme& l)
+{
+    return blockFollow(l) || doExprBodyFollow(l) || l.type == ';';
+}
+
+// Luwu Do Expressions (rfcs/do-expressions.md): inside a `do` expression, `give` and `continue` can't name a
+// variable. A name after `.` or `:`, a table key and a member name aren't variables and stay allowed.
+void Parser::checkDoExprKeywordAsName(const Name& name)
+{
+    if (functionStack.back().doExprDepth == 0)
+        return;
+
+    if (name.name == "give" || name.name == "continue")
+        report(
+            name.location,
+            "'%s' is a keyword inside a 'do' expression and can't name a variable there",
+            name.name.value
+        );
 }
 
 // Name
@@ -7497,6 +8585,10 @@ AstExpr* Parser::parseNumber()
 AstLocal* Parser::pushLocal(const Binding& binding)
 {
     const Name& name = binding.name;
+    checkDoExprKeywordAsName(name);
+
+    if (name.name == "continue")
+        continueNameUses++;
     AstLocal*& local = localMap[name.name];
 
     local = allocator.alloc<AstLocal>(
@@ -7575,13 +8667,19 @@ LUAU_NOINLINE bool Parser::expectAndConsumeFailWithLookahead(Lexeme::Type type, 
 // LUAU_NOINLINE is used to limit the stack cost due to std::string objects, and to increase caller performance since this code is cold
 LUAU_NOINLINE void Parser::expectAndConsumeFail(Lexeme::Type type, const char* context)
 {
+    reportExpected(lexer.current().location, type, context);
+}
+
+// Luwu: expectAndConsumeFail's error, reported at `location` instead of at the current token
+LUAU_NOINLINE void Parser::reportExpected(const Location& location, Lexeme::Type type, const char* context)
+{
     std::string typeString = Lexeme(Location(Position(0, 0), 0), type).toString();
     std::string currLexemeString = lexer.current().toString();
 
     if (context)
-        report(lexer.current().location, "Expected %s when parsing %s, got %s", typeString.c_str(), context, currLexemeString.c_str());
+        report(location, "Expected %s when parsing %s, got %s", typeString.c_str(), context, currLexemeString.c_str());
     else
-        report(lexer.current().location, "Expected %s, got %s", typeString.c_str(), currLexemeString.c_str());
+        report(location, "Expected %s, got %s", typeString.c_str(), currLexemeString.c_str());
 }
 
 bool Parser::expectMatchAndConsume(char value, const MatchLexeme& begin, bool searchForMissing)

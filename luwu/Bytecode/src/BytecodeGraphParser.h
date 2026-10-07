@@ -543,6 +543,15 @@ struct BytecodeGraphParser
                     addImmInput(node, static_cast<bool>(aux & LBC_JUMPXISA_CHECKCLASS));
                     break;
 
+                case LOP_INITTRAITS:
+                    // Luwu Traits (rfcs/classes/traits.md): reads the object in A + 1, jumps over the CALL after it, and
+                    // otherwise writes the runner to A
+                    addVmRegInput(node, LUAU_INSN_A(insn) + 1);
+                    addJumpInput(node, jumpTarget);
+                    func.regs[nodeOp] = LUAU_INSN_A(insn);
+                    addProducer(LUAU_INSN_A(insn), func.addProj(nodeOp, 0));
+                    break;
+
                 case LOP_JUMPIF:
                 case LOP_JUMPIFNOT:
                     addVmRegInput(node, LUAU_INSN_A(insn));
@@ -782,6 +791,7 @@ struct BytecodeGraphParser
             case LOP_JUMPXEQKN:
             case LOP_JUMPXEQKS:
             case LOP_JUMPXISA:
+            case LOP_INITTRAITS:
             case LOP_JUMPIF:
             case LOP_JUMPIFNOT:
             case LOP_JUMPIFEQ:
@@ -1033,6 +1043,23 @@ struct BytecodeGraphParser
                 addVmRegInput(node, LUAU_INSN_A(insn));
                 addVmRegInput(node, LUAU_INSN_B(insn));
                 addImmInput(node, static_cast<int32_t>(aux));
+                break;
+
+            case LOP_APPENDTABLE:
+                // Luwu Table Comprehensions (rfcs/table-comprehensions.md): reads the table and the value, and
+                // updates the count in C
+                addVmRegInput(node, LUAU_INSN_A(insn));
+                addVmRegInput(node, LUAU_INSN_B(insn));
+                addVmRegInput(node, LUAU_INSN_C(insn));
+                addProducer(LUAU_INSN_C(insn), nodeOp);
+                break;
+
+            case LOP_PRESIZETABLE:
+                // Luwu Table Comprehensions (rfcs/table-comprehensions.md): writes no register. The registers above B that
+                // the iterator and range forms also read belong to the loop that follows, which reads them too.
+                addVmRegInput(node, LUAU_INSN_A(insn));
+                addVmRegInput(node, LUAU_INSN_B(insn));
+                addImmInput(node, static_cast<int32_t>(LUAU_INSN_C(insn)));
                 break;
 
             case LOP_NEWOBJECT:

@@ -23,6 +23,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 #include <math.h>
 
@@ -34,6 +35,7 @@ LUAU_FASTINTVARIABLE(LuauCompileInlineThresholdMaxBoost, 300)
 LUAU_FASTINTVARIABLE(LuauCompileInlineDepth, 5)
 
 LUAU_FASTFLAGVARIABLE(LuauCompileIifeInline)
+LUAU_FASTFLAG(DebugLuwuDoExpr)
 LUAU_FASTFLAG(LuauExportValueSyntax)
 LUAU_FASTFLAG(LuauIntegerType2)
 LUAU_FASTFLAGVARIABLE(LuauCompileStringInterpTargetTop)
@@ -218,7 +220,8 @@ struct Compiler
         , classPrimaryInitFn(nullptr)
         , traitInitFn(nullptr)
         , traitNeedsFn(nullptr)
-        , classInitTraitsFn(nullptr)
+        , classImplementsFn(nullptr)
+        , traitInitHosts(nullptr)
         , classPrimaryInitCost(nullptr)
         , classPodConstDefaults(nullptr)
         , classMethodSelfChecks(nullptr)
@@ -573,6 +576,18 @@ struct Compiler
             }
         }
 
+        // Luwu Traits (rfcs/classes/traits.md): a class's trait fields are initialized before its own fields, so its
+        // own initializers can override them. A primary constructor's `__init` does it after its parameter defaults,
+        // which its `implements` arguments may use; any other host does it first thing.
+        AstStatClass* const* traitInitClass = FFlag::LuwuClasses ? traitInitHosts.find(func) : nullptr;
+        bool traitInitAfterArgDefaults = traitInitClass && (*traitInitClass)->primaryConstructor;
+
+        // every host takes the object under construction as its first parameter
+        LUAU_ASSERT(!traitInitClass || func->args.size > 0);
+
+        if (traitInitClass && !traitInitAfterArgDefaults)
+            compileTraitInit(*traitInitClass, args);
+
         // Inline this class's field defaults ("self.field = defaultExpr") as the very first
         // statements of a user-defined `__init`, ahead of the user's own body. This makes
         // defaults re-evaluate on every construction (each is ordinary bytecode running inside
@@ -603,6 +618,9 @@ struct Compiler
 
         if (FFlag::LuwuDefaultArguments)
             compileFunctionArgDefaults(func);
+
+        if (traitInitClass && traitInitAfterArgDefaults)
+            compileTraitInit(*traitInitClass, args);
 
         AstStatBlock* stat = func->body;
 
@@ -2603,6 +2621,16 @@ struct Compiler
 
     // Luwu Classes (rfcs/classes): this class's own `__init`, or null when it uses the default
     // (POD) constructor.
+    // Luwu Classes (rfcs/classes): the primary constructor (or trait) parameter that gives `decl`'s field `name` its value,
+    // if there is one
+    static AstLocal* primaryConstructorParam(AstStatClass* decl, const AstName& name)
+    {
+        if (!decl->primaryConstructor)
+            return nullptr;
+
+        return ClassInitDefaultsVisitor::findPrimaryConstructorParam(decl->primaryConstructor, name);
+    }
+
     const AstClassMethod* findClassInit(AstStatClass* decl)
     {
         for (const AstClassMember& member : decl->members)
@@ -2706,8 +2734,38 @@ struct Compiler
 
         uint8_t classReg = compileClassOperand(callee, rs);
 
-        bytecode.emitABC(LOP_NEWOBJECT, base, classReg, LBC_NEWOBJECT_FIELDS);
-        bytecode.emitAux(uint32_t(properties.size()));
+        if (decl->implements.size > 0)
+        {
+            // Luwu Traits (rfcs/classes/traits.md): the trait fields come between allocation and the class's own, which
+            // are then stored one by one. A nil value is skipped, which keeps the field's current value, as it does
+            // when the generic constructor applies a table.
+            bytecode.emitABC(LOP_NEWOBJECT, base, classReg, LBC_NEWOBJECT_ALLOC);
+            bytecode.emitAux(0);
+
+            compileTraitInit(decl, base);
+
+            for (size_t i = 0; i < properties.size(); ++i)
+            {
+                if (!values[i])
+                    continue;
+
+                uint8_t reg = uint8_t(base + 1 + i);
+
+                size_t skipLabel = bytecode.emitLabel();
+                bytecode.emitAD(LOP_JUMPXEQKNIL, reg, 0);
+                bytecode.emitAux(0);
+
+                bytecode.emitABC(LOP_SETOBJECTMEMBER, reg, base, 0);
+                bytecode.emitAux(uint32_t(i));
+
+                patchJump(expr, skipLabel, bytecode.emitLabel());
+            }
+        }
+        else
+        {
+            bytecode.emitABC(LOP_NEWOBJECT, base, classReg, LBC_NEWOBJECT_FIELDS);
+            bytecode.emitAux(uint32_t(properties.size()));
+        }
 
         if (base != target)
             bytecode.emitABC(LOP_MOVE, target, base, 0);
@@ -2928,6 +2986,9 @@ struct Compiler
             if (paramDefault && !isInlinable(paramDefault))
                 return false;
 
+        if (!implementsArgsMovable(decl, parameters, siteClass))
+            return false;
+
         // ...and it has to be worth copying into every construction site, same knob the general
         // inliner uses. The cost of the whole `__init` body stands in for the initializers, since that
         // body is exactly the field assignments.
@@ -3035,18 +3096,7 @@ struct Compiler
                 // an argument that turns out to be nil still takes the parameter's default, exactly as
                 // the synthesized `__init`'s prologue would (see compileFunctionArgDefaults)
                 if (paramDefault)
-                {
-                    size_t jumpLabel = bytecode.emitLabel();
-                    bytecode.emitAD(LOP_JUMPXEQKNIL, reg, 0);
-                    bytecode.emitAux(0 | 0x80000000);
-
-                    {
-                        RegScope rsDefault(this);
-                        compileExpr(paramDefault, reg, true);
-                    }
-
-                    patchJump(paramDefault, jumpLabel, bytecode.emitLabel());
-                }
+                    compileDefaultIfNil(paramDefault, reg);
             }
             else if (paramDefault)
             {
@@ -3070,11 +3120,26 @@ struct Compiler
             return -1;
         };
 
+        // Luwu Traits (rfcs/classes/traits.md): a class's trait fields are initialized before its own initializers run,
+        // so the object has to exist first. The class's own fields are stored into it afterwards.
+        bool allocForm = decl->implements.size > 0;
+
+        if (allocForm)
+        {
+            setDebugLine(expr);
+            bytecode.emitABC(LOP_NEWOBJECT, base, classReg, LBC_NEWOBJECT_ALLOC);
+            bytecode.emitAux(0);
+
+            compileTraitInit(decl, base);
+        }
+
+        // whether each field gets a value here: one with neither a default nor a parameter keeps the nil it starts with
+        std::vector<bool> initialized(fieldCount, true);
         size_t slot = 0;
 
         for (const AstClassProperty* prop : properties)
         {
-            uint8_t reg = uint8_t(base + 1 + slot++);
+            uint8_t reg = uint8_t(base + 1 + slot);
 
             if (prop->defaultValue)
             {
@@ -3086,12 +3151,17 @@ struct Compiler
                 // a bare restatement (`private const hash`) is initialized from the parameter it names
                 bytecode.emitABC(LOP_MOVE, reg, uint8_t(paramReg), 0);
             }
+            else if (allocForm)
+            {
+                initialized[slot] = false;
+            }
             else
             {
-                // a field with neither a default nor a parameter is nil, which is also what NEWOBJECT
-                // reads a nil slot as
+                // NEWOBJECT reads a nil slot as "keep the default", which for this field is nil too
                 bytecode.emitABC(LOP_LOADNIL, reg, 0, 0);
             }
+
+            slot++;
         }
 
         for (AstLocal* param : parameterFields)
@@ -3112,13 +3182,64 @@ struct Compiler
 
         setDebugLine(expr);
 
-        bytecode.emitABC(LOP_NEWOBJECT, base, classReg, LBC_NEWOBJECT_FIELDS);
-        bytecode.emitAux(uint32_t(fieldCount));
+        if (allocForm)
+        {
+            // the class's own fields come first in its layout, in the order they were evaluated in
+            for (size_t i = 0; i < fieldCount; ++i)
+            {
+                if (!initialized[i])
+                    continue;
+
+                bytecode.emitABC(LOP_SETOBJECTMEMBER, uint8_t(base + 1 + i), base, 0);
+                bytecode.emitAux(uint32_t(i));
+            }
+        }
+        else
+        {
+            bytecode.emitABC(LOP_NEWOBJECT, base, classReg, LBC_NEWOBJECT_FIELDS);
+            bytecode.emitAux(uint32_t(fieldCount));
+        }
 
         if (base != target)
             bytecode.emitABC(LOP_MOVE, target, base, 0);
 
         return true;
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): whether `decl`'s `implements` arguments mean the same at a construction site
+    // as in the class's own construction code, so the site can evaluate them itself (compileTraitInit). The rules are a
+    // primary constructor's initializers' (PrimaryInitInlineVisitor), with `parameters` the names the site binds.
+    bool implementsArgsMovable(AstStatClass* decl, const DenseHashSet<AstLocal*>& parameters, AstStatClass* siteClass)
+    {
+        for (const AstClassTraitRef& ref : decl->implements)
+        {
+            for (AstExpr* arg : ref.args)
+            {
+                PrimaryInitInlineVisitor visitor{this, parameters, decl, siteClass};
+                arg->visit(&visitor);
+
+                if (!visitor.movable())
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    // Luwu Classes (rfcs/classes): replaces the value in `reg` with `paramDefault` when it is nil, the way a function's
+    // prologue applies a parameter's default (compileFunctionArgDefaults), for a construction site doing that work inline
+    void compileDefaultIfNil(AstExpr* paramDefault, uint8_t reg)
+    {
+        size_t jumpLabel = bytecode.emitLabel();
+        bytecode.emitAD(LOP_JUMPXEQKNIL, reg, 0);
+        bytecode.emitAux(0 | 0x80000000);
+
+        {
+            RegScope rsDefault(this);
+            compileExpr(paramDefault, reg, true);
+        }
+
+        patchJump(paramDefault, jumpLabel, bytecode.emitLabel());
     }
 
     // Luwu Classes (rfcs/classes): marks a class's initializers as being expanded at a construction site
@@ -3219,11 +3340,6 @@ struct Compiler
         if (classPodDefaultsFn.contains(*decl))
             return false;
 
-        // Luwu Traits (rfcs/classes/traits.md): the fields of the traits a class implements are only laid out when the class
-        // is created, and initialized by their traits' `__traitinit`, which only the generic constructor calls.
-        if ((*decl)->implements.size > 0)
-            return false;
-
         const AstClassMethod* init = findClassInit(*decl);
 
         // A primary constructor compiles to a synthesized `__init` that isn't a member of the AST
@@ -3257,6 +3373,31 @@ struct Compiler
                 if (AstExprTable* fields = expr->args.data[0]->as<AstExprTable>();
                     fields && tryCompileNewObjectTableConstructor(expr, *decl, fields, target))
                     return true;
+            }
+
+            // Luwu Traits (rfcs/classes/traits.md): a class that implements traits gets its trait fields between
+            // allocation and its own (NEWOBJECT's ALLOC form, then compileTraitInit). An argument table that isn't a
+            // literal, applied after the traits by the generic constructor, takes the generic path.
+            if ((*decl)->implements.size > 0)
+            {
+                DenseHashSet<AstLocal*> noParameters{nullptr};
+                bool movable = implementsArgsMovable(*decl, noParameters, lexicalClassOf(currentFunction));
+
+                if (expr->args.size != 0 || !movable)
+                    return false;
+
+                // the object reaches `target` only once it is complete: initializing its trait fields can raise or
+                // yield, and `target` may be a variable other code reads
+                uint8_t object = allocReg(expr, 1u);
+                uint8_t classReg = compileClassOperand(callee, rs);
+
+                bytecode.emitABC(LOP_NEWOBJECT, object, classReg, LBC_NEWOBJECT_ALLOC);
+                bytecode.emitAux(0);
+
+                compileTraitInit(*decl, object);
+
+                bytecode.emitABC(LOP_MOVE, target, object, 0);
+                return true;
             }
 
             // NEWOBJECT writes the instance to its first operand and reads the single argument, when
@@ -3739,9 +3880,8 @@ struct Compiler
             for (const AstClassTraitRef& ref : traits[i]->needs)
             {
                 AstStatClass* needed = sameFileTrait(ref.trait);
-                bool hasParameters = needed && needed->primaryConstructor && needed->primaryConstructor->args.size > 0;
 
-                if (needed && !hasParameters && !seen.contains(needed))
+                if (needed && !traitHasParameters(needed) && !seen.contains(needed))
                 {
                     seen.insert(needed);
                     traits.push_back(needed);
@@ -3752,7 +3892,481 @@ struct Compiler
         return traits;
     }
 
-    // Luwu Traits (rfcs/classes/traits.md): `cls`'s copy of the trait function `method`.
+    // Luwu Traits (rfcs/classes/traits.md): what the compiler knows about how `cls` initializes its trait fields when every
+    // trait it gets is declared in this file, so construction can do that work inline instead of running INITTRAITS
+    // (compileInlinedTraitInit). It mirrors the runtime, which builds the same layout and order at implement time.
+    struct TraitInitPlan
+    {
+        // The traits in the order INITTRAITS runs their initializers: a trait's needed traits before it
+        // (luaR_pushtraitinitorder), so an overriding trait writes a field last
+        std::vector<AstStatClass*> initOrder;
+        // Where each field a trait provides lives in the class's layout: the class's own slot when the class overrides
+        // it, otherwise the slot luaR_implementtraits appends for it after the class's own fields
+        DenseHashMap<AstName, uint32_t> fieldSlots{AstName()};
+        // The fields declared more than once: by the class and a trait, or by traits that need each other
+        DenseHashSet<AstName> overridden{AstName()};
+    };
+
+    // Luwu Traits (rfcs/classes/traits.md): a trait's fields in the order its shape lists them (compileClassDeclaration):
+    // the body's provided fields, then the parameters the body doesn't restate. A parameter's entry has no property.
+    static std::vector<std::pair<AstName, const AstClassProperty*>> traitProvidedFields(AstStatClass* trait)
+    {
+        std::vector<std::pair<AstName, const AstClassProperty*>> fields;
+
+        for (const AstClassMember& member : trait->members)
+            if (const AstClassProperty* prop = member.get_if<AstClassProperty>(); prop && !prop->expectLocation)
+                fields.emplace_back(prop->name, prop);
+
+        if (trait->primaryConstructor)
+        {
+            for (AstLocal* param : trait->primaryConstructor->args)
+            {
+                bool restated = std::any_of(
+                    fields.begin(),
+                    fields.end(),
+                    [&](const std::pair<AstName, const AstClassProperty*>& field)
+                    {
+                        return field.first == param->name;
+                    }
+                );
+
+                if (!restated)
+                    fields.emplace_back(param->name, nullptr);
+            }
+        }
+
+        return fields;
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): a trait with parameters is only implemented when the class lists it with its
+    // arguments; one that is only needed is skipped (luaR_collecttraits)
+    static bool traitHasParameters(AstStatClass* trait)
+    {
+        return trait->primaryConstructor && trait->primaryConstructor->args.size > 0;
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): whether same-file trait `from` needs `to`, directly or through others
+    bool sameFileTraitNeeds(AstStatClass* from, AstStatClass* to)
+    {
+        std::vector<AstStatClass*> pending{from};
+        DenseHashSet<AstStatClass*> seen{nullptr};
+
+        while (!pending.empty())
+        {
+            AstStatClass* trait = pending.back();
+            pending.pop_back();
+
+            if (seen.contains(trait))
+                continue;
+
+            seen.insert(trait);
+
+            for (const AstClassTraitRef& ref : trait->needs)
+            {
+                AstStatClass* needed = sameFileTrait(ref.trait);
+                if (needed == to)
+                    return true;
+
+                if (needed)
+                    pending.push_back(needed);
+            }
+        }
+
+        return false;
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): appends `trait` to `order` after the traits it needs, as luaR_pushtraitinitorder
+    // does at runtime
+    void appendTraitInitOrder(AstStatClass* trait, DenseHashSet<AstStatClass*>& done, std::vector<AstStatClass*>& order)
+    {
+        done.insert(trait);
+
+        for (const AstClassTraitRef& ref : trait->needs)
+        {
+            AstStatClass* needed = sameFileTrait(ref.trait);
+            bool pending = needed && !traitHasParameters(needed) && !done.contains(needed);
+
+            if (pending)
+                appendTraitInitOrder(needed, done, order);
+        }
+
+        order.push_back(trait);
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): `cls`'s TraitInitPlan, or nullptr when the compiler can't know it: a trait comes
+    // from another module, or the class statement raises when it implements its traits (a trait listed twice, a field
+    // provided by two traits neither of which needs the other, a field the class declares as a function).
+    std::unique_ptr<TraitInitPlan> buildTraitInitPlan(AstStatClass* cls)
+    {
+        // the traits in the order luaR_collecttraits attaches them, which is the order their fields are laid out in
+        std::vector<AstStatClass*> attached;
+        DenseHashSet<AstStatClass*> seen{nullptr};
+
+        for (const AstClassTraitRef& ref : cls->implements)
+        {
+            AstStatClass* trait = sameFileTrait(ref.trait);
+            if (!trait || seen.contains(trait))
+                return nullptr;
+
+            seen.insert(trait);
+            attached.push_back(trait);
+        }
+
+        for (size_t i = 0; i < attached.size(); ++i)
+        {
+            for (const AstClassTraitRef& ref : attached[i]->needs)
+            {
+                AstStatClass* needed = sameFileTrait(ref.trait);
+                if (!needed)
+                    return nullptr;
+
+                if (seen.contains(needed) || traitHasParameters(needed))
+                    continue;
+
+                seen.insert(needed);
+                attached.push_back(needed);
+            }
+        }
+
+        auto plan = std::make_unique<TraitInitPlan>();
+
+        // the class's own fields keep the first slots: its body's fields, then the parameters the body doesn't restate
+        DenseHashSet<AstName> ownMethods{AstName()};
+        uint32_t ownFields = 0;
+
+        for (const AstClassMember& member : cls->members)
+        {
+            if (const AstClassProperty* prop = member.get_if<AstClassProperty>())
+                plan->fieldSlots[prop->name] = ownFields++;
+            else if (const AstClassMethod* method = member.get_if<AstClassMethod>())
+                ownMethods.insert(method->functionName);
+        }
+
+        if (cls->primaryConstructor)
+        {
+            for (AstLocal* param : cls->primaryConstructor->args)
+                if (!plan->fieldSlots.contains(param->name))
+                    plan->fieldSlots[param->name] = ownFields++;
+        }
+
+        // every trait that provides each field the class doesn't declare, in attach order
+        std::vector<AstName> providedNames;
+        DenseHashMap<AstName, std::vector<AstStatClass*>> providers{AstName()};
+
+        for (AstStatClass* trait : attached)
+        {
+            for (const auto& [name, prop] : traitProvidedFields(trait))
+            {
+                if (ownMethods.contains(name))
+                    return nullptr;
+
+                if (plan->fieldSlots.contains(name) && !providers.contains(name))
+                {
+                    // the class's own field overrides it
+                    plan->overridden.insert(name);
+                    continue;
+                }
+
+                std::vector<AstStatClass*>& list = providers[name];
+                if (list.empty())
+                    providedNames.push_back(name);
+                list.push_back(trait);
+            }
+        }
+
+        // the provider that needs every other one places the field (luaR_overridingtrait)
+        DenseHashMap<AstName, AstStatClass*> winners{AstName()};
+
+        for (AstName name : providedNames)
+        {
+            const std::vector<AstStatClass*>& list = providers[name];
+            AstStatClass* winner = nullptr;
+
+            for (AstStatClass* candidate : list)
+            {
+                bool needsAll = std::all_of(
+                    list.begin(),
+                    list.end(),
+                    [&](AstStatClass* other)
+                    {
+                        return other == candidate || sameFileTraitNeeds(candidate, other);
+                    }
+                );
+
+                if (needsAll)
+                {
+                    winner = candidate;
+                    break;
+                }
+            }
+
+            if (!winner)
+                return nullptr;
+
+            winners[name] = winner;
+            if (list.size() > 1)
+                plan->overridden.insert(name);
+        }
+
+        // each winner's fields are appended when the runtime reaches that trait (luaR_implementtraits)
+        uint32_t nextSlot = ownFields;
+
+        for (AstStatClass* trait : attached)
+        {
+            for (const auto& [name, prop] : traitProvidedFields(trait))
+            {
+                AstStatClass* const* winner = winners.find(name);
+                if (winner && *winner == trait)
+                    plan->fieldSlots[name] = nextSlot++;
+            }
+        }
+
+        DenseHashSet<AstStatClass*> done{nullptr};
+        for (const AstClassTraitRef& ref : cls->implements)
+        {
+            AstStatClass* trait = sameFileTrait(ref.trait);
+            if (!done.contains(trait))
+                appendTraitInitOrder(trait, done, plan->initOrder);
+        }
+
+        return plan;
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): `cls`'s TraitInitPlan, computed once
+    const TraitInitPlan* traitInitPlan(AstStatClass* cls)
+    {
+        auto it = traitInitPlans.find(cls);
+        if (it == traitInitPlans.end())
+            it = traitInitPlans.emplace(cls, buildTraitInitPlan(cls)).first;
+
+        return it->second.get();
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): whether the traits' initializers can be compiled where construction runs, with
+    // the same meaning they have in the trait: the rules of a primary constructor's initializers (PrimaryInitInlineVisitor),
+    // with the trait's parameters as the names it binds
+    bool traitInitInlinable(const TraitInitPlan& plan)
+    {
+        AstStatClass* siteClass = lexicalClassOf(currentFunction);
+
+        for (AstStatClass* trait : plan.initOrder)
+        {
+            DenseHashSet<AstLocal*> parameters{nullptr};
+            if (trait->primaryConstructor)
+            {
+                for (AstLocal* param : trait->primaryConstructor->args)
+                    parameters.insert(param);
+            }
+
+            auto movable = [&](AstExpr* expr)
+            {
+                PrimaryInitInlineVisitor visitor{this, parameters, trait, siteClass};
+                expr->visit(&visitor);
+                return visitor.movable();
+            };
+
+            if (trait->primaryConstructor)
+            {
+                for (AstExpr* paramDefault : trait->primaryConstructor->argsDefaults)
+                    if (paramDefault && !movable(paramDefault))
+                        return false;
+            }
+
+            for (const auto& [name, prop] : traitProvidedFields(trait))
+                if (prop && prop->defaultValue && !movable(prop->defaultValue))
+                    return false;
+        }
+
+        return true;
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): what INITTRAITS does, compiled inline. Each trait in
+    // dependency order binds its parameters to its `implements` arguments (evaluated from `argBase`, in list order) and its
+    // parameter defaults, then stores its computed fields at their slots. Its constant fields are already in place from
+    // allocation, except an overridden one, which is stored again so the overriding value lands last. For a class with
+    // no `__init`, whose own constant defaults come only from allocation, an overriding constant is stored once more after
+    // the traits, which INITTRAITS does with LuauClass::overriddenconsts.
+    void compileInlinedTraitInit(AstStatClass* cls, const TraitInitPlan& plan, uint8_t objectReg, uint8_t argBase)
+    {
+        auto storeRegister = [&](AstName name, uint8_t reg)
+        {
+            const uint32_t* slot = plan.fieldSlots.find(name);
+            LUAU_ASSERT(slot);
+
+            bytecode.emitABC(LOP_SETOBJECTMEMBER, reg, objectReg, 0);
+            bytecode.emitAux(*slot);
+        };
+
+        auto storeField = [&](AstName name, AstExpr* value)
+        {
+            RegScope rsValue(this);
+            uint8_t reg = allocReg(value, 1u);
+            compileExprTemp(value, reg);
+            storeRegister(name, reg);
+        };
+
+        for (AstStatClass* trait : plan.initOrder)
+        {
+            // the trait's own `implements` entry's arguments, if the class lists it with any
+            size_t argOffset = 0;
+            size_t argCount = 0;
+
+            for (const AstClassTraitRef& ref : cls->implements)
+            {
+                if (sameFileTrait(ref.trait) == trait)
+                {
+                    argCount = ref.args.size;
+                    break;
+                }
+
+                argOffset += ref.args.size;
+            }
+
+            RegScope rsTrait(this);
+            size_t oldLocals = localStack.size();
+
+            if (AstClassPrimaryConstructor* params = trait->primaryConstructor)
+            {
+                for (size_t i = 0; i < params->args.size; ++i)
+                {
+                    AstExpr* paramDefault = params->argsDefaults.data[i];
+                    uint8_t reg = allocReg(trait, 1u);
+
+                    if (i < argCount)
+                    {
+                        bytecode.emitABC(LOP_MOVE, reg, uint8_t(argBase + argOffset + i), 0);
+
+                        // a nil argument still takes the parameter's default, as the copy's prologue would
+                        if (paramDefault)
+                            compileDefaultIfNil(paramDefault, reg);
+                    }
+                    else if (paramDefault)
+                    {
+                        compileExprTemp(paramDefault, reg);
+                    }
+                    else
+                    {
+                        bytecode.emitABC(LOP_LOADNIL, reg, 0, 0);
+                    }
+
+                    pushLocal(params->args.data[i], reg, kDefaultAllocPc);
+                }
+            }
+
+            for (const auto& [name, prop] : traitProvidedFields(trait))
+            {
+                bool constant = prop && isTraitConstantField(*prop);
+                if (constant && !plan.overridden.contains(name))
+                    continue;
+
+                if (prop && prop->defaultValue)
+                {
+                    storeField(name, prop->defaultValue);
+                    continue;
+                }
+
+                // a body field without a default restates the parameter it is named after, as does a parameter's own field
+                AstLocal* param = primaryConstructorParam(trait, name);
+                LUAU_ASSERT(param);
+                storeRegister(name, uint8_t(getLocalReg(param)));
+            }
+
+            popLocals(oldLocals);
+        }
+
+        // see above: an overriding constant of a class without `__init`
+        bool ownDefaultsOnlyAtAllocation = !cls->primaryConstructor && !findClassInit(cls) && !classPodDefaultsFn.contains(cls);
+        if (!ownDefaultsOnlyAtAllocation)
+            return;
+
+        for (const AstClassMember& member : cls->members)
+        {
+            const AstClassProperty* prop = member.get_if<AstClassProperty>();
+            if (prop && prop->defaultValue && plan.overridden.contains(prop->name))
+                storeField(prop->name, prop->defaultValue);
+        }
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): whether constructing `cls` has no trait fields to initialize, so construction
+    // can leave out INITTRAITS. That takes knowing every trait it gets (traitInitPlan): a trait from another module could
+    // have anything.
+    bool traitsNeedNoInit(AstStatClass* cls)
+    {
+        const TraitInitPlan* plan = traitInitPlan(cls);
+        if (!plan)
+            return false;
+
+        return std::none_of(
+            plan->initOrder.begin(),
+            plan->initOrder.end(),
+            [&](AstStatClass* trait)
+            {
+                return traitInitFn.contains(trait);
+            }
+        );
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): how many `implements` arguments `cls` passes, over all its entries
+    static size_t implementsArgCount(AstStatClass* cls)
+    {
+        size_t count = 0;
+        for (const AstClassTraitRef& ref : cls->implements)
+            count += ref.args.size;
+
+        return count;
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): whether compileTraitInit has nothing to emit for `cls`: no `implements`
+    // argument to evaluate, and no trait field to initialize
+    bool traitInitDoesNothing(AstStatClass* cls)
+    {
+        return implementsArgCount(cls) == 0 && traitsNeedNoInit(cls);
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): initializes the trait fields of the object in `objectReg`, an instance of
+    // `cls` under construction. Evaluates every `implements` argument, one value each and in list order, then runs the
+    // traits' initializers with them: inline when the compiler knows them (compileInlinedTraitInit), otherwise through
+    // INITTRAITS and the CALL of its runner. Construction code calls this between allocating the object and initializing
+    // the class's own fields, which come later so they can override the traits'.
+    void compileTraitInit(AstStatClass* cls, uint8_t objectReg)
+    {
+        if (traitInitDoesNothing(cls))
+            return;
+
+        size_t argCount = implementsArgCount(cls);
+        const TraitInitPlan* plan = traitInitPlan(cls);
+        bool inlined = plan && traitInitInlinable(*plan);
+
+        RegScope rs(this);
+
+        // the runner's call frame: the runner, the object, then the arguments
+        uint8_t frame = inlined ? 0 : allocReg(cls, unsigned(2 + argCount));
+        uint8_t argBase = inlined ? 0 : uint8_t(frame + 2);
+
+        if (inlined && argCount > 0)
+            argBase = allocReg(cls, unsigned(argCount));
+
+        size_t next = 0;
+        for (const AstClassTraitRef& ref : cls->implements)
+            for (AstExpr* arg : ref.args)
+                compileExprTemp(arg, uint8_t(argBase + next++));
+
+        if (inlined)
+        {
+            compileInlinedTraitInit(cls, *plan, objectReg, argBase);
+            return;
+        }
+
+        bytecode.emitABC(LOP_MOVE, uint8_t(frame + 1), objectReg, 0);
+
+        setDebugLine(cls);
+        size_t skipLabel = bytecode.emitLabel();
+        bytecode.emitAD(LOP_INITTRAITS, frame, 0);
+        bytecode.emitABC(LOP_CALL, frame, uint8_t(argCount + 2), 1);
+        patchJump(cls, skipLabel, bytecode.emitLabel());
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): `cls`'s copy of the trait function `function`, whose name is at `nameLocation`.
     // - The copy is a second AstExprFunction over the same body. Every analysis of the body applies to it unchanged,
     //   and its line info points into the trait, where the code is written, so errors and breakpoints do too.
     // - It compiles as a method of `cls`, which is what it is at runtime: the VM stamps it with the class
@@ -3762,14 +4376,15 @@ struct Compiler
     //   the order FunctionVisitor gives, nested functions first.
     AstExprFunction* copyTraitFunction(
         AstStatClass* cls,
-        const AstClassMethod& method,
+        AstExprFunction* function,
+        const Location& nameLocation,
         Allocator& allocator,
         std::vector<AstExprFunction*>& functionsToCompile
     )
     {
         std::vector<AstExprFunction*> originals;
         FunctionVisitor visitor(originals);
-        method.function->visit(&visitor);
+        function->visit(&visitor);
 
         functionCopySets.push_back(std::make_unique<FunctionCopies>(nullptr));
         FunctionCopies& copies = *functionCopySets.back();
@@ -3785,13 +4400,13 @@ struct Compiler
             functionsToCompile.push_back(copy);
         }
 
-        AstExprFunction* copy = copies[method.function];
+        AstExprFunction* copy = copies[function];
 
-        if (const SelfClassCheck* check = classMethodSelfChecks.find(method.function))
+        if (const SelfClassCheck* check = classMethodSelfChecks.find(function))
         {
             // read before inserting, which may move the entry `check` points to
             AstName methodName = check->methodName;
-            AstExpr* classExpr = allocator.alloc<AstExprLocal>(method.nameLocation, cls->name, /* upvalue= */ true);
+            AstExpr* classExpr = allocator.alloc<AstExprLocal>(nameLocation, cls->name, /* upvalue= */ true);
 
             classMethodSelfChecks[copy] = SelfClassCheck{classExpr, methodName};
             classMethodOwner[copy] = cls;
@@ -3800,14 +4415,19 @@ struct Compiler
         return copy;
     }
 
-    // Luwu Traits (rfcs/classes/traits.md): gives each class its own compiled copy (TraitFunctionCopy) of the functions of
-    // the traits it implements that are declared earlier in this file. The copies are ordinary protos of the module, so
-    // native code compiles them with the rest. The copies the VM makes for other traits are never natively compiled.
-    // - Everything a trait defines is copied, overridden defaults included, because `Trait.method(obj)` runs the class's
-    //   copy of the trait's version. Expected functions have no body, and a factory's `__create` belongs to the trait.
-    // - The VM still decides which copy goes where, so overriding, `final` and clashes work exactly as they do for a
-    //   trait from another module.
-    // - Classes and traits are only declared at the top level, so this only looks there.
+    // Luwu Traits (rfcs/classes/traits.md): for each class, creates its copy of every function it gets from a trait declared
+    // earlier in this file (classTraitCopies), so those copies are compiled ahead of time and can run natively.
+    // - Why: each class implementing a trait runs its own copy of the trait's functions, as a method of that class. Without
+    //   this, the VM makes those copies at runtime (luaR_copytraitfunction), and a VM-made copy is never natively compiled.
+    //   A copy made here is an ordinary proto of this module, compiled as a method of its class: `self` is checked against
+    //   that class, and the class's own fields are at offsets the compiler knows.
+    // - The VM still decides which member each copy becomes (LBC_NEWCLASSMEMBER_TRAITCOPY), so overriding, `final` and
+    //   name clashes behave exactly as they do for a trait from another module.
+    // - Copies every function with a body, including defaults the class overrides: an override can still call the trait's
+    //   version with `Trait.method(self)`, and that runs the trait's code through this copy. Skips `expect` functions
+    //   (no body) and a factory's `__create`, which belongs to the trait, not the class.
+    // - Also copies each trait's `__traitinit`, which construction runs for every object (LOP_INITTRAITS), so the trait's
+    //   fields are computed natively too.
     void buildTraitFunctionCopies(AstStatBlock* root, Allocator& allocator, std::vector<AstExprFunction*>& functionsToCompile)
     {
         for (AstStat* stat : root->body)
@@ -3837,7 +4457,15 @@ struct Compiler
                     if (!method || method->expectLocation || method->functionName == "__create")
                         continue;
 
-                    copies.push_back({trait, method->functionName, copyTraitFunction(decl, *method, allocator, functionsToCompile)});
+                    AstExprFunction* copy = copyTraitFunction(decl, method->function, method->nameLocation, allocator, functionsToCompile);
+                    copies.push_back({trait, method->functionName, copy});
+                }
+
+                // the trait's initializer too, which construction runs (LOP_INITTRAITS)
+                if (AstExprFunction* const* init = traitInitFn.find(trait))
+                {
+                    AstExprFunction* copy = copyTraitFunction(decl, *init, trait->name->location, allocator, functionsToCompile);
+                    copies.push_back({trait, names.getOrAdd("__traitinit"), copy});
                 }
             }
 
@@ -3924,7 +4552,7 @@ struct Compiler
                             flags |= LBC_CLASSMEMBER_PRIVATE;
                         if (prop.isConst)
                             flags |= LBC_CLASSMEMBER_CONST;
-                        if (prop.defaultValue)
+                        if (prop.defaultValue || primaryConstructorParam(decl, prop.name))
                             flags |= LBC_CLASSMEMBER_HASDEFAULT;
                         if (prop.expectLocation)
                             flags |= LBC_CLASSMEMBER_EXPECTED;
@@ -4029,9 +4657,9 @@ struct Compiler
                 checkConstant(propNameCid, arg->location);
                 shape.propertyNames.emplace_back(propNameCid);
 
-                // a parameter's field is initialized by the synthesized `__init` rather than by a
-                // default in the class shape, so it never carries HASDEFAULT
-                uint8_t flags = 0;
+                // the parameter gives its field a value (LBC_CLASSMEMBER_HASDEFAULT), through the synthesized
+                // `__init` rather than a default in the class shape
+                uint8_t flags = LBC_CLASSMEMBER_HASDEFAULT;
                 if (qualifiers.visibility == AstClassMemberVisibility::Private)
                     flags |= LBC_CLASSMEMBER_PRIVATE;
                 if (qualifiers.isConst)
@@ -4095,7 +4723,9 @@ struct Compiler
 
         registerSynthesizedMember(traitInitFn, "__traitinit");
         registerSynthesizedMember(traitNeedsFn, "__needs");
-        registerSynthesizedMember(classInitTraitsFn, "__inittraits");
+        // a class without an `__init` whose traits initialize nothing has no `__implements` for the constructor to call
+        if (!traitInitDoesNothing(decl))
+            registerSynthesizedMember(classImplementsFn, "__implements");
 
         // Luwu Traits (rfcs/classes/traits.md): the class's copies of the functions of its same-file traits, which
         // implementing uses instead of copying those functions at runtime
@@ -5040,6 +5670,12 @@ struct Compiler
             return;
         }
 
+        // Luwu Table Comprehensions (rfcs/table-comprehensions.md): nothing can observe the table in `#{ for ... }`, so only
+        // its length is computed and the table is never built
+        AstExprTableComprehension* counted = expr->op == AstExprUnary::Op::Len ? expr->expr->as<AstExprTableComprehension>() : nullptr;
+        if (counted && !counted->item->key)
+            return compileComprehensionCount(counted, target);
+
         uint8_t re = compileExprAuto(expr->expr, rs);
 
         bytecode.emitABC(getUnaryOp(expr->op), target, re, 0);
@@ -5199,8 +5835,506 @@ struct Compiler
         }
     }
 
+    // Luwu If Local (rfcs/if-local.md): emits a `when` chain's clauses in order, adding a jump to `elseJumps` after
+    // each one, taken when it fails. A binding gets a register of its own and stays pushed as a local; the caller
+    // closes and pops the chain's locals (from `oldLocals`) after the branch.
+    void compileIfClauses(const AstArray<AstIfClause>& clauses, std::vector<size_t>& elseJumps)
+    {
+        for (const AstIfClause& clause : clauses)
+        {
+            if (clause.local)
+            {
+                uint8_t reg = allocReg(clause.expr, 1u);
+                uint32_t allocpc = bytecode.getDebugPC();
+
+                compileExprTemp(clause.expr, reg);
+                pushLocal(clause.local, reg, allocpc);
+
+                elseJumps.push_back(bytecode.emitLabel());
+                bytecode.emitAD(LOP_JUMPIFNOT, reg, 0);
+            }
+            else
+            {
+                compileConditionValue(clause.expr, nullptr, elseJumps, false);
+            }
+        }
+    }
+
+    // Luwu If Local (rfcs/if-local.md): the lowest register among the captured locals from `start` up, or -1. A
+    // clause can capture an earlier binding (`when run(function() x = nil end)`), and when a later clause fails the
+    // else path has to close that upvalue too, because the binding's register is reused after the chain.
+    int capturedLocalsReg(size_t start)
+    {
+        int reg = -1;
+
+        for (size_t i = start; i < localStack.size(); ++i)
+        {
+            Local* l = locals.find(localStack[i]);
+            LUAU_ASSERT(l);
+
+            if (l->captured && (reg < 0 || l->reg < reg))
+                reg = l->reg;
+        }
+
+        return reg;
+    }
+
+    // Luwu If Local (rfcs/if-local.md)
+    void compileExprIfElseClauses(AstExprIfElse* expr, uint8_t target, bool targetTemp)
+    {
+        size_t oldLocals = localStack.size();
+        std::vector<size_t> elseJump;
+        int closeReg = -1;
+
+        {
+            RegScope rs(this);
+
+            compileIfClauses(expr->clauses, elseJump);
+            compileExpr(expr->trueExpr, target, targetTemp);
+
+            closeReg = capturedLocalsReg(oldLocals);
+            closeLocals(oldLocals);
+            popLocals(oldLocals);
+        }
+
+        size_t thenLabel = bytecode.emitLabel();
+        bytecode.emitAD(LOP_JUMP, 0, 0);
+
+        size_t elseLabel = bytecode.emitLabel();
+        if (closeReg >= 0)
+            bytecode.emitABC(LOP_CLOSEUPVALS, uint8_t(closeReg), 0, 0);
+
+        compileExpr(expr->falseExpr, target, targetTemp);
+        size_t endLabel = bytecode.emitLabel();
+
+        patchJumps(expr, elseJump, elseLabel);
+        patchJump(expr, thenLabel, endLabel);
+    }
+
+    // Luwu Do Expressions (rfcs/do-expressions.md): the block runs in place, and each `give` compiles its value into
+    // `target`, closes the block's captured locals and jumps to the end, the way an inlined function's `return` does
+    // (compileInlineReturn). `return`, `break` and `continue` leave through their usual paths: they close upvalues
+    // from the local stack, which already holds the block's locals.
+    void compileExprDo(AstExprDo* expr, uint8_t target, bool targetTemp)
+    {
+        RegScope rs(this);
+
+        giveFrames.push_back({target, targetTemp, localStack.size(), {}});
+
+        // The block always ends in a `give`, `return`, `break` or `continue`, so nothing falls through it
+        LUAU_ASSERT(alwaysTerminates(expr->body));
+        compileStat(expr->body);
+
+        // The last `give`'s jump goes to the very next instruction (see the same in compileInlinedCall)
+        std::vector<size_t>& jumps = giveFrames.back().jumps;
+        if (!jumps.empty() && jumps.back() == bytecode.emitLabel() - 1)
+        {
+            bytecode.undoEmit(LOP_JUMP);
+            jumps.pop_back();
+        }
+
+        size_t endLabel = bytecode.emitLabel();
+        patchJumps(expr, giveFrames.back().jumps, endLabel);
+
+        giveFrames.pop_back();
+    }
+
+    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): the comprehension's loop compiles like any loop, with its
+    // item appending to the table (compileStatComprehensionItem). What makes it faster than the loop one would write by
+    // hand is the sizing: the table is allocated for every element the source can produce, by NEWTABLE for a constant
+    // range or by PRESIZETABLE at the loop's start (compileComprehensionPresize), so filling it never rehashes. An array
+    // comprehension that skipped elements is trimmed afterwards, so it never holds more than twice what it uses, like a
+    // table grown one element at a time.
+    void compileExprTableComprehension(AstExprTableComprehension* expr, uint8_t target, bool targetTemp)
+    {
+        if (options.optimizationLevel >= 2 && tryCompileConstantComprehension(expr, target))
+            return;
+
+        RegScope rs(this);
+
+        bool isMap = expr->item->key != nullptr;
+
+        // The target can be a local the loop reads (`t = { for _, v in t do v }`), so the table is only written to it at the end
+        uint8_t table = targetTemp ? target : allocReg(expr, 1u);
+        uint8_t counter = isMap ? kInvalidReg : allocReg(expr, 1u);
+
+        // Only a single clause's source says how many elements there are: a flattening comprehension grows as it goes
+        AstStat* presizeLoop = expr->clauseCount == 1 ? expr->loop : nullptr;
+        unsigned staticSize = 0;
+
+        if (AstStatFor* range = presizeLoop ? presizeLoop->as<AstStatFor>() : nullptr)
+        {
+            double from = 0;
+            double step = 0;
+            int tripCount = getConstantTripCount(range, from, step);
+
+            if (tripCount >= 0)
+            {
+                staticSize = std::min(unsigned(tripCount), unsigned(LBC_PRESIZE_RANGE_LIMIT));
+                presizeLoop = nullptr;
+            }
+        }
+
+        bool sized = presizeLoop || staticSize > 0;
+
+        bytecode.addDebugRemark("allocation: table comprehension");
+
+        if (isMap)
+        {
+            bytecode.emitABC(LOP_NEWTABLE, table, encodeHashSize(staticSize), 0);
+            bytecode.emitAux(0);
+        }
+        else
+        {
+            bytecode.emitABC(LOP_NEWTABLE, table, 0, 0);
+            bytecode.emitAux(staticSize);
+            bytecode.emitABC(LOP_LOADN, counter, 0, 0);
+        }
+
+        comprehensionFrames.push_back({table, counter, presizeLoop});
+        compileStat(expr->loop);
+        comprehensionFrames.pop_back();
+
+        if (!isMap && sized)
+            bytecode.emitABC(LOP_PRESIZETABLE, table, counter, LBC_PRESIZE_TRIM);
+
+        if (table != target)
+            bytecode.emitABC(LOP_MOVE, target, table, 0);
+    }
+
+    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): the trip count of a numeric for whose bounds and step are
+    // constants, with the first value and the step; -1 when they aren't constant (see getTripCount for the other -1 cases)
+    int getConstantTripCount(AstStatFor* range, double& from, double& step)
+    {
+        Constant one = {Constant::Type_Number};
+        one.valueNumber = 1.0;
+
+        Constant fromc = getConstant(range->from);
+        Constant toc = getConstant(range->to);
+        Constant stepc = range->step ? getConstant(range->step) : one;
+
+        bool constantRange = fromc.type == Constant::Type_Number && toc.type == Constant::Type_Number && stepc.type == Constant::Type_Number;
+        if (!constantRange)
+            return -1;
+
+        from = fromc.valueNumber;
+        step = stepc.valueNumber;
+        return getTripCount(fromc.valueNumber, toc.valueNumber, stepc.valueNumber);
+    }
+
+    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): an array comprehension over a constant range whose item and
+    // `when` conditions fold to constants on every iteration has nothing left to run at runtime. It compiles to what the
+    // literal it builds compiles to: `{ for i = 1, 4 do i * 2 }` is `{ 2, 4, 6, 8 }`, a NEWTABLE and SETLISTs.
+    bool tryCompileConstantComprehension(AstExprTableComprehension* expr, uint8_t target)
+    {
+        AstStatFor* range = expr->clauseCount == 1 ? expr->loop->as<AstStatFor>() : nullptr;
+        if (!range || expr->item->key)
+            return false;
+
+        AstStatIf* guard = range->body->body.data[0]->as<AstStatIf>();
+        if (guard)
+        {
+            // a binding needs a register, so it can't fold away
+            for (const AstIfClause& clause : guard->clauses)
+                if (clause.declaration)
+                    return false;
+        }
+
+        double from = 0;
+        double step = 0;
+        int tripCount = getConstantTripCount(range, from, step);
+
+        if (tripCount < 0 || tripCount > kConstantComprehensionLimit)
+            return false;
+
+        if (Variable* lv = variables.find(range->var); lv && lv->written)
+            return false;
+
+        AstLocal* var = range->var;
+        std::vector<Constant> values;
+        bool foldable = true;
+
+        // Local logs: the shared ones may hold an enclosing unrolled loop's or inlined call's changes
+        Compile::ExprConstantChangeLog foldExprChanges;
+        Compile::LocalConstantChangeLog foldLocalChanges;
+
+        for (int iv = 0; iv < tripCount && foldable; ++iv)
+        {
+            locstants[var].type = Constant::Type_Number;
+            locstants[var].valueNumber = from + iv * step;
+
+            // the first fold records what it changes, so the state before the comprehension can be restored
+            foldConstants(
+                constants,
+                variables,
+                locstants,
+                builtinsFold,
+                builtinsFoldLibraryK,
+                options.vectorPrecision == 1,
+                options.libraryMemberConstantCb,
+                range,
+                names,
+                tableConstants,
+                iv == 0 ? &foldExprChanges : nullptr,
+                iv == 0 ? &foldLocalChanges : nullptr
+            );
+
+            bool skipped = false;
+
+            if (guard)
+            {
+                // a single plain `when` is the if's own condition, a chain is its clauses
+                std::vector<AstExpr*> conditions;
+                if (guard->clauses.size == 0)
+                    conditions.push_back(guard->condition);
+                for (const AstIfClause& clause : guard->clauses)
+                    conditions.push_back(clause.expr);
+
+                for (AstExpr* conditionExpr : conditions)
+                {
+                    Constant condition = getConstant(conditionExpr);
+                    if (condition.type == Constant::Type_Unknown)
+                    {
+                        foldable = false;
+                        break;
+                    }
+
+                    if (!condition.isTruthful())
+                    {
+                        skipped = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!foldable || skipped)
+                continue;
+
+            Constant value = getConstant(expr->item->value);
+            if (value.type == Constant::Type_Unknown)
+                foldable = false;
+            else if (value.type != Constant::Type_Nil)
+                values.push_back(value);
+        }
+
+        locstants[var].type = Constant::Type_Unknown;
+        Compile::undoChanges(constants, foldExprChanges);
+        Compile::undoChanges(locstants, foldLocalChanges);
+
+        if (!foldable)
+            return false;
+
+        bytecode.addDebugRemark("allocation: table comprehension folded to %d constants", int(values.size()));
+
+        // the items are constants, so nothing reads the target and the table can be built in it directly
+        bytecode.emitABC(LOP_NEWTABLE, target, 0, 0);
+        bytecode.emitAux(uint32_t(values.size()));
+
+        RegScope rs(this);
+        unsigned chunkSize = std::min(16u, unsigned(values.size()));
+        uint8_t chunk = chunkSize ? allocReg(expr, chunkSize) : 0;
+
+        for (size_t start = 0; start < values.size(); start += chunkSize)
+        {
+            size_t count = std::min(size_t(chunkSize), values.size() - start);
+
+            for (size_t i = 0; i < count; ++i)
+                compileExprConstant(expr->item->value, &values[start + i], uint8_t(chunk + i));
+
+            bytecode.emitABC(LOP_SETLIST, target, chunk, uint8_t(count + 1));
+            bytecode.emitAux(uint32_t(start + 1));
+        }
+
+        return true;
+    }
+
+    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): `#{ for ... }`, which counts the items that aren't nil
+    // without building the table (see ComprehensionFrame)
+    void compileComprehensionCount(AstExprTableComprehension* expr, uint8_t target)
+    {
+        RegScope rs(this);
+
+        // the target can be a local the loop reads, so the count is only written to it at the end
+        uint8_t counter = allocReg(expr, 1u);
+        bytecode.emitABC(LOP_LOADN, counter, 0, 0);
+
+        comprehensionFrames.push_back({kInvalidReg, counter, nullptr});
+        compileStat(expr->loop);
+        comprehensionFrames.pop_back();
+
+        bytecode.emitABC(LOP_MOVE, target, counter, 0);
+    }
+
+    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): sizes the comprehension's table from the loop whose
+    // registers start at `regs`, when that loop is the one its frame sizes from
+    void compileComprehensionPresize(AstStat* loop, uint8_t regs, bool range)
+    {
+        if (comprehensionFrames.empty() || comprehensionFrames.back().presizeLoop != loop)
+            return;
+
+        const ComprehensionFrame& frame = comprehensionFrames.back();
+        bool isMap = frame.counter == kInvalidReg;
+
+        uint8_t form = 0;
+        if (range)
+            form = isMap ? LBC_PRESIZE_RANGE_HASH : LBC_PRESIZE_RANGE_ARRAY;
+        else
+            form = isMap ? LBC_PRESIZE_ITER_HASH : LBC_PRESIZE_ITER_ARRAY;
+
+        bytecode.emitABC(LOP_PRESIZETABLE, frame.table, regs, form);
+    }
+
+    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): one element. A nil value adds nothing, which is also how an
+    // `if c then v else nil` item filters.
+    void compileStatComprehensionItem(AstStatComprehensionItem* stat)
+    {
+        LUAU_ASSERT(!comprehensionFrames.empty());
+        // A copy: compiling the item can push a nested comprehension's frame, which may reallocate the vector
+        ComprehensionFrame frame = comprehensionFrames.back();
+
+        RegScope rs(this);
+
+        if (frame.table == kInvalidReg)
+        {
+            LUAU_ASSERT(!stat->key);
+            compileComprehensionCountItem(stat, frame.counter, rs);
+            return;
+        }
+
+        // the key is evaluated before the value, as in a table constructor
+        uint8_t key = stat->key ? compileExprAuto(stat->key, rs) : kInvalidReg;
+        uint8_t value = compileExprAuto(stat->value, rs);
+
+        if (!stat->key)
+        {
+            bytecode.emitABC(LOP_APPENDTABLE, frame.table, value, frame.counter);
+            return;
+        }
+
+        size_t skipLabel = bytecode.emitLabel();
+        bytecode.emitAD(LOP_JUMPXEQKNIL, value, 0);
+        bytecode.emitAux(0);
+
+        if (stat->accumulate)
+            compileComprehensionAccumulate(stat, frame.table, key, value);
+        else
+            bytecode.emitABC(LOP_SETTABLE, value, frame.table, key);
+
+        size_t endLabel = bytecode.emitLabel();
+        patchJump(stat, skipLabel, endLabel);
+    }
+
+    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): an item of `#{ for ... }`: counted unless it is nil
+    void compileComprehensionCountItem(AstStatComprehensionItem* stat, uint8_t counter, RegScope& rs)
+    {
+        // a constant has no side effects to keep, so a non-nil one just counts and a nil one does nothing
+        const Constant* constant = constants.find(stat->value);
+        bool knownNil = constant && constant->type == Constant::Type_Nil;
+        bool knownValue = constant && constant->type != Constant::Type_Unknown && !knownNil;
+
+        if (knownNil)
+            return;
+
+        size_t skipLabel = 0;
+        if (!knownValue)
+        {
+            uint8_t value = compileExprAuto(stat->value, rs);
+            skipLabel = bytecode.emitLabel();
+            bytecode.emitAD(LOP_JUMPXEQKNIL, value, 0);
+            bytecode.emitAux(0);
+        }
+
+        int32_t one = bytecode.addConstantNumber(1.0);
+        if (one < 0)
+            CompileError::raise(stat->location, "Exceeded constant limit; simplify the code to compile");
+
+        if (one <= 255)
+        {
+            bytecode.emitABC(LOP_ADDK, counter, counter, uint8_t(one));
+        }
+        else
+        {
+            RegScope rs(this);
+            uint8_t step = allocReg(stat, 1u);
+            bytecode.emitABC(LOP_LOADN, step, 1, 0);
+            bytecode.emitABC(LOP_ADD, counter, counter, step);
+        }
+
+        if (!knownValue)
+            patchJump(stat, skipLabel, bytecode.emitLabel());
+    }
+
+    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): `[key] op= value`. The key's current value is combined
+    // with the new one; an absent key stores the value itself (negated for -=)
+    void compileComprehensionAccumulate(AstStatComprehensionItem* stat, uint8_t table, uint8_t key, uint8_t value)
+    {
+        RegScope rs(this);
+        AstExprBinary::Op op = *stat->accumulate;
+
+        uint8_t current = allocReg(stat, 1u);
+        bytecode.emitABC(LOP_GETTABLE, current, table, key);
+
+        size_t absentLabel = bytecode.emitLabel();
+        bytecode.emitAD(LOP_JUMPXEQKNIL, current, 0);
+        bytecode.emitAux(0);
+
+        if (op == AstExprBinary::Concat)
+        {
+            // CONCAT reads a run of consecutive registers
+            uint8_t pair = allocReg(stat, 2u);
+            bytecode.emitABC(LOP_MOVE, pair, current, 0);
+            bytecode.emitABC(LOP_MOVE, uint8_t(pair + 1), value, 0);
+            bytecode.emitABC(LOP_CONCAT, current, pair, uint8_t(pair + 1));
+        }
+        else
+        {
+            bytecode.emitABC(getBinaryOpArith(op), current, current, value);
+        }
+
+        bytecode.emitABC(LOP_SETTABLE, current, table, key);
+
+        size_t doneLabel = bytecode.emitLabel();
+        bytecode.emitAD(LOP_JUMP, 0, 0);
+
+        patchJump(stat, absentLabel, bytecode.emitLabel());
+
+        if (op == AstExprBinary::Sub)
+        {
+            bytecode.emitABC(LOP_MINUS, current, value, 0);
+            bytecode.emitABC(LOP_SETTABLE, current, table, key);
+        }
+        else
+        {
+            bytecode.emitABC(LOP_SETTABLE, value, table, key);
+        }
+
+        patchJump(stat, doneLabel, bytecode.emitLabel());
+    }
+
+    // Luwu Do Expressions (rfcs/do-expressions.md)
+    void compileStatGive(AstStatGive* stat)
+    {
+        LUAU_ASSERT(!giveFrames.empty());
+
+        // Each `give` writes the target only once, right before it jumps out: the target can be a live local that the
+        // block still reads (`x = do ... give x + 1`), so it's never used as scratch before that
+        {
+            RegScope rs(this);
+            GiveFrame& frame = giveFrames.back();
+            compileExpr(stat->value, frame.target, frame.targetTemp);
+        }
+
+        closeLocals(giveFrames.back().localOffset);
+
+        giveFrames.back().jumps.push_back(bytecode.emitLabel());
+        bytecode.emitAD(LOP_JUMP, 0, 0);
+    }
+
     void compileExprIfElse(AstExprIfElse* expr, uint8_t target, bool targetTemp)
     {
+        if (expr->clauses.size != 0)
+            return compileExprIfElseClauses(expr, target, targetTemp);
+
         if (isConstant(expr->condition))
         {
             if (isConstantTrue(expr->condition))
@@ -5975,6 +7109,14 @@ struct Compiler
         {
             compileExprIfElse(expr, target, targetTemp);
         }
+        else if (AstExprDo* expr = node->as<AstExprDo>())
+        {
+            compileExprDo(expr, target, targetTemp);
+        }
+        else if (AstExprTableComprehension* expr = node->as<AstExprTableComprehension>())
+        {
+            compileExprTableComprehension(expr, target, targetTemp);
+        }
         else if (AstExprInterpString* interpString = node->as<AstExprInterpString>())
         {
             compileExprInterpString(interpString, target, targetTemp);
@@ -6356,8 +7498,58 @@ struct Compiler
             return nullptr;
     }
 
+    // Luwu If Local (rfcs/if-local.md)
+    void compileStatIfClauses(AstStatIf* stat)
+    {
+        size_t oldLocals = localStack.size();
+        std::vector<size_t> elseJump;
+        bool thenTerminates = alwaysTerminates(stat->thenbody);
+        int closeReg = -1;
+
+        // With no else branch, the branch falls through to the else path's CLOSEUPVALS, which closes for both
+        bool thenFallsIntoElsePath = !stat->elsebody && !thenTerminates;
+
+        {
+            RegScope rs(this);
+
+            compileIfClauses(stat->clauses, elseJump);
+            compileStat(stat->thenbody);
+
+            closeReg = capturedLocalsReg(oldLocals);
+
+            if (!thenTerminates && !thenFallsIntoElsePath)
+                closeLocals(oldLocals);
+
+            popLocals(oldLocals);
+        }
+
+        size_t thenLabel = 0;
+        bool jumpOverElse = stat->elsebody && !thenTerminates;
+
+        if (jumpOverElse)
+        {
+            thenLabel = bytecode.emitLabel();
+            bytecode.emitAD(LOP_JUMP, 0, 0);
+        }
+
+        size_t elseLabel = bytecode.emitLabel();
+        if (closeReg >= 0)
+            bytecode.emitABC(LOP_CLOSEUPVALS, uint8_t(closeReg), 0, 0);
+
+        if (stat->elsebody)
+            compileStat(stat->elsebody);
+
+        patchJumps(stat, elseJump, elseLabel);
+
+        if (jumpOverElse)
+            patchJump(stat, thenLabel, bytecode.emitLabel());
+    }
+
     void compileStatIf(AstStatIf* stat)
     {
+        if (stat->clauses.size != 0)
+            return compileStatIfClauses(stat);
+
         // Optimization: condition is always false => we only need the else body
         if (isConstantFalse(stat->condition))
         {
@@ -6376,32 +7568,32 @@ struct Compiler
         }
 
         // Optimization: body is a "break" statement with no "else" => we can directly break out of the loop in "then" case
-        if (!stat->elsebody && isStatBreak(stat->thenbody) && !areLocalsCaptured(loops.back().localOffset))
+        if (!stat->elsebody && isStatBreak(stat->thenbody) && !areLocalsCaptured(loops[targetLoop()].localOffset))
         {
             // fallthrough = continue with the loop as usual
             std::vector<size_t> elseJump;
             compileConditionValue(stat->condition, nullptr, elseJump, true);
 
             for (size_t jump : elseJump)
-                loopJumps.push_back({LoopJump::Break, jump});
+                loopJumps.push_back({LoopJump::Break, jump, targetLoop()});
             return;
         }
 
         AstStatContinue* continueStatement = extractStatContinue(stat->thenbody);
 
         // Optimization: body is a "continue" statement with no "else" => we can directly continue in "then" case
-        if (!stat->elsebody && continueStatement != nullptr && !areLocalsCaptured(loops.back().localOffsetContinue))
+        if (!stat->elsebody && continueStatement != nullptr && !areLocalsCaptured(loops[targetLoop()].localOffsetContinue))
         {
             // track continue statement for repeat..until validation (validateContinueUntil)
-            if (!loops.back().continueUsed)
-                loops.back().continueUsed = continueStatement;
+            if (!loops[targetLoop()].continueUsed)
+                loops[targetLoop()].continueUsed = continueStatement;
 
             // fallthrough = proceed with the loop body as usual
             std::vector<size_t> elseJump;
             compileConditionValue(stat->condition, nullptr, elseJump, true);
 
             for (size_t jump : elseJump)
-                loopJumps.push_back({LoopJump::Continue, jump});
+                loopJumps.push_back({LoopJump::Continue, jump, targetLoop()});
             return;
         }
 
@@ -6477,7 +7669,9 @@ struct Compiler
         size_t loopLabel = bytecode.emitLabel();
 
         std::vector<size_t> elseJump;
+        loops.back().compilingHeader = true;
         compileConditionValue(stat->condition, nullptr, elseJump, false);
+        loops.back().compilingHeader = false;
 
         compileStat(stat->body);
 
@@ -6497,7 +7691,6 @@ struct Compiler
         patchJumps(stat, elseJump, endLabel);
 
         patchLoopJumps(stat, oldJumps, endLabel, contLabel);
-        loopJumps.resize(oldJumps);
 
         loops.pop_back();
     }
@@ -6574,7 +7767,9 @@ struct Compiler
         else
         {
             std::vector<size_t> skipJump;
+            loops.back().compilingHeader = true;
             compileConditionValue(stat->condition, nullptr, skipJump, true);
+            loops.back().compilingHeader = false;
 
             // we close locals *after* we compute loop conditionals because during computation of condition it's (in theory) possible that user code
             // mutates them
@@ -6600,7 +7795,6 @@ struct Compiler
         popLocals(oldLocals);
 
         patchLoopJumps(stat, oldJumps, endLabel, contLabel);
-        loopJumps.resize(oldJumps);
 
         loops.pop_back();
     }
@@ -6905,6 +8099,7 @@ struct Compiler
         if (Variable* il = variables.find(stat->var); il && il->written)
             varreg = allocReg(stat, 1u);
 
+        loops.back().compilingHeader = true;
         compileExprTemp(stat->from, uint8_t(regs + 2));
         compileExprTemp(stat->to, uint8_t(regs + 0));
 
@@ -6912,6 +8107,9 @@ struct Compiler
             compileExprTemp(stat->step, uint8_t(regs + 1));
         else
             bytecode.emitABC(LOP_LOADN, uint8_t(regs + 1), 1, 0);
+        loops.back().compilingHeader = false;
+
+        compileComprehensionPresize(stat, regs, /* range= */ true);
 
         size_t forLabel = bytecode.emitLabel();
 
@@ -6943,7 +8141,6 @@ struct Compiler
         patchJump(stat, backLabel, loopLabel);
 
         patchLoopJumps(stat, oldJumps, endLabel, contLabel);
-        loopJumps.resize(oldJumps);
 
         loops.pop_back();
     }
@@ -6962,7 +8159,11 @@ struct Compiler
         uint8_t regs = allocReg(stat, 3u);
 
         // this puts initial values of (generator, state, index) into the loop registers
+        loops.back().compilingHeader = true;
         compileExprListTemp(stat->values, regs, 3, /* targetTop= */ true);
+        loops.back().compilingHeader = false;
+
+        compileComprehensionPresize(stat, regs, /* range= */ false);
 
         // note that we reserve at least 2 variables; this allows our fast path to assume that we need 2 variables instead of 1 or 2
         uint8_t vars = allocReg(stat, std::max(unsigned(stat->vars.size), 2u));
@@ -7026,7 +8227,6 @@ struct Compiler
         patchJump(stat, backLabel, loopLabel);
 
         patchLoopJumps(stat, oldJumps, endLabel, contLabel);
-        loopJumps.resize(oldJumps);
 
         loops.pop_back();
     }
@@ -7376,34 +8576,44 @@ struct Compiler
         else if (node->is<AstStatBreak>())
         {
             LUAU_ASSERT(!loops.empty());
+            size_t loop = targetLoop();
 
             // before exiting out of the loop, we need to close all local variables that were captured in closures since loop start
             // normally they are closed by the enclosing blocks, including the loop block, but we're skipping that here
-            closeLocals(loops.back().localOffset);
+            closeLocals(loops[loop].localOffset);
 
             size_t label = bytecode.emitLabel();
 
             bytecode.emitAD(LOP_JUMP, 0, 0);
 
-            loopJumps.push_back({LoopJump::Break, label});
+            loopJumps.push_back({LoopJump::Break, label, loop});
         }
         else if (AstStatContinue* stat = node->as<AstStatContinue>())
         {
             LUAU_ASSERT(!loops.empty());
+            size_t loop = targetLoop();
 
             // track continue statement for repeat..until validation (validateContinueUntil)
-            if (!loops.back().continueUsed)
-                loops.back().continueUsed = stat;
+            if (!loops[loop].continueUsed)
+                loops[loop].continueUsed = stat;
 
             // before continuing, we need to close all local variables that were captured in closures since loop start
             // normally they are closed by the enclosing blocks, including the loop block, but we're skipping that here
-            closeLocals(loops.back().localOffsetContinue);
+            closeLocals(loops[loop].localOffsetContinue);
 
             size_t label = bytecode.emitLabel();
 
             bytecode.emitAD(LOP_JUMP, 0, 0);
 
-            loopJumps.push_back({LoopJump::Continue, label});
+            loopJumps.push_back({LoopJump::Continue, label, loop});
+        }
+        else if (AstStatGive* stat = node->as<AstStatGive>())
+        {
+            compileStatGive(stat);
+        }
+        else if (AstStatComprehensionItem* stat = node->as<AstStatComprehensionItem>())
+        {
+            compileStatComprehensionItem(stat);
         }
         else if (AstStatReturn* stat = node->as<AstStatReturn>())
         {
@@ -7703,13 +8913,28 @@ struct Compiler
             patchJump(node, l, target);
     }
 
+    // Patches the jumps the innermost loop owns, and truncates loopJumps back to `oldJumps`, keeping the jumps that
+    // belong to an enclosing loop.
     void patchLoopJumps(AstNode* node, size_t oldJumps, size_t endLabel, size_t contLabel)
     {
         LUAU_ASSERT(oldJumps <= loopJumps.size());
+        LUAU_ASSERT(!loops.empty());
+
+        size_t loop = loops.size() - 1;
+        size_t kept = oldJumps;
 
         for (size_t i = oldJumps; i < loopJumps.size(); ++i)
         {
             const LoopJump& lj = loopJumps[i];
+
+            // Luwu Do Expressions (rfcs/do-expressions.md): a `do` expression in this loop's header jumps for an
+            // enclosing loop, which patches it later
+            if (lj.loop != loop)
+            {
+                LUAU_ASSERT(lj.loop < loop);
+                loopJumps[kept++] = lj;
+                continue;
+            }
 
             switch (lj.type)
             {
@@ -7725,6 +8950,26 @@ struct Compiler
                 LUAU_ASSERT(!"Unknown loop jump type");
             }
         }
+
+        loopJumps.resize(kept);
+    }
+
+    // Luwu Do Expressions (rfcs/do-expressions.md): the loop a `break` or `continue` belongs to: the innermost loop that
+    // isn't compiling its own header (a `while` or `until` condition, `for` bounds, `for ... in` values). A header runs
+    // outside its loop's body, so the parser resolves a `break`/`continue` in a `do` expression there to the enclosing
+    // loop.
+    size_t targetLoop() const
+    {
+        LUAU_ASSERT(!loops.empty());
+        size_t loop = loops.size() - 1;
+
+        while (loops[loop].compilingHeader)
+        {
+            LUAU_ASSERT(loop > 0);
+            --loop;
+        }
+
+        return loop;
     }
 
     uint8_t allocReg(AstNode* node, unsigned int count)
@@ -8013,7 +9258,7 @@ struct Compiler
         DenseHashMap<AstStatClass*, AstExprFunction*>& primaryInitFn;
         DenseHashMap<AstStatClass*, AstExprFunction*>& traitInitFn;
         DenseHashMap<AstStatClass*, AstExprFunction*>& traitNeedsFn;
-        DenseHashMap<AstStatClass*, AstExprFunction*>& classInitTraitsFn;
+        DenseHashMap<AstStatClass*, AstExprFunction*>& classImplementsFn;
         DenseHashMap<AstStatClass*, std::vector<AstExpr*>>& podConstDefaults;
         DenseHashMap<AstExprFunction*, SelfClassCheck>& methodSelfChecks;
         DenseHashMap<AstExprFunction*, AstStatClass*>& methodOwner;
@@ -8029,7 +9274,7 @@ struct Compiler
             DenseHashMap<AstStatClass*, AstExprFunction*>& primaryInitFn,
             DenseHashMap<AstStatClass*, AstExprFunction*>& traitInitFn,
             DenseHashMap<AstStatClass*, AstExprFunction*>& traitNeedsFn,
-            DenseHashMap<AstStatClass*, AstExprFunction*>& classInitTraitsFn,
+            DenseHashMap<AstStatClass*, AstExprFunction*>& classImplementsFn,
             DenseHashMap<AstStatClass*, std::vector<AstExpr*>>& podConstDefaults,
             DenseHashMap<AstExprFunction*, SelfClassCheck>& methodSelfChecks,
             DenseHashMap<AstExprFunction*, AstStatClass*>& methodOwner,
@@ -8044,7 +9289,7 @@ struct Compiler
             , primaryInitFn(primaryInitFn)
             , traitInitFn(traitInitFn)
             , traitNeedsFn(traitNeedsFn)
-            , classInitTraitsFn(classInitTraitsFn)
+            , classImplementsFn(classImplementsFn)
             , podConstDefaults(podConstDefaults)
             , methodSelfChecks(methodSelfChecks)
             , methodOwner(methodOwner)
@@ -8371,53 +9616,20 @@ struct Compiler
             }
         }
 
-        // Luwu Traits (rfcs/classes/traits.md): a class whose `implements` list passes trait arguments gets
-        // `__inittraits(self, init1, ..., initN, params...)`: one trait initializer per entry that passes arguments, in list
-        // order (the VM passes the class's copies of those traits' `__traitinit`), then the primary constructor's
-        // parameters. It calls each initializer with `self` and the entry's arguments, so the arguments are evaluated
-        // right where they are used. The VM calls it on every construction.
-        void visitImplements(AstStatClass* node)
+        // Luwu Traits (rfcs/classes/traits.md): construction initializes a class's trait fields inside the class's own
+        // code (compileTraitInit), and a class with no `__init` has none to do it in. So it gets `__implements(self)`, which
+        // the constructor calls before the class's own field defaults. Its body is empty here; compileFunction emits the
+        // work.
+        void visitPodImplements(AstStatClass* node)
         {
             size_t functionDepth = node->name->functionDepth + 1;
             AstLocal* self = buildSynthesizedLocal("self", node->location, functionDepth);
+
             std::vector<AstLocal*> args{self};
             std::vector<AstExpr*> argsDefaults{nullptr};
-            std::vector<AstStat*> body;
+            AstExprFunction* fn = buildSynthesizedFunction(node, node->location, copyToAst(args), copyToAst(argsDefaults), {}, "__implements");
 
-            for (const AstClassTraitRef& ref : node->implements)
-            {
-                if (ref.args.size == 0)
-                    continue;
-
-                AstLocal* init = buildSynthesizedLocal("init", ref.location, functionDepth);
-                args.push_back(init);
-                argsDefaults.push_back(nullptr);
-
-                std::vector<AstExpr*> callArgs{allocator.alloc<AstExprLocal>(ref.location, self, /* upvalue= */ false)};
-                // one value each, as a trait parameter takes: a call's extra results don't spill into the next one
-                for (AstExpr* arg : ref.args)
-                    callArgs.push_back(allocator.alloc<AstExprGroup>(arg->location, arg));
-
-                AstExpr* func = allocator.alloc<AstExprLocal>(ref.location, init, /* upvalue= */ false);
-                AstExprCall* call = allocator.alloc<AstExprCall>(ref.location, func, copyToAst(callArgs), /* self= */ false, AstArray<AstTypeOrPack>(), ref.location);
-                body.push_back(allocator.alloc<AstStatExpr>(ref.location, call));
-            }
-
-            if (body.empty())
-                return;
-
-            if (AstClassPrimaryConstructor* ctor = node->primaryConstructor)
-            {
-                for (size_t i = 0; i < ctor->args.size; ++i)
-                {
-                    args.push_back(ctor->args.data[i]);
-                    argsDefaults.push_back(ctor->argsDefaults.data[i]);
-                }
-            }
-
-            AstExprFunction* fn = buildSynthesizedFunction(node, node->location, copyToAst(args), copyToAst(argsDefaults), body, "__inittraits");
-
-            classInitTraitsFn[node] = fn;
+            classImplementsFn[node] = fn;
             functionsToCompile.push_back(fn);
         }
 
@@ -8430,8 +9642,6 @@ struct Compiler
                 visitTrait(node);
                 return true;
             }
-
-            visitImplements(node);
 
             // Luwu Traits (rfcs/classes/traits.md): the traits may bring private members (see classMemberIsPrivate)
             if (node->implements.size > 0)
@@ -8505,6 +9715,9 @@ struct Compiler
                     member
                 );
             }
+
+            if (node->implements.size > 0 && !node->primaryConstructor && !init)
+                visitPodImplements(node);
 
             if (node->primaryConstructor)
             {
@@ -8654,6 +9867,15 @@ struct Compiler
 
         bool visit(AstExpr* expr) override
         {
+            // Luwu Do Expressions (rfcs/do-expressions.md): a `do` expression can `return` from anywhere inside an
+            // expression, so every expression has to be searched. Upstream skips them: there, a `return` is only ever a
+            // statement of the function's own blocks.
+            return FFlag::DebugLuwuDoExpr;
+        }
+
+        // A nested function's returns are its own
+        bool visit(AstExprFunction* expr) override
+        {
             return false;
         }
 
@@ -8722,6 +9944,10 @@ struct Compiler
 
         Type type;
         size_t label;
+
+        // Luwu Do Expressions (rfcs/do-expressions.md): the index in `loops` of the loop this jump leaves or continues.
+        // It isn't always the innermost one: see targetLoop.
+        size_t loop;
     };
 
     struct Loop
@@ -8730,6 +9956,9 @@ struct Compiler
         size_t localOffsetContinue;
 
         AstStatContinue* continueUsed;
+
+        // Luwu Do Expressions (rfcs/do-expressions.md): set while the loop compiles its own header (see targetLoop)
+        bool compilingHeader = false;
     };
 
     struct InlineArg
@@ -8782,11 +10011,18 @@ struct Compiler
     DenseHashMap<AstStatClass*, AstExprFunction*> classPrimaryInitFn;
     // Luwu Traits (rfcs/classes/traits.md): populated by ClassInitDefaultsVisitor. A trait with a field or parameter to
     // compute per construction maps to its synthesized `__traitinit`, a trait with a `needs` list to its `__needs`, and
-    // a class whose `implements` list passes trait arguments to its `__inittraits`. See
-    // ClassInitDefaultsVisitor::visitTrait and visitImplements.
+    // a class with an `implements` list but no `__init` to its `__implements`. See ClassInitDefaultsVisitor::visitTrait
+    // and visitPodImplements.
     DenseHashMap<AstStatClass*, AstExprFunction*> traitInitFn;
     DenseHashMap<AstStatClass*, AstExprFunction*> traitNeedsFn;
-    DenseHashMap<AstStatClass*, AstExprFunction*> classInitTraitsFn;
+    DenseHashMap<AstStatClass*, AstExprFunction*> classImplementsFn;
+    // Luwu Traits (rfcs/classes/traits.md): the function that initializes each implementing class's trait fields
+    // (compileTraitInit): its `__init`, explicit or synthesized from a primary constructor, or its `__implements`.
+    // Maps the function to its class.
+    DenseHashMap<AstExprFunction*, AstStatClass*> traitInitHosts;
+    // Luwu Traits (rfcs/classes/traits.md): each implementing class's TraitInitPlan, computed on first use; nullptr when
+    // the compiler can't know it (see buildTraitInitPlan)
+    std::unordered_map<AstStatClass*, std::unique_ptr<TraitInitPlan>> traitInitPlans;
     // Cost of each primary constructor's `__init` body, computed on first use by
     // tryCompileNewObjectFieldParameters and reused by every other construction site of that class.
     DenseHashMap<AstStatClass*, int> classPrimaryInitCost;
@@ -8911,6 +10147,32 @@ struct Compiler
     std::vector<LoopJump> loopJumps;
     std::vector<Loop> loops;
     std::vector<InlineFrame> inlineFrames;
+
+    // Luwu Do Expressions (rfcs/do-expressions.md): the `do` expressions being compiled, innermost last
+    struct GiveFrame
+    {
+        uint8_t target;
+        bool targetTemp;
+        size_t localOffset;
+        std::vector<size_t> jumps;
+    };
+    std::vector<GiveFrame> giveFrames;
+
+    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): the comprehensions being compiled, innermost last
+    struct ComprehensionFrame
+    {
+        // The table being built, or kInvalidReg for `#{ for ... }`, which only counts (compileComprehensionCount).
+        uint8_t table;
+        // An array comprehension's element count; kInvalidReg for a map comprehension.
+        uint8_t counter;
+        // The loop whose header sizes the table with PRESIZETABLE, or null when the table isn't sized at runtime.
+        AstStat* presizeLoop;
+    };
+    std::vector<ComprehensionFrame> comprehensionFrames;
+
+    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): the longest constant range a comprehension is folded to
+    // a literal for (tryCompileConstantComprehension). Past it, the loop is less bytecode than the constants.
+    static const int kConstantComprehensionLimit = 64;
     // Luwu Classes (rfcs/classes): classes whose initializers are being compiled at a construction site
     // (tryCompileNewObjectFieldParameters), innermost last
     std::vector<AstStatClass*> fieldsExpansionStack;
@@ -8982,7 +10244,7 @@ void compileOrThrow(BytecodeBuilder& bytecode, const ParseResult& parseResult, A
             compiler.classPrimaryInitFn,
             compiler.traitInitFn,
             compiler.traitNeedsFn,
-            compiler.classInitTraitsFn,
+            compiler.classImplementsFn,
             compiler.classPodConstDefaults,
             compiler.classMethodSelfChecks,
             compiler.classMethodOwner,
@@ -9008,8 +10270,21 @@ void compileOrThrow(BytecodeBuilder& bytecode, const ParseResult& parseResult, A
         for (auto [decl, fn] : compiler.traitNeedsFn)
             compiler.classLexicalOwner[fn] = decl;
 
-        for (auto [decl, fn] : compiler.classInitTraitsFn)
+        for (auto [decl, fn] : compiler.classImplementsFn)
             compiler.classLexicalOwner[fn] = decl;
+
+        for (auto [name, decl] : compiler.classByName)
+        {
+            if (decl->implements.size == 0)
+                continue;
+
+            if (AstExprFunction** primaryInit = compiler.classPrimaryInitFn.find(decl))
+                compiler.traitInitHosts[*primaryInit] = decl;
+            else if (const AstClassMethod* init = compiler.findClassInit(decl))
+                compiler.traitInitHosts[init->function] = decl;
+            else if (AstExprFunction** implementsFn = compiler.classImplementsFn.find(decl))
+                compiler.traitInitHosts[*implementsFn] = decl;
+        }
 
         // a class named by an annotation matters only when annotations are acted on
         if (compiler.trustsTypeAnnotations())
