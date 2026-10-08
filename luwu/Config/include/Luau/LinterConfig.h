@@ -87,11 +87,12 @@ struct LintWarning
         Code_MethodsNotInlined = 55,       // code that keeps the compiler from proving a class, so its methods aren't inlined
         Code_FloorDivision = 56,           // `math.floor(a / b)`, which is `a // b`
         Code_FenvDeoptimization = 57,      // `getfenv`/`setfenv`, which deoptimize the whole module
-        Code_ReturnOnNextLine = 58,        // Luwu: a `return` in a `do` expression whose value starts on the next line
-        Code_OrContinue = 59,              // Luwu: `x or continue`, which reads a binding named `continue`
-        Code_KeywordShadow = 60,           // Luwu: a binding named after a contextual keyword (`class`, `continue`, ...)
-        Code_BuiltinShadow = 61,           // Luwu: a binding that hides a builtin global (`type`, `typeof`, `table`, ...)
-        Code_LuwuOnlyApi = 62,             // Luwu: a Luwu-only library function (`table.drop`) used in a `.luau` file
+        Code_ReturnSelf = 58,              // Luwu Traits: a trait method returning `self` typed as the trait, not `Self`
+        Code_ReturnOnNextLine = 59,        // Luwu: a `return` in a `do` expression whose value starts on the next line
+        Code_OrContinue = 60,              // Luwu: `x or continue`, which reads a binding named `continue`
+        Code_KeywordShadow = 61,           // Luwu: a binding named after a contextual keyword (`class`, `continue`, ...)
+        Code_BuiltinShadow = 62,           // Luwu: a binding that hides a builtin global (`type`, `typeof`, `table`, ...)
+        Code_LuwuOnlyApi = 63,             // Luwu: a Luwu-only library function (`table.drop`) used in a `.luau` file
 
         Code__Count
     };
@@ -193,6 +194,7 @@ inline constexpr const char* kWarningNames[] = {
     "MethodsNotInlined",
     "FloorDivision",
     "FenvDeoptimization",
+    "ReturnSelf",
     "ReturnOnNextLine",
     "OrContinue",
     "KeywordShadow",

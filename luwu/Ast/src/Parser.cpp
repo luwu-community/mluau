@@ -43,6 +43,8 @@ LUAU_FASTFLAGVARIABLE(LuwuIfLocal)
 // Luwu Do Expressions (rfcs/do-expressions.md): `do ... give exp` expressions. Experimental.
 LUAU_FASTFLAGVARIABLE(DebugLuwuDoExpr)
 LUAU_FASTFLAG(LuwuTableComprehensions)
+// Luwu: `{ function foo() end }` in a table literal, meaning `{ foo = function() end }`.
+LUAU_FASTFLAGVARIABLE(LuwuTableFunctionFields)
 // Luwu Declare Statements (rfcs/declare-statements.md): `declare` in ordinary source, where upstream only accepts it
 // in definition files. Still in progress.
 LUAU_FASTFLAGVARIABLE(LuwuDeclareStatements)
@@ -2736,7 +2738,19 @@ AstStat* Parser::parseTypeAlias(
     bool equalsFound = expectAndConsume('=', "type alias");
     Position equalsPosition = equalsFound ? lexer.previousLocation().begin : Position::missing();
 
-    AstType* type = parseType();
+    // Luwu: `type Name` with nothing after it is an unfinished alias, and the next line is the next statement. Upstream
+    // parses that line as the alias's type, which eats a statement keyword like `trait` or `local` and turns everything
+    // up to the next `end` into a cascade of errors.
+    bool nextLineStartsStatement = !equalsFound && lexer.current().location.begin.line > lexer.previousLocation().end.line;
+
+    AstType* type = nullptr;
+    if (nextLineStartsStatement)
+    {
+        Position missingAt = lexer.previousLocation().end;
+        type = allocator.alloc<AstTypeError>(Location(missingAt, missingAt), AstArray<AstType*>{}, true, unsigned(parseErrors.size() - 1));
+    }
+    else
+        type = parseType();
 
     AstStatTypeAlias* node = allocator.alloc<AstStatTypeAlias>(
         Location(start, type->location), name->name, name->location, generics, genericPacks, type, exported, typeKeywordLocation
@@ -3148,8 +3162,9 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(
 
     auto contextualKeywordListFollows = [&](const char* keyword)
     {
+        // the list may be parenthesized (`implements (A, B)`), which no class member starts with
         return FFlag::LuwuTraits && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == keyword &&
-               lexer.lookahead().type == Lexeme::Name;
+               (lexer.lookahead().type == Lexeme::Name || lexer.lookahead().type == '(');
     };
 
     if (contextualKeywordListFollows("implements"))
@@ -3908,6 +3923,14 @@ AstArray<AstClassTraitRef> Parser::parseClassTraitRefs(bool allowArgs, AstClassP
     LUAU_ASSERT(FFlag::LuwuTraits);
     std::vector<AstClassTraitRef> refs;
 
+    // `implements (A, B)`, so a long list can go one per line
+    std::optional<MatchLexeme> parenthesized;
+    if (lexer.current().type == '(')
+    {
+        parenthesized = lexer.current();
+        nextLexeme();
+    }
+
     while (true)
     {
         AstClassTraitRef ref;
@@ -3990,6 +4013,9 @@ AstArray<AstClassTraitRef> Parser::parseClassTraitRefs(bool allowArgs, AstClassP
 
         nextLexeme();
     }
+
+    if (parenthesized)
+        expectMatchAndConsume(')', *parenthesized);
 
     return copy(refs.data(), refs.size());
 }
@@ -7198,6 +7224,53 @@ AstExpr* Parser::parseTableConstructor()
                 );
             }
         }
+        else if (lexer.current().type == Lexeme::ReservedFunction && lexer.lookahead().type == Lexeme::Name)
+        {
+            // Luwu: `function foo() end` is `foo = function() end`, the way `function t.foo() end` is a statement
+            // assigning `t.foo`. An anonymous function (`function() end`) stays a list item.
+            Lexeme matchFunction = lexer.current();
+            nextLexeme();
+
+            Name name = parseName("function name");
+
+            if (!FFlag::LuwuTableFunctionFields)
+                report(
+                    Location(matchFunction.location, name.location),
+                    "Named functions in table literals are a Luwu feature; enable the 'LuwuTableFunctionFields' fast flag to use them"
+                );
+
+            AstArray<AstAttr*> functionAttributes{nullptr, 0};
+            TempVector<CstAttrList*>* functionCstAttrLists = nullptr;
+            if (pendingFunctionAttributes)
+            {
+                functionAttributes = pendingFunctionAttributes->attributes;
+                functionCstAttrLists = pendingFunctionAttributes->cstAttrLists;
+                pendingFunctionAttributes.reset();
+            }
+
+            AstArray<char> nameString;
+            nameString.data = const_cast<char*>(name.name.value);
+            nameString.size = strlen(name.name.value);
+
+            AstExpr* key = allocator.alloc<AstExprConstantString>(name.location, nameString, AstExprConstantString::QuoteStyle::Unquoted);
+            AstExprFunction* value =
+                parseFunctionBody(false, matchFunction, name.name, nullptr, functionAttributes, false, functionCstAttrLists).first;
+
+            items.push_back({AstExprTable::Item::Kind::Record, key, value, attributes});
+            if (options.storeCstData)
+            {
+                CstExprTable::Separator separator = tableSeparator();
+                CstExprTable::Item cstItem{
+                    Position::missing(),
+                    Position::missing(),
+                    Position::missing(),
+                    separator,
+                    separator == CstExprTable::Separator::Missing ? Position::missing() : lexer.current().location.begin
+                };
+                cstItem.namedFunction = true;
+                cstItems.push_back(cstItem);
+            }
+        }
         else
         {
             AstExpr* expr = parseExpr();
@@ -7221,7 +7294,8 @@ AstExpr* Parser::parseTableConstructor()
         {
             nextLexeme();
         }
-        else if ((lexer.current().type == '[' || lexer.current().type == Lexeme::Name) &&
+        else if ((lexer.current().type == '[' || lexer.current().type == Lexeme::Name ||
+                  (lexer.current().type == Lexeme::ReservedFunction && lexer.lookahead().type == Lexeme::Name)) &&
                  (FFlag::LuauTableEntriesDontNeedToMatchIndent ? true : lexer.current().location.begin.column == lastElementIndent_DEPRECATED))
         {
             report(lexer.current().location, "Expected ',' after table constructor element");
@@ -7396,7 +7470,7 @@ AstExpr* Parser::parseTableComprehension(const Location& start, const MatchLexem
     else if (lexer.current().type == Lexeme::ReservedDo)
     {
         // `do` would read as a loop body; a comprehension gives one item
-        report(lexer.current().location, "A table comprehension's item follows 'give', not 'do'");
+        report(lexer.current().location, "Table comprehensions don't use 'do'; did you mean 'give'?");
         nextLexeme();
     }
     else
