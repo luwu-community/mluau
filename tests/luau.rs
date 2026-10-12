@@ -450,7 +450,7 @@ fn test_classes_instantiate_and_roundtrip_through_rust() -> Result<()> {
 
             return roundtripped_object.x == 1 and roundtripped_object.y == 2
             "#,
-        )
+        ).set_language(mluau::Language::Luwu)
         .eval()?;
 
     assert!(result, "object fields did not survive the roundtrip");
@@ -505,7 +505,7 @@ fn test_classes_value_enum_roundtrip() -> Result<()> {
         assert(receive_class(Animal) == Animal)
         assert(receive_object(cat) == cat)
         "#,
-    )
+    ).set_language(mluau::Language::Luwu)
     .call::<()>(())?;
 
     let class_value = seen_class
@@ -563,7 +563,7 @@ fn test_classes_get_set_object_field_from_rust() -> Result<()> {
             bump_score(player)
             return player.score
             "#,
-        )
+        ).set_language(mluau::Language::Luwu)
         .eval()?;
 
     assert_eq!(result, 15);

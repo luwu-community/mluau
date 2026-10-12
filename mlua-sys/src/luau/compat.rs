@@ -343,13 +343,28 @@ unsafe fn finish_load_status(L: *mut lua_State, status: c_int) -> c_int {
     LUA_OK
 }
 
+/// Loads `data` as Luau source: Luwu syntax in it is a compile error. Use [`luaL_loadbufferenvx`] to load Luwu.
 pub unsafe fn luaL_loadbufferenv(
+    L: *mut lua_State,
+    data: *const c_char,
+    size: usize,
+    name: *const c_char,
+    mode: *const c_char,
+    env: c_int,
+) -> c_int {
+    luaL_loadbufferenvx(L, data, size, name, mode, env, LUA_LANGUAGE_LUAU)
+}
+
+/// Like [`luaL_loadbufferenv`], with `language` (one of the `LUA_LANGUAGE_*` constants) saying which language text
+/// `data` is compiled as.
+pub unsafe fn luaL_loadbufferenvx(
     L: *mut lua_State,
     data: *const c_char,
     mut size: usize,
     name: *const c_char,
     mode: *const c_char,
     mut env: c_int,
+    language: c_int,
 ) -> c_int {
     unsafe extern "C" {
         fn free(p: *mut c_void);
@@ -381,7 +396,9 @@ pub unsafe fn luaL_loadbufferenv(
             env -= 1;
         }
         let data_ud = lua_newuserdatadtor(L, mem::size_of::<*mut c_char>(), data_dtor) as *mut *mut c_char;
-        let data = luau_compile_(data, size, ptr::null_mut(), &mut size);
+        let mut options = lua_CompileOptions::default();
+        options.language = language;
+        let data = luau_compile_(data, size, &mut options, &mut size);
         ptr::write(data_ud, data);
         // By deferring the `free(data)` to the userdata destructor, we ensure that
         // even if `luau_load` throws an error, the `data` is still released.

@@ -219,6 +219,8 @@ pub struct Chunk<'a> {
     pub(crate) mode: ChunkMode,
     pub(crate) source: IoResult<Cow<'a, [u8]>>,
     pub(crate) compiler: Option<Compiler>,
+    /// Set by [`Chunk::set_language`]; overrides the compiler's language. Without either, the chunk is Luau.
+    pub(crate) language: Option<Language>,
     /// Set by `compile` once it has replaced `source` with bytecode it just produced
     /// itself. Lets `load_chunk` skip the binary/text sniff in `luaL_loadbufferenv`,
     /// which only guesses from the leading byte (the bytecode version number) and
@@ -227,6 +229,29 @@ pub struct Chunk<'a> {
     /// Distinct from `mode`: `mode` is what the caller *claims* the data is (and must
     /// still be validated, e.g. by `test_load_mode`), this is what *we* know it is.
     pub(crate) trusted_binary: bool,
+}
+
+/// The language a chunk's source is written in, which decides what syntax the compiler accepts.
+///
+/// Luwu syntax is only accepted in [`Language::Luwu`]. The default is [`Language::Luau`], so code moving from mlua
+/// compiles exactly as it did there; a host opts a module into Luwu, typically by its `.luwu` file extension.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Language {
+    #[default]
+    Luau,
+    Luwu,
+    Lua,
+}
+
+impl Language {
+    // the lua_CompileOptions::language value
+    fn ffi_value(self) -> std::os::raw::c_int {
+        match self {
+            Language::Luwu => ffi::LUA_LANGUAGE_LUWU,
+            Language::Luau => ffi::LUA_LANGUAGE_LUAU,
+            Language::Lua => ffi::LUA_LANGUAGE_LUA,
+        }
+    }
 }
 
 /// Represents chunk mode (text or binary).
@@ -287,6 +312,7 @@ pub struct Compiler {
     libraries_with_known_members: Vec<StdString>,
     library_constants: Option<LibraryMemberConstantMap>,
     disabled_builtins: Vec<StdString>,
+    language: Language,
 }
 
 impl Default for Compiler {
@@ -312,7 +338,16 @@ impl Compiler {
             libraries_with_known_members: Vec::new(),
             library_constants: None,
             disabled_builtins: Vec::new(),
+            language: Language::Luau,
         }
+    }
+
+    /// Sets the language the source is written in. Luwu syntax is a compile error unless it's [`Language::Luwu`], even
+    /// when the feature's FFlag is on. Defaults to [`Language::Luau`].
+    #[must_use]
+    pub const fn set_language(mut self, language: Language) -> Self {
+        self.language = language;
+        self
     }
 
     /// Sets Luau compiler optimization level.
@@ -557,6 +592,7 @@ impl Compiler {
                 }
             }
             options.disabledBuiltins = disabled_builtins_ptr;
+            options.language = self.language.ffi_value();
             ffi::luau_compile(source.as_ref(), options)
         };
 
@@ -625,6 +661,27 @@ impl Chunk<'_> {
         self
     }
 
+    /// Sets the language the chunk's source is written in, overriding the compiler's. Luwu syntax is a compile error
+    /// unless it's [`Language::Luwu`]. Without this or a compiler, the chunk is [`Language::Luau`].
+    pub fn set_language(mut self, language: Language) -> Self {
+        self.language = Some(language);
+        self
+    }
+
+    // the chunk's own language, else its compiler's, else Luau
+    fn language(&self) -> Language {
+        self.language.or_else(|| self.compiler.as_ref().map(|c| c.language)).unwrap_or_default()
+    }
+
+    // the compiler to use, carrying the chunk's language when it set one
+    fn effective_compiler(&self) -> Option<Compiler> {
+        match (&self.compiler, self.language) {
+            (Some(compiler), Some(language)) => Some(compiler.clone().set_language(language)),
+            (Some(compiler), None) => Some(compiler.clone()),
+            (None, _) => None,
+        }
+    }
+
     /// Evaluate the chunk as either an expression or block.
     ///
     /// If the chunk can be parsed as an expression, this loads and executes the chunk and returns
@@ -670,6 +727,7 @@ impl Chunk<'_> {
             self.compile();
         }
 
+        let language = self.language();
         let name = Self::convert_name(self.name)?;
         self.lua.lock().load_chunk(
             Some(&name),
@@ -677,6 +735,7 @@ impl Chunk<'_> {
             self.mode,
             self.source.map_err(crate::Error::runtime)?.as_ref(),
             self.trusted_binary,
+            language.ffi_value(),
         )
     }
 
@@ -686,7 +745,8 @@ impl Chunk<'_> {
     fn compile(&mut self) {
         if let Ok(ref source) = self.source {
             if self.mode == ChunkMode::Text {
-                if let Ok(data) = self.compiler.get_or_insert_with(Default::default).compile(source) {
+                let compiler = self.effective_compiler().unwrap_or_else(|| Compiler::new().set_language(self.language()));
+                if let Ok(data) = compiler.compile(source) {
                     self.source = Ok(Cow::Owned(data));
                     self.mode = ChunkMode::Binary;
                     self.trusted_binary = true;
@@ -750,7 +810,7 @@ impl Chunk<'_> {
         let source = source.map_err(Error::runtime)?;
         let source = Self::expression_source(source);
         // We don't need to compile source if no compiler options set
-        let compiled = self.compiler.as_ref().map(|c| c.compile(&source)).transpose()?;
+        let compiled = self.effective_compiler().map(|c| c.compile(&source)).transpose()?;
 
         let trusted_binary = compiled.is_some();
         let source = compiled.unwrap_or(source);
@@ -764,7 +824,7 @@ impl Chunk<'_> {
 
         self.lua
             .lock()
-            .load_chunk(Some(&name), env, ChunkMode::Text, &source, trusted_binary)
+            .load_chunk(Some(&name), env, ChunkMode::Text, &source, trusted_binary, self.language().ffi_value())
     }
 
     fn convert_name(name: StdString) -> Result<CString> {

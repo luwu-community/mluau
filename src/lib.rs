@@ -92,7 +92,7 @@ pub mod prelude;
 pub use bstr::BString;
 pub use ffi::{self, lua_CFunction, lua_State};
 
-pub use crate::chunk::{AsChunk, Chunk, ChunkMode, ChunkSource};
+pub use crate::chunk::{AsChunk, Chunk, ChunkMode, ChunkSource, Language};
 pub use crate::debug::{Debug, DebugEvent, DebugNames, DebugSource, DebugStack};
 pub use crate::error::{Error, Result};
 pub use crate::function::{Function, FunctionInfo};

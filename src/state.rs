@@ -867,6 +867,7 @@ impl Lua {
             mode: chunk.mode(),
             source: chunk.source(),
             compiler: unsafe { (*self.lock().extra.get()).compiler.clone() },
+            language: None,
             trusted_binary: false,
         }
     }

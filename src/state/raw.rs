@@ -264,6 +264,7 @@ impl RawLua {
         mode: ChunkMode,
         source: &[u8],
         trusted_binary: bool,
+        language: c_int,
     ) -> Result<Function> {
         let state = self.state();
         unsafe {
@@ -277,7 +278,7 @@ impl RawLua {
                 // None => cstr!("bt"),
             };
             let status = protect_lua!(state, 0, 1, |state| {
-                self.load_chunk_inner(state, name, env, mode, source, trusted_binary)
+                self.load_chunk_inner(state, name, env, mode, source, trusted_binary, language)
             })?;
             match status {
                 ffi::LUA_OK => Ok(Function(self.pop_ref())),
@@ -294,6 +295,7 @@ impl RawLua {
         mode: *const c_char,
         source: &[u8],
         trusted_binary: bool,
+        language: c_int,
     ) -> c_int {
         let env = match env {
             Some(env) => {
@@ -306,13 +308,14 @@ impl RawLua {
         let status = if trusted_binary {
             ffi::luau_load_trusted_binary(state, source.as_ptr() as *const c_char, source.len(), name, env)
         } else {
-            ffi::luaL_loadbufferenv(
+            ffi::luaL_loadbufferenvx(
                 state,
                 source.as_ptr() as *const c_char,
                 source.len(),
                 name,
                 mode,
                 env,
+                language,
             )
         };
         #[cfg(feature = "luau-jit")]

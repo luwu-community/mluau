@@ -21,7 +21,14 @@ pub struct lua_CompileOptions {
     pub libraryMemberTypeCallback: Option<lua_LibraryMemberTypeCallback>,
     pub libraryMemberConstantCallback: Option<lua_LibraryMemberConstantCallback>,
     pub disabledBuiltins: *const *const c_char,
+    // Luwu: the language the source is written in, one of the LUA_LANGUAGE_* constants
+    pub language: c_int,
 }
+
+// Luwu: values of lua_CompileOptions::language (lua_Language in luacode.h)
+pub const LUA_LANGUAGE_LUWU: c_int = 0;
+pub const LUA_LANGUAGE_LUAU: c_int = 1;
+pub const LUA_LANGUAGE_LUA: c_int = 2;
 
 impl Default for lua_CompileOptions {
     fn default() -> Self {
@@ -40,6 +47,8 @@ impl Default for lua_CompileOptions {
             libraryMemberTypeCallback: None,
             libraryMemberConstantCallback: None,
             disabledBuiltins: ptr::null(),
+            // Luau, as mlua compiles it: Luwu syntax is opt-in. The C API's own default is Luwu.
+            language: LUA_LANGUAGE_LUAU,
         }
     }
 }
