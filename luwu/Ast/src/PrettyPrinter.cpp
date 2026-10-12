@@ -847,6 +847,15 @@ struct Printer
             }
             visualize(*a->expr);
         }
+        // Luwu Push and Pop Operators (rfcs/push-pop-operators.md), `<-` syntax
+        else if (const auto& a = expr.as<AstExprPop>())
+        {
+            if (const auto cstNode = lookupCstNode<CstExprOp>(a))
+                advance(cstNode->opPosition);
+
+            writer.symbol("<-");
+            visualize(*a->expr);
+        }
         else if (const auto& a = expr.as<AstExprBinary>())
         {
             visualize(*a->left);
@@ -956,7 +965,7 @@ struct Printer
                         visualize(*range->step);
                     }
 
-                    body = range->body;
+                    body = visualizeLoopWhen(*range->body, range->whenGuard);
                     doLocation = range->doLocation;
                 }
                 else
@@ -968,13 +977,7 @@ struct Printer
                     advance(generic->forLocation.begin);
                     writer.keyword("for");
 
-                    CommaSeparatorInserter varComma(writer, cstNode ? cstNode->varsCommaPositions.begin() : nullptr);
-                    for (size_t i = 0; i < generic->vars.size; i++)
-                    {
-                        varComma();
-                        bool hasColon = cstNode && cstNode->varsAnnotationColonPositions.size > i;
-                        visualize(*generic->vars.data[i], hasColon ? cstNode->varsAnnotationColonPositions.data[i] : Position::missing());
-                    }
+                    visualizeLoopVars(*generic, cstNode);
 
                     advance(generic->inLocation.begin);
                     writer.keyword("in");
@@ -986,26 +989,13 @@ struct Printer
                         visualize(*value);
                     }
 
-                    body = generic->body;
+                    body = visualizeLoopWhen(*generic->body, generic->whenGuard);
                     doLocation = generic->doLocation;
                 }
 
-                LUAU_ASSERT(body->body.size == 1);
-                stat = body->body.data[0];
-
-                if (AstStatIf* guard = stat->as<AstStatIf>())
-                {
-                    // a single plain `when` is stored as an ordinary condition, and its `when` is the if's keyword
-                    if (guard->clauses.size == 0)
-                    {
-                        advance(guard->ifLocation.begin);
-                        writer.keyword("when");
-                    }
-
-                    visualizeIfCondition(*guard->condition, guard->clauses);
-                    LUAU_ASSERT(guard->thenbody->body.size == 1);
-                    stat = guard->thenbody->body.data[0];
-                }
+                // the clause's next `for` or the item, after any destructured fields
+                LUAU_ASSERT(body->body.size >= 1);
+                stat = body->body.data[body->body.size - 1];
             }
 
             advance(doLocation.begin);
@@ -1139,7 +1129,9 @@ struct Printer
     {
         // Luwu Destructuring (rfcs/destructuring.md): the first statement a destructuring declaration desugars to
         // prints the whole declaration, so the rest print nothing but a trailing `;`.
-        if (const auto& local = program.as<AstStatLocal>(); local && local->destructuredFrom)
+        bool desugaredLocal = program.is<AstStatLocal>() && program.as<AstStatLocal>()->isDesugaredField();
+        bool desugaredTypeAlias = program.is<AstStatTypeAlias>() && program.as<AstStatTypeAlias>()->destructuredFrom;
+        if (desugaredLocal || desugaredTypeAlias)
         {
             if (program.hasSemicolon)
             {
@@ -1181,7 +1173,7 @@ struct Printer
         else if (const auto& a = program.as<AstStatWhile>())
         {
             writer.keyword("while");
-            visualize(*a->condition);
+            visualizeIfCondition(*a->condition, a->clauses);
             // TODO: what if 'hasDo = false'?
             advance(a->doLocation.begin);
             writer.keyword("do");
@@ -1324,9 +1316,11 @@ struct Printer
 
                 visualize(*a->step);
             }
+
+            AstStatBlock* body = visualizeLoopWhen(*a->body, a->whenGuard);
             advance(a->doLocation.begin);
             writer.keyword("do");
-            visualizeBlock(*a->body);
+            visualizeBlock(*body);
 
             advance(a->body->location.end);
             writer.keyword("end");
@@ -1337,18 +1331,7 @@ struct Printer
 
             writer.keyword("for");
 
-            CommaSeparatorInserter varComma(writer, cstNode ? cstNode->varsCommaPositions.begin() : nullptr);
-            for (size_t i = 0; i < a->vars.size; i++)
-            {
-                varComma();
-                if (cstNode)
-                {
-                    LUAU_ASSERT(cstNode->varsAnnotationColonPositions.size > i);
-                    visualize(*a->vars.data[i], cstNode->varsAnnotationColonPositions.data[i]);
-                }
-                else
-                    visualize(*a->vars.data[i], Position{0, 0});
-            }
+            visualizeLoopVars(*a, cstNode);
 
             advance(a->inLocation.begin);
             writer.keyword("in");
@@ -1361,10 +1344,11 @@ struct Printer
                 visualize(*val);
             }
 
+            AstStatBlock* body = visualizeLoopWhen(*a->body, a->whenGuard);
             advance(a->doLocation.begin);
             writer.keyword("do");
 
-            visualizeBlock(*a->body);
+            visualizeBlock(*body);
 
             advance(a->body->location.end);
             writer.keyword("end");
@@ -1454,6 +1438,25 @@ struct Printer
 
             visualize(*a->value);
         }
+        else if (const auto& a = program.as<AstStatPush>())
+        {
+            const auto cstNode = lookupCstNode<CstStatPush>(a);
+
+            visualize(*a->target);
+
+            if (cstNode)
+                advance(cstNode->opPosition);
+            else
+                writer.space();
+            writer.symbol("<+");
+
+            CommaSeparatorInserter valueComma(writer, cstNode ? cstNode->valuesCommaPositions.begin() : nullptr);
+            for (const auto& value : a->values)
+            {
+                valueComma();
+                visualize(*value);
+            }
+        }
         else if (const auto& a = program.as<AstStatFunction>())
         {
             if (FFlag::LuauCstAttr)
@@ -1517,7 +1520,11 @@ struct Printer
         }
         else if (const auto& a = program.as<AstStatTypeAlias>())
         {
-            if (writeTypes)
+            if (writeTypes && a->destructure)
+            {
+                visualizeTypeDestructuring(*a);
+            }
+            else if (writeTypes)
             {
                 const auto* cstNode = lookupCstNode<CstStatTypeAlias>(a);
 
@@ -2043,6 +2050,44 @@ struct Printer
             LUAU_ASSERT(!"visualizeBlock was expecting an AstStatBlock");
     }
 
+    // Luwu Destructuring (rfcs/destructuring.md): a `for ... in` loop's variables. A destructured one prints its pattern.
+    void visualizeLoopVars(const AstStatForIn& loop, const CstStatForIn* cstNode)
+    {
+        CommaSeparatorInserter varComma(writer, cstNode ? cstNode->varsCommaPositions.begin() : nullptr);
+        for (size_t i = 0; i < loop.vars.size; i++)
+        {
+            varComma();
+
+            if (loop.destructure.size > i && loop.destructure.data[i])
+            {
+                visualizeDestructuring(*loop.destructure.data[i]);
+                continue;
+            }
+
+            bool hasColon = cstNode && cstNode->varsAnnotationColonPositions.size > i;
+            visualize(*loop.vars.data[i], hasColon ? cstNode->varsAnnotationColonPositions.data[i] : Position::missing());
+        }
+    }
+
+    // Luwu If Local (rfcs/if-local.md): prints a loop's `when` chain, if its body holds one (AstStatFor::whenGuard),
+    // and returns the block as written. Destructured fields at the start of the body print with the loop's bindings, and
+    // print nothing themselves.
+    AstStatBlock* visualizeLoopWhen(AstStatBlock& body, AstStatIf* guard)
+    {
+        if (!guard)
+            return &body;
+
+        // a single plain `when` is stored as an ordinary condition, and its `when` is the if's keyword
+        if (guard->clauses.size == 0)
+        {
+            advance(guard->ifLocation.begin);
+            writer.keyword("when");
+        }
+
+        visualizeIfCondition(*guard->condition, guard->clauses);
+        return guard->thenbody;
+    }
+
     // Luwu If Local (rfcs/if-local.md): a `when` chain prints clause by clause. A binding prints through its
     // declaration, which also prints a destructuring pattern back as written.
     void visualizeIfCondition(AstExpr& condition, const AstArray<AstIfClause>& clauses)
@@ -2068,6 +2113,60 @@ struct Printer
                 visualize(static_cast<AstStat&>(*clause.declaration));
             else
                 visualize(*clause.expr);
+        }
+    }
+
+    // Luwu Destructuring (rfcs/destructuring.md): `[export] type .{A, B as C} = module`, from the source form the parser
+    // kept on the first alias.
+    void visualizeTypeDestructuring(const AstStatTypeAlias& first)
+    {
+        const AstTypeDestructure& pattern = *first.destructure;
+
+        if (first.exported)
+            writer.keyword("export");
+
+        advance(first.typeLocation.begin);
+        writer.keyword("type");
+
+        advance(pattern.location.begin);
+        writer.symbol(".");
+        writer.symbol("{");
+
+        CommaSeparatorInserter comma(writer, nullptr);
+        for (const AstTypeDestructureField& field : pattern.fields)
+        {
+            const AstTypeReference* reference = field.alias->destructuredReference();
+            LUAU_ASSERT(reference);
+
+            comma();
+            advance(reference->nameLocation.begin);
+            writer.identifier(reference->name.value);
+
+            if (field.asLocation)
+            {
+                advance(field.asLocation->begin);
+                writer.keyword("as");
+                advance(field.alias->nameLocation.begin);
+                writer.identifier(field.alias->name.value);
+            }
+        }
+
+        if (pattern.closed)
+        {
+            advanceBefore(pattern.location.end, 1);
+            writer.symbol("}");
+        }
+
+        if (!pattern.equalsLocation)
+            return;
+
+        advance(pattern.equalsLocation->begin);
+        writer.symbol("=");
+
+        if (pattern.module != kParseNameError)
+        {
+            advance(pattern.moduleLocation.begin);
+            writer.identifier(pattern.module.value);
         }
     }
 

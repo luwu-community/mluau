@@ -247,6 +247,11 @@ struct CostVisitor : AstVisitor
             result = outer;
             return block;
         }
+        else if (AstExprPop* expr = node->as<AstExprPop>())
+        {
+            // Luwu Push and Pop Operators (rfcs/push-pop-operators.md): one instruction, which can call __pop
+            return model(expr->expr) + 1;
+        }
         else
         {
             LUAU_ASSERT(!"Unknown expression type");
@@ -312,6 +317,10 @@ struct CostVisitor : AstVisitor
     bool visit(AstStatWhile* node) override
     {
         Cost condition = model(node->condition);
+
+        // Luwu If Local (rfcs/if-local.md): every clause of a `when` chain runs per iteration, and each adds a test
+        for (size_t i = 1; i < node->clauses.size; ++i)
+            condition += model(node->clauses.data[i].expr) + 1;
 
         loop(node->body, condition);
         return false;
@@ -398,6 +407,20 @@ struct CostVisitor : AstVisitor
         result += node->var->is<AstExprLocal>() ? 1 : 2;
 
         return true;
+    }
+
+    bool visit(AstStatPush* node) override
+    {
+        // Luwu Push and Pop Operators (rfcs/push-pop-operators.md): one instruction after the operands, which can call
+        // __push
+        result += model(node->target);
+
+        for (AstExpr* value : node->values)
+            result += model(value);
+
+        result += 1;
+
+        return false;
     }
 
     bool visit(AstStatBreak* node) override

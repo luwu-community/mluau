@@ -933,6 +933,10 @@ public:
     // condition has to go through the clauses instead.
     AstArray<AstIfClause> clauses{nullptr, 0};
 
+    // Luwu If Local (rfcs/if-local.md): this `if` is a loop's `when` chain (AstStatFor::whenGuard), not one written
+    // as an `if`. It has no `then`, no `else` and no `end` of its own.
+    bool isWhenGuard = false;
+
     // Visits the condition: `condition`, or every clause of the `when` chain (a binding's declaration, or a
     // plain condition).
     void visitCondition(AstVisitor* visitor);
@@ -964,6 +968,16 @@ public:
 
     // Location of the leading 'while' keyword token only.
     Location whileLocation;
+
+    // Luwu If Local (rfcs/if-local.md): the condition's `when` chain (`while local x = f() when x.ok do`), checked
+    // before every iteration; the loop ends when a clause fails. Empty for an ordinary condition. When it is set,
+    // `condition` is the first clause's expression, as for AstStatIf::clauses.
+    AstArray<AstIfClause> clauses{nullptr, 0};
+
+    // Visits the condition: `condition`, or every clause of the `when` chain.
+    void visitCondition(AstVisitor* visitor);
+    // Where the condition is written: `condition`, or the whole `when` chain.
+    Location conditionLocation() const;
 };
 
 class AstStatRepeat : public AstStat
@@ -1130,6 +1144,16 @@ public:
     // `destructure`; every one after it points to the first through `destructuredFrom`.
     AstDestructurePattern* destructure = nullptr;
     AstStatLocal* destructuredFrom = nullptr;
+    // A field of a pattern in a `for` loop's bindings (`for _, p.{x, y} in ps`): the loop body starts with one of
+    // these per bound name, and the loop holds the pattern (AstStatForIn::destructure).
+    bool destructuredFromLoop = false;
+
+    // One of several statements a single destructuring in the source desugars to, other than the one that holds
+    // the pattern. Tools that work on the source skip these.
+    bool isDesugaredField() const
+    {
+        return destructuredFrom || destructuredFromLoop;
+    }
 };
 
 class AstStatFor : public AstStat
@@ -1162,6 +1186,11 @@ public:
 
     // Location of the leading 'for' keyword token only.
     Location forLocation;
+
+    // Luwu If Local (rfcs/if-local.md): the `if` holding the loop's `when` chain (`for i = 1, n when i % 2 == 0 do`),
+    // or null. It is then the only statement of `body`, and the loop's block as written is its `thenbody`: a
+    // failing chain skips the iteration. Table comprehensions store their `when`s the same way.
+    AstStatIf* whenGuard = nullptr;
 };
 
 class AstStatForIn : public AstStat
@@ -1195,6 +1224,15 @@ public:
 
     // Location of the leading 'for' keyword token only.
     Location forLocation;
+
+    // Luwu If Local (rfcs/if-local.md): see AstStatFor::whenGuard. With destructured bindings, `body` starts with
+    // their fields and the guard follows them.
+    AstStatIf* whenGuard = nullptr;
+
+    // Luwu Destructuring (rfcs/destructuring.md): the pattern of each binding written as one (`for _, p.{x, y} in ps`),
+    // null for a plain name; empty when no binding is a pattern. The loop variable is the pattern's local (hidden for
+    // `.{x, y}`), and `body` starts with one `local` per bound name (AstStatLocal::destructuredFromLoop).
+    AstArray<AstDestructurePattern*> destructure{nullptr, 0};
 };
 
 class AstStatAssign : public AstStat
@@ -1225,6 +1263,24 @@ public:
     AstExprBinary::Op op;
     AstExpr* var;
     AstExpr* value;
+};
+
+// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): `target <+ v1, v2, ...` appends every non-nil value to
+// `target`, or hands them all to its `__push` in one call.
+class AstStatPush : public AstStat
+{
+public:
+    LUAU_RTTI(AstStatPush)
+
+    AstStatPush(const Location& location, AstExpr* target, const Location& opLocation, const AstArray<AstExpr*>& values);
+
+    void visit(AstVisitor* visitor) override;
+
+    AstExpr* target;
+    // The `<+`
+    Location opLocation;
+    // The last value may be a call or `...`, which pushes all of its values.
+    AstArray<AstExpr*> values;
 };
 
 class AstStatFunction : public AstStat
@@ -1272,6 +1328,29 @@ public:
     Location functionLocation;
 };
 
+// Luwu Destructuring (rfcs/destructuring.md): the source form of `type .{A, B as C} = module`, kept on the first
+// alias it desugars to (Parser::parseTypeDestructuring) so tools can print it back.
+struct AstTypeDestructureField
+{
+    // Declares the type: `type C = module.B`. Its name and reference hold the field's name and key.
+    class AstStatTypeAlias* alias = nullptr;
+    // The `as` keyword, when the type is declared under another name.
+    std::optional<Location> asLocation;
+};
+
+struct AstTypeDestructure
+{
+    // From the `.` to the `}`.
+    Location location;
+    // False when the `}` is missing, as it is while a pattern is being written.
+    bool closed = true;
+    std::optional<Location> equalsLocation;
+    // The module local the types are read from; kParseNameError when the value isn't a name.
+    AstName module;
+    Location moduleLocation;
+    AstArray<AstTypeDestructureField> fields{nullptr, 0};
+};
+
 class AstStatTypeAlias : public AstStat
 {
 public:
@@ -1302,6 +1381,15 @@ public:
 
     // Attributes written above this declaration, e.g. `@deprecated`. Empty when there are none.
     AstArray<AstAttr*> attributes{nullptr, 0};
+
+    // Luwu Destructuring (rfcs/destructuring.md): `type .{A, B} = module` desugars to one alias per field (see
+    // Parser::parseTypeDestructuring). The first spans the whole declaration and holds its source form in
+    // `destructure`; every one after it points to the first through `destructuredFrom`.
+    AstTypeDestructure* destructure = nullptr;
+    AstStatTypeAlias* destructuredFrom = nullptr;
+
+    // The `module.Name` a destructured alias reads, or null for any other alias.
+    class AstTypeReference* destructuredReference() const;
 };
 
 class AstStatTypeFunction : public AstStat
@@ -1836,15 +1924,24 @@ public:
     // Written as `x or return v` or `x or break` rather than with `do`: the body is that one statement
     // (see Parser::parseOrLeave).
     bool shorthand = false;
+
+    // Does every path leave it with `return`, `break` or `continue`, so it never has a value? True for the shorthand,
+    // and for a `do` expression with no `give` of its own.
+    bool alwaysLeaves() const;
 };
+
+// Luwu Do Expressions (rfcs/do-expressions.md): `expr` as `x or <leave>`, an `or` whose right operand (parenthesized
+// or not) always leaves (AstExprDo::alwaysLeaves), or null. As a whole statement, or as a declaration's or assignment's
+// value, it only completes when `x` is truthy.
+class AstExprBinary* asOrLeave(AstExpr* expr);
 
 // Luwu Table Comprehensions (rfcs/table-comprehensions.md): `{ for ... in ... when ... give item }`, a table built by
 // a loop. It is stored as the loop it runs: `loop` is an ordinary AstStatFor or AstStatForIn, so every pass that
-// handles loops and if-local chains handles a comprehension through that code. A clause's `when` chain is an
-// AstStatIf with no else that is the only statement of its loop's body: an ordinary condition for a single plain
-// `when`, the chain's `clauses` otherwise. A following `for` clause is the only statement of the previous clause's
-// body (or of its `when` if), and the innermost body holds `item`, an AstStatComprehensionItem, as its only
-// statement. The loops' `doLocation` is the `give`.
+// handles loops and if-local chains handles a comprehension through that code. A clause's `when` chain is the
+// loop's `whenGuard` (an ordinary condition for a single plain `when`, the chain's `clauses` otherwise), the last
+// statement of its body; destructured bindings' fields come before it. A following `for` clause is the last statement
+// of the previous clause's body (or the only one of its `when` if), and the innermost body ends with `item`, an
+// AstStatComprehensionItem. The loops' `doLocation` is the `give`.
 class AstExprTableComprehension : public AstExpr
 {
 public:
@@ -1859,6 +1956,20 @@ public:
     class AstStatComprehensionItem* item;
     // The number of `for` clauses, 1 unless the comprehension flattens nested loops.
     unsigned clauseCount;
+};
+
+// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): `<-container` removes the last element of `container` (or
+// calls its `__pop`) and evaluates to it.
+class AstExprPop : public AstExpr
+{
+public:
+    LUAU_RTTI(AstExprPop)
+
+    AstExprPop(const Location& location, AstExpr* expr);
+
+    void visit(AstVisitor* visitor) override;
+
+    AstExpr* expr;
 };
 
 class AstExprError : public AstExpr
@@ -2094,6 +2205,10 @@ public:
     {
         return visit(static_cast<AstExpr*>(node));
     }
+    virtual bool visit(class AstExprPop* node)
+    {
+        return visit(static_cast<AstExpr*>(node));
+    }
     virtual bool visit(class AstExprDo* node)
     {
         return visit(static_cast<AstExpr*>(node));
@@ -2173,6 +2288,10 @@ public:
         return visit(static_cast<AstStat*>(node));
     }
     virtual bool visit(class AstStatCompoundAssign* node)
+    {
+        return visit(static_cast<AstStat*>(node));
+    }
+    virtual bool visit(class AstStatPush* node)
     {
         return visit(static_cast<AstStat*>(node));
     }

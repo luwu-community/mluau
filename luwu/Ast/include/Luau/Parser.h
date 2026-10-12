@@ -51,6 +51,17 @@ private:
     size_t size_;
 };
 
+// Luwu: a piece of Luwu-only syntax, named the way error messages name it.
+struct LuwuFeature
+{
+    // As it reads in the middle of a sentence: "classes", "'do' expressions"
+    const char* name;
+    // Whether `name` takes "are" rather than "is"
+    bool plural;
+    // The FFlag that turns it on
+    const char* flag;
+};
+
 class Parser
 {
     template<typename Node, typename F>
@@ -123,7 +134,9 @@ private:
     AstStat* parseIf();
 
     // Luwu If Local (rfcs/if-local.md)
-    AstExpr* parseIfCondition(AstArray<AstIfClause>& clauses);
+    AstExpr* parseIfCondition(AstArray<AstIfClause>& clauses, const char* head = "if");
+    AstArray<AstIfClause> parseLoopWhenChain(Location& whenLocation, bool inComprehension = false);
+    AstStatBlock* wrapInWhenGuard(const AstArray<AstIfClause>& when, const Location& whenLocation, AstStatBlock* body, AstStatIf*& guard);
     void parseIfBindingClause(std::vector<AstIfClause>& chain, const std::optional<Location>& whenLocation);
     bool ifBindingFollows();
     bool whenFollows();
@@ -243,6 +256,24 @@ private:
         bool isConst,
         std::vector<AstStat*>& out
     );
+    AstDestructurePattern desugarDestructureFields(const DestructureTarget& target, AstLocal* local, bool isConst, std::vector<AstStat*>& out);
+
+    // Luwu Destructuring (rfcs/destructuring.md): patterns in a `for ... in` loop's bindings
+    bool loopPatternFollows();
+    AstStatBlock* prependLoopFields(const std::vector<AstStat*>& fields, AstStatBlock* body);
+    Binding parseLoopPattern(std::vector<std::optional<DestructureTarget>>& patterns);
+    void parseLoopBindings(
+        TempVector<Binding>& names,
+        std::vector<std::optional<DestructureTarget>>& patterns,
+        AstArray<Position>* commaPositions,
+        Position* initialCommaPosition
+    );
+    AstArray<AstLocal*> pushLoopLocals(
+        const TempVector<Binding>& names,
+        const std::vector<std::optional<DestructureTarget>>& patterns,
+        std::vector<AstStat*>& fields,
+        AstArray<AstDestructurePattern*>& destructure
+    );
 
     // return [explist]
     AstStat* parseReturn();
@@ -256,6 +287,7 @@ private:
         const Location& typeKeywordLocation,
         const AstArray<AstAttr*>& attributes = {nullptr, 0}
     );
+    AstStat* parseTypeDestructuring(const Location& start, bool exported, const Location& typeKeywordLocation);
 
     // `declared` parses the shape of a `declare class` (see AstStatDeclareClass) and returns the AstStatClass for it.
     // Luwu Traits (rfcs/classes/traits.md): `isTrait` parses `trait Name ... end`, which is a class with trait members.
@@ -302,6 +334,7 @@ private:
     void checkDuplicateDeclaration(const Name& name);
     void checkTypeName(const Name& name, bool declared);
     bool declaresClass();
+    bool declaresTrait();
 
     // Luwu Traits (rfcs/classes/traits.md): whether `trait` declarations parse.
     bool traitsEnabled() const;
@@ -323,6 +356,18 @@ private:
 
     // var [`+=' | `-=' | `*=' | `/=' | `%=' | `^=' | `..='] exp
     AstStat* parseCompoundAssignment(AstExpr* initial, AstExprBinary::Op op);
+
+    // Luwu Push and Pop Operators (rfcs/push-pop-operators.md)
+    // var `<+' explist
+    AstStat* parsePush(AstExpr* target);
+    // `<-` syntax: whether the current `<` and the `-` right after it start a pop.
+    bool popFollows();
+    // `<-' exp, the operand parsed like a unary operator's
+    AstExpr* parsePop(unsigned int unaryPriority);
+    // Whether `<<` (or `< <`) opening explicit type arguments follows.
+    bool typeArgumentsFollow();
+    // `<-` syntax: `x <- y` as a statement, which reads like a push with an arrow
+    AstStat* parseMistakenPushArrow(AstExpr* target);
 
     std::tuple<AstLocal*, AstArray<AstLocal*>, AstArray<AstExpr*>> prepareFunctionArguments(const Location& start, bool hasself, const TempVector<Binding>& args);
 
@@ -433,10 +478,15 @@ private:
     static std::optional<AstExprBinary::Op> parseBinaryOp(const Lexeme& l);
     static std::optional<AstExprBinary::Op> parseCompoundOp(const Lexeme& l);
 
+public:
     struct BinaryOpPriority
     {
         unsigned char left, right;
     };
+
+private:
+    AstExpr* parseBinaryTail(AstExpr* expr, const Location& start, unsigned int limit);
+    AstStat* parseOrLeaveStatement(AstExpr* first, const Location& start);
 
     std::optional<AstExprUnary::Op> checkUnaryConfusables();
     std::optional<AstExprBinary::Op> checkBinaryConfusables(const BinaryOpPriority binaryPriority[], unsigned int limit);
@@ -597,6 +647,14 @@ private:
         ...
     ) LUAU_PRINTF_ATTR(5, 6);
     AstExprError* reportExprError(const Location& location, const AstArray<AstExpr*>& expressions, const char* format, ...) LUAU_PRINTF_ATTR(4, 5);
+
+    // Luwu: reports `feature` where it can't be used, in a Luau module or with its FFlag off (`enabled`). Returns
+    // whether it can be used. The syntax is parsed either way, so the rest of the module still checks.
+    bool checkLuwuFeature(const Location& location, const LuwuFeature& feature, bool enabled);
+    // Luwu: whether this is a Luau module whose classes follow upstream Luau's syntax (luauClassCompat)
+    bool luauClassModule() const;
+    // Luwu: the statement for a Luwu-only one that can't be used, after reporting why (see checkLuwuFeature).
+    AstStatError* reportLuwuFeatureStat(const Location& location, const AstArray<AstExpr*>& expressions, const LuwuFeature& feature);
     AstStatClass* getMatchingClass(AstExpr* expr);
     bool isExprLValue(AstExpr* expr);
     AstExprError* reportLValueError(AstExpr* expr);
@@ -793,6 +851,7 @@ private:
     std::vector<Position> scratchPosition2;
     std::vector<CstAttrList*> scratchCstAttrList;
     std::vector<AstDestructureField> scratchDestructureField;
+    std::vector<AstTypeDestructureField> scratchTypeDestructureField;
     std::string scratchData;
 
     CstNodeMap cstNodeMap;

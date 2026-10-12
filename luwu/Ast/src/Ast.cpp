@@ -632,6 +632,54 @@ void AstExprIfElse::visit(AstVisitor* visitor)
     }
 }
 
+bool AstExprDo::alwaysLeaves() const
+{
+    if (shorthand)
+        return true;
+
+    struct GiveFinder : AstVisitor
+    {
+        bool found = false;
+
+        bool visit(AstStatGive*) override
+        {
+            found = true;
+            return false;
+        }
+
+        // a nested `do` expression's gives are its own, and a function's body is another function
+        bool visit(AstExprDo*) override
+        {
+            return false;
+        }
+
+        bool visit(AstExprFunction*) override
+        {
+            return false;
+        }
+    };
+
+    GiveFinder finder;
+    for (AstStat* stat : body->body)
+        stat->visit(&finder);
+
+    return !finder.found;
+}
+
+AstExprBinary* asOrLeave(AstExpr* expr)
+{
+    AstExprBinary* binary = expr->as<AstExprBinary>();
+    if (!binary || binary->op != AstExprBinary::Or)
+        return nullptr;
+
+    AstExpr* right = binary->right;
+    while (AstExprGroup* group = right->as<AstExprGroup>())
+        right = group->expr;
+
+    AstExprDo* leave = right->as<AstExprDo>();
+    return leave && leave->alwaysLeaves() ? binary : nullptr;
+}
+
 AstExprDo::AstExprDo(const Location& location, AstStatBlock* body)
     : AstExpr(ClassIndex(), location)
     , body(body)
@@ -661,6 +709,19 @@ void AstExprTableComprehension::visit(AstVisitor* visitor)
 {
     if (visitor->visit(this))
         loop->visit(visitor);
+}
+
+AstExprPop::AstExprPop(const Location& location, AstExpr* expr)
+    : AstExpr(ClassIndex(), location)
+    , expr(expr)
+{
+    luwuOnly = true;
+}
+
+void AstExprPop::visit(AstVisitor* visitor)
+{
+    if (visitor->visit(this))
+        expr->visit(visitor);
 }
 
 AstExprError::AstExprError(const Location& location, const AstArray<AstExpr*>& expressions, unsigned messageIndex)
@@ -786,11 +847,21 @@ AstStatWhile::AstStatWhile(
 {
 }
 
+Location AstStatWhile::conditionLocation() const
+{
+    return ifConditionLocation(condition, clauses);
+}
+
+void AstStatWhile::visitCondition(AstVisitor* visitor)
+{
+    visitIfCondition(condition, clauses, visitor);
+}
+
 void AstStatWhile::visit(AstVisitor* visitor)
 {
     if (visitor->visit(this))
     {
-        condition->visit(visitor);
+        visitCondition(visitor);
         body->visit(visitor);
     }
 }
@@ -1048,6 +1119,26 @@ void AstStatCompoundAssign::visit(AstVisitor* visitor)
     }
 }
 
+AstStatPush::AstStatPush(const Location& location, AstExpr* target, const Location& opLocation, const AstArray<AstExpr*>& values)
+    : AstStat(ClassIndex(), location)
+    , target(target)
+    , opLocation(opLocation)
+    , values(values)
+{
+    luwuOnly = true;
+}
+
+void AstStatPush::visit(AstVisitor* visitor)
+{
+    if (visitor->visit(this))
+    {
+        target->visit(visitor);
+
+        for (AstExpr* value : values)
+            value->visit(visitor);
+    }
+}
+
 AstStatFunction::AstStatFunction(const Location& location, AstExpr* name, AstExprFunction* func, const Location& functionLocation)
     : AstStat(ClassIndex(), location)
     , name(name)
@@ -1109,6 +1200,14 @@ AstStatTypeAlias::AstStatTypeAlias(
     , exported(exported)
     , typeLocation(typeLocation)
 {
+}
+
+AstTypeReference* AstStatTypeAlias::destructuredReference() const
+{
+    if (!destructure && !destructuredFrom)
+        return nullptr;
+
+    return type->as<AstTypeReference>();
 }
 
 void AstStatTypeAlias::visit(AstVisitor* visitor)
