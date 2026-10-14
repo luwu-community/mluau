@@ -135,11 +135,14 @@ private:
 
     // Luwu If Local (rfcs/if-local.md)
     AstExpr* parseIfCondition(AstArray<AstIfClause>& clauses, const char* head = "if");
+    AstExpr* parseIfConditionClauses(AstArray<AstIfClause>& clauses, const char* head, const Location& start);
     AstArray<AstIfClause> parseLoopWhenChain(Location& whenLocation, bool inComprehension = false);
     AstStatBlock* wrapInWhenGuard(const AstArray<AstIfClause>& when, const Location& whenLocation, AstStatBlock* body, AstStatIf*& guard);
     void parseIfBindingClause(std::vector<AstIfClause>& chain, const std::optional<Location>& whenLocation);
     bool ifBindingFollows();
     bool whenFollows();
+    bool andStartsBinding();
+    void reportAndBeforeBinding();
 
     // while exp do block end
     AstStat* parseWhile();
@@ -241,6 +244,9 @@ private:
 
     bool destructuringFollows();
     bool destructurePatternFollows();
+    bool destructuringAssignmentFollows();
+    bool dotTableMissingBraceFollows();
+    bool destructuringAvailable();
     AstStat* parseDestructuring(const Location& start, const Location& keywordLocation, bool isConst, std::optional<Name> name = {});
     AstExpr* parseDestructuringDeclaration(const Location& start, DestructureTarget& target, Location& equalsLocation);
     void parseDestructurePattern(DestructureTarget& target);
@@ -486,7 +492,8 @@ public:
 
 private:
     AstExpr* parseBinaryTail(AstExpr* expr, const Location& start, unsigned int limit);
-    AstStat* parseOrLeaveStatement(AstExpr* first, const Location& start);
+    AstStat* parseOrLeaveStatement(AstExpr* first, const Location& start, size_t errorsBeforeStatement);
+    AstStatError* reportIncompleteStatement(AstExpr* expr, size_t errorsBeforeStatement, const char* message);
 
     std::optional<AstExprUnary::Op> checkUnaryConfusables();
     std::optional<AstExprBinary::Op> checkBinaryConfusables(const BinaryOpPriority binaryPriority[], unsigned int limit);
@@ -526,6 +533,11 @@ private:
     // fieldsep ::= `,' | `;'
     AstExpr* parseTableConstructor();
 
+    // Luwu Destructuring (rfcs/destructuring.md):
+    // dottable ::= `.' `{' [dotfield {fieldsep dotfield} [fieldsep]] `}'
+    // dotfield ::= Name | Name `=' exp
+    AstExpr* parseDotTableConstructor();
+
     // TODO: Add grammar rules here?
     AstExpr* parseIfElseExpr();
     // Luwu: a missing `then`/`else` in an if-else expression is reported on its keyword (see parseIfElseExpr)
@@ -539,6 +551,8 @@ private:
     void noteStrayEnd(const char* construct, bool reported);
     void reportLeftoverAtEndOfChunk();
     AstExpr* missingIfElseArm();
+    AstExpr* missingValueAfter(const char* keyword);
+    AstExprError* missingValueHere();
     // Luwu Do Expressions (rfcs/do-expressions.md)
     AstExpr* parseDoExpr();
     AstStat* parseGive();
@@ -560,6 +574,7 @@ private:
 
     // Name
     std::optional<Name> parseNameOpt(const char* context = nullptr);
+    std::optional<Name> parseNameBeforeDeclaration(const char* context);
     Name parseName(const char* context = nullptr);
     Name parseIndexName(const char* context, const Position& previous);
 
@@ -594,6 +609,13 @@ private:
     // check that parser is at lexeme/symbol, move to next lexeme/symbol on success, report failure and continue on failure
     bool expectAndConsume(char value, const char* context = nullptr);
     bool expectAndConsume(Lexeme::Type type, const char* context = nullptr);
+    bool consumeExpected(Lexeme::Type type, const char* context);
+    AstTypeError* missingTypeHere();
+    bool continuesOnSameLine();
+    bool startsConstDeclaration();
+    bool nextLineStartsStatement(bool (*cantContinue)(const Lexeme& afterName));
+    bool nextLineStartsUnpatternedStatement();
+    bool statementReportedError();
     bool expectAndConsumeFailWithLookahead(Lexeme::Type type, const char* context);
     void expectAndConsumeFail(Lexeme::Type type, const char* context);
     void reportExpected(const Location& location, Lexeme::Type type, const char* context);
@@ -774,6 +796,9 @@ private:
 
     bool hotcommentHeader = true;
 
+    // Luwu: where the statement being parsed starts (see nextLineStartsStatement)
+    Position statementStart{0, 0};
+
     unsigned int recursionCounter;
 
     // Luwu Do Expressions (rfcs/do-expressions.md): where the expression directly inside the innermost `(` being parsed
@@ -783,6 +808,12 @@ private:
     // Luwu Do Expressions (rfcs/do-expressions.md): the statement being parsed is directly in a `do` expression's block, not
     // in a block nested in it. A `give` there ends the expression, so a `,` after its value belongs to the list around it.
     bool doExprTopLevel = false;
+
+
+    // Luwu If Local (rfcs/if-local.md): an `if`/`elseif`/`while` condition is being parsed, where `and local x` and
+    // `and const x` were meant as `when`. `andBeforeBinding` is that `and`, already reported and consumed.
+    bool inIfCondition = false;
+    std::optional<Location> andBeforeBinding;
 
     // Luwu: `end`s found right after an if-else or `do` expression (see noteStrayEnd)
     struct StrayEnd
@@ -820,6 +851,10 @@ private:
     std::vector<ParseError> parseErrors;
 
     std::vector<unsigned int> matchRecoveryStopOnToken;
+
+    // Luwu: the line of the last "Incomplete statement" error. A word still being typed (`n o` on the way to `n or`)
+    // splits into several statements on one line, and only the first is reported.
+    std::optional<unsigned> incompleteStatementLine;
 
     DenseHashMap<AstName, Location> declaredExportBindings;
     bool hasModuleReturn = false;

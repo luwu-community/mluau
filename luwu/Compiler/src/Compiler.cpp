@@ -185,6 +185,19 @@ static bool isTraitConstantField(const AstClassProperty& prop)
     return !prop.expectLocation && prop.defaultValue && isConstantClassDefault(prop.defaultValue);
 }
 
+// Luwu Classes (rfcs/classes): whether the class or trait body declares a field `name`, which restates the primary
+// constructor parameter of that name
+static bool classBodyDeclaresProperty(AstStatClass* decl, AstName name)
+{
+    for (const AstClassMember& member : decl->members)
+    {
+        if (const AstClassProperty* prop = member.get_if<AstClassProperty>(); prop && prop->name == name)
+            return true;
+    }
+
+    return false;
+}
+
 struct Compiler
 {
     struct RegScope;
@@ -3909,6 +3922,7 @@ struct Compiler
 
     // Luwu Traits (rfcs/classes/traits.md): a trait's fields in the order its shape lists them (compileClassDeclaration):
     // the body's provided fields, then the parameters the body doesn't restate. A parameter's entry has no property.
+    // An `expect` field restates a parameter too, so the parameter provides no field, as in luaR_implementtraits.
     static std::vector<std::pair<AstName, const AstClassProperty*>> traitProvidedFields(AstStatClass* trait)
     {
         std::vector<std::pair<AstName, const AstClassProperty*>> fields;
@@ -3921,16 +3935,7 @@ struct Compiler
         {
             for (AstLocal* param : trait->primaryConstructor->args)
             {
-                bool restated = std::any_of(
-                    fields.begin(),
-                    fields.end(),
-                    [&](const std::pair<AstName, const AstClassProperty*>& field)
-                    {
-                        return field.first == param->name;
-                    }
-                );
-
-                if (!restated)
+                if (!classBodyDeclaresProperty(trait, param->name))
                     fields.emplace_back(param->name, nullptr);
             }
         }
@@ -5934,32 +5939,69 @@ struct Compiler
         return reg;
     }
 
+    // Luwu If Local (rfcs/if-local.md): compiles `clauses`, then the code they guard with `compileBranch`, which sees the
+    // clauses' bindings and `class.isinstance` proofs. A `while` chain is its loop's header (Loop::compilingHeader). Closes
+    // the bindings' upvalues when `closeAfter`, and pops them. Returns the register a failing clause's path closes
+    // upvalues from, or -1 (capturedLocalsReg; see emitClauseFailureClose).
+    template<typename CompileBranch>
+    int compileGuardedBranch(
+        const AstArray<AstIfClause>& clauses,
+        std::vector<size_t>& elseJumps,
+        AstNode* branch,
+        bool loopHeader,
+        bool closeAfter,
+        CompileBranch&& compileBranch
+    )
+    {
+        size_t oldLocals = localStack.size();
+        RegScope rs(this);
+
+        std::vector<AssertProof> proofs;
+        if (loopHeader)
+            loops.back().compilingHeader = true;
+        compileIfClauses(clauses, elseJumps, branch, &proofs);
+        if (loopHeader)
+            loops.back().compilingHeader = false;
+
+        compileBranch();
+        restoreAssertProofs(proofs);
+
+        int closeReg = capturedLocalsReg(oldLocals);
+        if (closeAfter)
+            closeLocals(oldLocals);
+        popLocals(oldLocals);
+
+        return closeReg;
+    }
+
+    // Luwu If Local (rfcs/if-local.md): the start of the path a failing clause jumps to
+    void emitClauseFailureClose(int closeReg)
+    {
+        if (closeReg >= 0)
+            bytecode.emitABC(LOP_CLOSEUPVALS, uint8_t(closeReg), 0, 0);
+    }
+
     // Luwu If Local (rfcs/if-local.md)
     void compileExprIfElseClauses(AstExprIfElse* expr, uint8_t target, bool targetTemp)
     {
-        size_t oldLocals = localStack.size();
         std::vector<size_t> elseJump;
-        int closeReg = -1;
-
-        {
-            RegScope rs(this);
-
-            std::vector<AssertProof> proofs;
-            compileIfClauses(expr->clauses, elseJump, expr->trueExpr, &proofs);
-            compileExpr(expr->trueExpr, target, targetTemp);
-            restoreAssertProofs(proofs);
-
-            closeReg = capturedLocalsReg(oldLocals);
-            closeLocals(oldLocals);
-            popLocals(oldLocals);
-        }
+        int closeReg = compileGuardedBranch(
+            expr->clauses,
+            elseJump,
+            expr->trueExpr,
+            /* loopHeader */ false,
+            /* closeAfter */ true,
+            [&]()
+            {
+                compileExpr(expr->trueExpr, target, targetTemp);
+            }
+        );
 
         size_t thenLabel = bytecode.emitLabel();
         bytecode.emitAD(LOP_JUMP, 0, 0);
 
         size_t elseLabel = bytecode.emitLabel();
-        if (closeReg >= 0)
-            bytecode.emitABC(LOP_CLOSEUPVALS, uint8_t(closeReg), 0, 0);
+        emitClauseFailureClose(closeReg);
 
         compileExpr(expr->falseExpr, target, targetTemp);
         size_t endLabel = bytecode.emitLabel();
@@ -7562,29 +7604,23 @@ struct Compiler
     // Luwu If Local (rfcs/if-local.md)
     void compileStatIfClauses(AstStatIf* stat)
     {
-        size_t oldLocals = localStack.size();
         std::vector<size_t> elseJump;
         bool thenTerminates = alwaysTerminates(stat->thenbody);
-        int closeReg = -1;
 
         // With no else branch, the branch falls through to the else path's CLOSEUPVALS, which closes for both
         bool thenFallsIntoElsePath = !stat->elsebody && !thenTerminates;
 
-        {
-            RegScope rs(this);
-
-            std::vector<AssertProof> proofs;
-            compileIfClauses(stat->clauses, elseJump, stat->thenbody, &proofs);
-            compileStat(stat->thenbody);
-            restoreAssertProofs(proofs);
-
-            closeReg = capturedLocalsReg(oldLocals);
-
-            if (!thenTerminates && !thenFallsIntoElsePath)
-                closeLocals(oldLocals);
-
-            popLocals(oldLocals);
-        }
+        int closeReg = compileGuardedBranch(
+            stat->clauses,
+            elseJump,
+            stat->thenbody,
+            /* loopHeader */ false,
+            /* closeAfter */ !thenTerminates && !thenFallsIntoElsePath,
+            [&]()
+            {
+                compileStat(stat->thenbody);
+            }
+        );
 
         size_t thenLabel = 0;
         bool jumpOverElse = stat->elsebody && !thenTerminates;
@@ -7596,8 +7632,7 @@ struct Compiler
         }
 
         size_t elseLabel = bytecode.emitLabel();
-        if (closeReg >= 0)
-            bytecode.emitABC(LOP_CLOSEUPVALS, uint8_t(closeReg), 0, 0);
+        emitClauseFailureClose(closeReg);
 
         if (stat->elsebody)
             compileStat(stat->elsebody);
@@ -7732,26 +7767,20 @@ struct Compiler
         size_t loopLabel = bytecode.emitLabel();
 
         std::vector<size_t> elseJump;
-        int closeReg = -1;
         size_t contLabel = 0;
 
-        {
-            RegScope rs(this);
-
-            std::vector<AssertProof> proofs;
-            loops.back().compilingHeader = true;
-            compileIfClauses(stat->clauses, elseJump, stat->body, &proofs);
-            loops.back().compilingHeader = false;
-
-            compileStat(stat->body);
-            restoreAssertProofs(proofs);
-
-            contLabel = bytecode.emitLabel();
-
-            closeReg = capturedLocalsReg(oldLocals);
-            closeLocals(oldLocals);
-            popLocals(oldLocals);
-        }
+        int closeReg = compileGuardedBranch(
+            stat->clauses,
+            elseJump,
+            stat->body,
+            /* loopHeader */ true,
+            /* closeAfter */ true,
+            [&]()
+            {
+                compileStat(stat->body);
+                contLabel = bytecode.emitLabel();
+            }
+        );
 
         size_t backLabel = bytecode.emitLabel();
 
@@ -7760,9 +7789,7 @@ struct Compiler
         bytecode.emitAD(LOP_JUMPBACK, 0, 0);
 
         size_t endLabel = bytecode.emitLabel();
-
-        if (closeReg >= 0)
-            bytecode.emitABC(LOP_CLOSEUPVALS, uint8_t(closeReg), 0, 0);
+        emitClauseFailureClose(closeReg);
 
         patchJump(stat, backLabel, loopLabel);
         patchJumps(stat, elseJump, endLabel);
