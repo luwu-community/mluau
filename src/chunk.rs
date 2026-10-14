@@ -252,6 +252,25 @@ impl Language {
             Language::Lua => ffi::LUA_LANGUAGE_LUA,
         }
     }
+
+    /// convenience wrapper for getting the right kind of language given a chunk named after a file path.
+    /// this doesn't accept AsRef<Path> so we can accept chunk names that start with @
+    /// 
+    /// if you pass things in here dynamically and your chunk name commonly doesn't have an extension
+    /// you should just `unwrap_or` this result
+    pub fn from_chunk_name<P: AsRef<str>>(path: P) -> Result<Self> {
+        let pathy = path.as_ref();
+        let lang = if pathy.ends_with(".luwu") {
+            Language::Luwu
+        } else if pathy.ends_with(".luau") {
+            Language::Luau
+        } else if pathy.ends_with(".lua") {
+            Language::Lua
+        } else {
+            return Err(Error::UnsupportedLanguage)
+        };
+        Ok(lang)
+    }
 }
 
 /// Represents chunk mode (text or binary).

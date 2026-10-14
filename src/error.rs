@@ -110,6 +110,7 @@ pub enum Error {
     /// Returning `Err(ExternalError(...))` from a Rust callback will raise the error as a Lua
     /// error.
     ExternalError(StdString),
+    UnsupportedLanguage,
 }
 
 /// A specialized `Result` type used by `mlua`'s API.
@@ -174,7 +175,9 @@ impl fmt::Display for Error {
                 write!(fmt, "deserialize error: {err}")
             },
             Error::ExternalError(err) => err.fmt(fmt),
-
+            Error::UnsupportedLanguage => {
+                write!(fmt, "mluau doesn't support this programming language (we only accept Lua, Luau, and Luwu)")
+            }
         }
     }
 }
