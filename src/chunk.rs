@@ -322,7 +322,9 @@ impl Default for Compiler {
 }
 
 impl Compiler {
-    /// Creates Luau compiler instance with default options
+    /// Creates Luwu compiler with default options.
+    /// This defaults to [`Language::Luau`], pass [`Language::Luwu`] to [`Compiler::set_language`] or use
+    /// [`Compiler::luwu`] to use Luwu instead.
     pub const fn new() -> Self {
         // Defaults are taken from luacode.h
         Compiler {
@@ -342,15 +344,22 @@ impl Compiler {
         }
     }
 
-    /// Sets the language the source is written in. Luwu syntax is a compile error unless it's [`Language::Luwu`], even
-    /// when the feature's FFlag is on. Defaults to [`Language::Luau`].
+    pub const fn luwu() -> Self {
+        Compiler::new().set_language(Language::Luwu)
+    }
+
+    /// Set the Lua-family language to compile this chunk as: Lua, Luau, or Luwu.
+    /// Luwu-only syntax is invalid in Luau chunks (will syntax error if you try), and Lua code is currently handled like Luau.
+    /// 
+    /// We default to [`Language::Luau`] for backwards compat. with previous versions of mluau (even when the luwu crate feature is enabled),
+    /// see [`Compiler::luwu`] for a quicker way to use [`Language::Luwu`].
     #[must_use]
     pub const fn set_language(mut self, language: Language) -> Self {
         self.language = language;
         self
     }
 
-    /// Sets Luau compiler optimization level.
+    /// Sets Luwu compiler optimization level.
     ///
     /// Possible values:
     /// * 0 - no optimization
@@ -362,7 +371,7 @@ impl Compiler {
         self
     }
 
-    /// Sets Luau compiler debug level.
+    /// Sets Luwu compiler debug level.
     ///
     /// Possible values:
     /// * 0 - no debugging support
@@ -374,7 +383,7 @@ impl Compiler {
         self
     }
 
-    /// Sets Luau type information level used to guide native code generation decisions.
+    /// Sets Luwu type information level used to guide native code generation decisions.
     ///
     /// Possible values:
     /// * 0 - generate for native modules (default)
@@ -385,7 +394,7 @@ impl Compiler {
         self
     }
 
-    /// Sets Luau compiler code coverage level.
+    /// Sets Luwu compiler code coverage level.
     ///
     /// Possible values:
     /// * 0 - no code coverage support (default)
