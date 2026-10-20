@@ -293,6 +293,7 @@ private:
         const Location& typeKeywordLocation,
         const AstArray<AstAttr*>& attributes = {nullptr, 0}
     );
+    std::optional<Name> parseModulePath();
     AstStat* parseTypeDestructuring(const Location& start, bool exported, const Location& typeKeywordLocation);
 
     // `declared` parses the shape of a `declare class` (see AstStatDeclareClass) and returns the AstStatClass for it.
@@ -540,6 +541,27 @@ private:
 
     // TODO: Add grammar rules here?
     AstExpr* parseIfElseExpr();
+
+    // Luwu match expressions: `match` and the `is` / `implements` operators
+    bool matchExpressionsAvailable();
+    bool typeTestFollows();
+    AstExpr* parseTypeTest(AstExpr* value, const Location& start);
+    std::optional<AstExpr*> parseNothingValue();
+    AstExpr* parseTypeTestBindings(AstExpr* value, AstExpr* type, bool negated, const Location& start);
+    struct TypeTestBindings;
+    struct TypeTestBindingsFrame;
+    TypeTestBindingsFrame allowTypeTestBindings();
+    void appendConditionClauses(
+        std::vector<AstIfClause>& chain,
+        AstExpr* condition,
+        const std::optional<Location>& whenLocation,
+        TypeTestBindingsFrame outer
+    );
+    bool matchExpressionFollows();
+    AstExpr* parseMatchExpr(bool inStatement = false);
+    AstExpr* parseMatchPattern(AstLocal* subject);
+    AstExpr* parseMatchAlternative(AstLocal* subject);
+    AstExprCall* makeGlobalCall(AstName library, std::optional<AstName> function, const Location& location, std::initializer_list<AstExpr*> args);
     // Luwu: a missing `then`/`else` in an if-else expression is reported on its keyword (see parseIfElseExpr)
     enum class IfElseKeyword
     {
@@ -613,6 +635,7 @@ private:
     AstTypeError* missingTypeHere();
     bool continuesOnSameLine();
     bool startsConstDeclaration();
+    bool startsTypeAliasDeclaration();
     bool nextLineStartsStatement(bool (*cantContinue)(const Lexeme& afterName));
     bool nextLineStartsUnpatternedStatement();
     bool statementReportedError();
@@ -831,6 +854,33 @@ private:
     std::vector<AstExpr**> orContinues;
 
     AstName nameSelf;
+    // Luwu match expressions: the globals and functions `is` / `implements` call, and a `match` subject's hidden name
+    AstName nameClass;
+    AstName nameType;
+    AstName nameIsinstance;
+    AstName nameImplements;
+    AstName nameMatched;
+    AstName nameNone;
+
+    // Luwu match expressions: the clauses a `.{}` after a type test (`x is Point.{x, y}`) adds to the condition it's
+    // in: a hidden local holding the tested value when it isn't a local already, the test, then one untested binding
+    // per name. `test` is the expression the condition must be for the bindings to apply.
+    struct TypeTestBindings
+    {
+        AstExpr* test = nullptr;
+        Location location;
+        std::vector<AstIfClause> clauses;
+    };
+    // Whether a type test here may bind (the condition being parsed is a whole `if`, `when` or `case` condition), and
+    // the bindings it made. Saved and restored around each condition, so a nested one has its own.
+    struct TypeTestBindingsFrame
+    {
+        bool allowed = false;
+        std::optional<TypeTestBindings> bindings;
+    };
+    TypeTestBindingsFrame typeTestBindings;
+    // Set while parsing the class after `is`, so `Point.{x, y}` stops before the `.{` instead of calling `Point`
+    bool typeTestOperand = false;
     AstName nameNumber;
     AstName nameAny;
     AstName nameError;
