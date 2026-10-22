@@ -21,7 +21,8 @@ pub static ENABLED_FFLAGS: &[&str] = &[
     "LuauAutoStack", // lets mluau avoid calls to lua_checkstack (avoids ffi calls)
     "LuwuFatCClosure",
     "LuwuManagedReferences2",
-    "LuwuPcallMulti"
+    "LuwuPcallMulti",
+    "LuwuStringExtensions"
 ];
 
 pub static RESTRICTED_FFLAGS: &[&str] = &[
