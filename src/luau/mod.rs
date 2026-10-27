@@ -23,6 +23,8 @@ pub static ENABLED_FFLAGS: &[&str] = &[
     "LuwuManagedReferences2",
     "LuwuPcallMulti",
     "LuwuStringExtensions",
+    "LuwuBufferBatched",
+    "LuwuBufferMemcmp",
     // the `collections` library; it also needs LuwuClasses and LuwuNonePrimitive, and stays closed without them
     #[cfg(feature = "luwu-classes")]
     "DebugLuwuCollections"
