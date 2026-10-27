@@ -17,6 +17,8 @@ pub const LUA_VECLIBNAME: *const c_char = cstr!("vector");
 pub const LUA_INTLIBNAME: *const c_char = cstr!("integer");
 #[cfg(feature = "luwu-classes")]
 pub const LUA_CLASSLIBNAME: *const c_char = cstr!("class");
+#[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+pub const LUA_COLLECTIONSLIBNAME: *const c_char = cstr!("collections");
 
 unsafe extern "C-unwind" {
     pub fn luaopen_base(L: *mut lua_State) -> c_int;
@@ -33,6 +35,8 @@ unsafe extern "C-unwind" {
     pub fn luaopen_integer(L: *mut lua_State) -> c_int;
     #[cfg(feature = "luwu-classes")]
     pub fn luaopen_class(L: *mut lua_State) -> c_int;
+    #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+    pub fn luaopen_collections(L: *mut lua_State) -> c_int;
 
     // open all builtin libraries
     pub fn luaL_openlibs(L: *mut lua_State);

@@ -105,6 +105,8 @@ private:
 
     Parser(const char* buffer, std::size_t bufferSize, AstNameTable& names, Allocator& allocator, const ParseOptions& options);
 
+    static ParseResult finishParse(Parser& p, AstStatBlock* root, const char* buffer, size_t bufferSize);
+
     bool blockFollow(const Lexeme& l);
 
     AstStatBlock* parseChunk();
@@ -354,6 +356,8 @@ private:
     // varlist `=' explist
     AstStat* parseAssignment(AstExpr* initial);
 
+    void reportRedundantExportKeyword(const Location& keywordLocation, const char* keyword, AstStatLocal* stat);
+    void reportValuelessExports(AstStatBlock* root);
     AstStat* parseExportValue(
         const Location& start,
         const Location& keywordLocation,
@@ -493,7 +497,8 @@ public:
 
 private:
     AstExpr* parseBinaryTail(AstExpr* expr, const Location& start, unsigned int limit);
-    AstStat* parseOrLeaveStatement(AstExpr* first, const Location& start, size_t errorsBeforeStatement);
+    bool onlyStartsValue(const Lexeme& l);
+    AstStat* parseOrLeaveStatement(AstExpr* expr, size_t errorsBeforeStatement);
     AstStatError* reportIncompleteStatement(AstExpr* expr, size_t errorsBeforeStatement, const char* message);
 
     std::optional<AstExprUnary::Op> checkUnaryConfusables();
@@ -570,7 +575,7 @@ private:
         Missing,
     };
     IfElseKeyword expectIfElseKeyword(Lexeme::Type type, const Location& keyword);
-    void noteStrayEnd(const char* construct, bool reported);
+    void noteStrayEnd(const char* message, bool reported);
     void reportLeftoverAtEndOfChunk();
     AstExpr* missingIfElseArm();
     AstExpr* missingValueAfter(const char* keyword);
@@ -842,16 +847,30 @@ private:
     struct StrayEnd
     {
         Location location;
-        const char* construct;
+        const char* message;
         bool reported;
     };
     std::vector<StrayEnd> strayEnds;
+    // The stray `end` reportLeftoverAtEndOfChunk blamed. Parser::parse parses the file again with it skipped (as
+    // skippedStrayEnd), so the code after it isn't cut off at the block it closed early.
+    std::optional<Location> blamedStrayEnd;
+    std::optional<Location> skippedStrayEnd;
 
     // Luwu Do Expressions (rfcs/do-expressions.md): `x or continue` is the continue shorthand only in a module that never
     // uses `continue` as a name. Name uses are counted as the module is parsed, and each shorthand keeps the slot it was
     // stored in, so resolveOrContinues can turn it back into a variable read if the count isn't zero at the end.
+    // Whether one is a Luwu-only feature in this module is only known then too.
+    struct OrContinue
+    {
+        AstExpr** slot;
+        // `or`, `and`, `then` or `else`, for the feature error
+        const char* introducer;
+    };
     size_t continueNameUses = 0;
-    std::vector<AstExpr**> orContinues;
+    std::vector<OrContinue> orContinues;
+    void recordOrContinue(AstExpr** slot, const char* introducer);
+    void keepOrContinueKeyword(AstExpr** slot);
+    void checkLeaveShorthandFeature(const Location& keyword, const char* introducer);
 
     AstName nameSelf;
     // Luwu match expressions: the globals and functions `is` / `implements` call, and a `match` subject's hidden name
@@ -907,6 +926,17 @@ private:
     std::optional<unsigned> incompleteStatementLine;
 
     DenseHashMap<AstName, Location> declaredExportBindings;
+    // Luwu Export Values (rfcs/export-values.md): exports declared without a value, reported once the module is parsed
+    struct ValuelessExport
+    {
+        Location location;
+        AstStatLocal* stat;
+        // Written `export local x`, which is how upstream forward declares an export
+        bool writtenAsLocal;
+    };
+    std::vector<ValuelessExport> valuelessExports;
+    // Set while parseLocal reads an export's declaration, which reports a missing value through valuelessExports
+    bool parsingExport = false;
     bool hasModuleReturn = false;
 
     std::vector<AstAttr*> scratchAttr;

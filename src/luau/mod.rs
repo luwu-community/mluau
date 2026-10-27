@@ -22,7 +22,10 @@ pub static ENABLED_FFLAGS: &[&str] = &[
     "LuwuFatCClosure",
     "LuwuManagedReferences2",
     "LuwuPcallMulti",
-    "LuwuStringExtensions"
+    "LuwuStringExtensions",
+    // the `collections` library; it also needs LuwuClasses and LuwuNonePrimitive, and stays closed without them
+    #[cfg(feature = "luwu-classes")]
+    "DebugLuwuCollections"
 ];
 
 pub static RESTRICTED_FFLAGS: &[&str] = &[
@@ -125,6 +128,17 @@ impl Lua {
             let state = lua.state();
             protect_lua!(state, 0, 0, |state| {
                 ffi::luaL_requiref(state, ffi::LUA_CLASSLIBNAME, ffi::luaopen_class, 1)
+            })?;
+        }
+
+        // The `collections` library of builtin classes (DebugLuwuCollections, enabled above). It needs classes and
+        // the `none` primitive, which is the empty option.
+        #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+        {
+            let lua = self.lock();
+            let state = lua.state();
+            protect_lua!(state, 0, 0, |state| {
+                ffi::luaL_requiref(state, ffi::LUA_COLLECTIONSLIBNAME, ffi::luaopen_collections, 1)
             })?;
         }
 
