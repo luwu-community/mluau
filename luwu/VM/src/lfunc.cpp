@@ -58,6 +58,10 @@ Proto* luaF_newproto(lua_State* L)
 
     f->feedbackvec = NULL;
     f->feedbackvecsize = 0;
+    f->sizetablesites = 0;
+    f->tablesiteslisted = 0;
+    f->tablesites = NULL;
+    f->nextsited = NULL;
     f->funid = 0;
     f->optimized = nullptr;
     f->deoptimized = nullptr;
@@ -110,7 +114,15 @@ Closure* luaF_newFatCclosure(lua_State* L, size_t sz, LuaTable* e)
     c->fatc.debugname = NULL;
     c->fatc.dtor = NULL;
     c->fatc.size = sz;
+    c->fatc.df = NULL;
     return c;
+}
+
+int luaF_calldatacfunction(lua_State* L)
+{
+    Closure* cl = clvalue(L->ci->func);
+    LUAU_ASSERT(cl->isC == 2 && cl->fatc.df);
+    return cl->fatc.df(L, cl->fatc.data, int(L->top - L->base));
 }
 
 UpVal* luaF_findupval(lua_State* L, StkId level)
@@ -207,6 +219,9 @@ void luaF_freeproto(lua_State* L, Proto* f, lua_Page* page)
 
     if (f->feedbackvec)
         luaM_freearray(L, f->feedbackvec, f->feedbackvecsize, FeedbackVectorSlot, f->memcat);
+
+    if (f->tablesites)
+        luaM_freearray(L, f->tablesites, f->sizetablesites, TableSite, f->memcat);
 
     luaM_freegco(L, f, sizeof(Proto), f->memcat, page);
 }

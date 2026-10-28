@@ -4,6 +4,7 @@
 #include "Luau/Ast.h"
 #include "Luau/Common.h"
 #include "Luau/LuwuFlags.h"
+#include "Luau/LuwonSyntax.h"
 #include "Luau/StringUtils.h"
 #include "Luau/TimeTrace.h"
 
@@ -134,9 +135,13 @@ const char* const kDeclarationPlacementError =
 // its defaults (class fields, primary constructor and function parameters) are written as types.
 const char* const kDeclaredDefaultIsATypeError = "In a declaration, a default is written as its type: 'name = T'";
 // Luwu Declare Statements (rfcs/declare-statements.md): a declared value belongs to its file; values shared by
-// several files come from a definitions file.
+// several files come from a definitions file. A declared class is the exception: exporting it exports the class.
 const char* const kDeclareExportValueError =
-    "Only types can be exported with 'export declare'; to declare a global for several files, use a definitions file";
+    "'export declare' exports classes, traits and types only; to declare a global for several files, use a definitions file";
+// Luwu Declare Statements (rfcs/declare-statements.md): an exported declared class is an exported value, and those are
+// top-level statements.
+const char* const kDeclareExportNestedError =
+    "Move this 'export declare %s' statement outside the 'do' block into the module's top level";
 const char* const kIncompleteStatement = "Incomplete statement: expected assignment or a function call";
 // Luwu Do Expressions (rfcs/do-expressions.md): an expression statement can also end in a leave form, and in a `do`
 // expression a value where a statement goes was usually meant as the result.
@@ -148,9 +153,10 @@ const char* const kStrayEndAfterDoExpr = "Remove this 'end'; a 'do' expression e
 const char* const kStrayEndAfterIfElseExpr = "Remove this 'end'; an if-else expression ends at the value after its 'else'";
 // Luwu: upstream's legacy `declare class` declares an extern type; in Luwu it is a class or nothing.
 const char* const kLegacyDeclareClassError = "In Luwu, 'declare class' does not declare an extern type; write 'declare extern type' instead";
-const char* const kDeclareClassNeedsTypeError =
-    "A declared class is written 'declare class type Name'; to declare an extern type, write 'declare extern type Name'";
-const char* const kDeclareTraitNeedsTypeError = "A declared trait is written 'declare trait type Name'";
+const char* const kDeclareClassTypeError =
+    "Write 'class type %s' for the type alone, or 'declare class %s' for the class and its type: 'declare' declares a value";
+const char* const kDeclareTraitTypeError =
+    "Write 'trait type %s' for the type alone, or 'declare trait %s' for the trait and its type: 'declare' declares a value";
 const char* const kDeclareExportOrderError = "'export' goes before 'declare': write 'export declare'";
 const LuwuFeature kClassesFeature{"classes", /* plural= */ true, "LuwuClasses"};
 const LuwuFeature kDefaultArgumentsFeature{"default arguments", /* plural= */ true, "LuwuDefaultArguments"};
@@ -552,6 +558,9 @@ ParseResult Parser::parse(const char* buffer, size_t bufferSize, AstNameTable& n
 
 ParseResult Parser::finishParse(Parser& p, AstStatBlock* root, const char* buffer, size_t bufferSize)
 {
+    if (p.options.luwon)
+        checkLuwonSyntax(root, p.parseErrors);
+
     size_t lines = p.lexer.current().location.end.line + (bufferSize > 0 && buffer[bufferSize - 1] != '\n');
 
     return ParseResult{root, lines, std::move(p.hotcomments), std::move(p.parseErrors), std::move(p.commentLocations), std::move(p.cstNodeMap)};
@@ -648,6 +657,7 @@ Parser::Parser(const char* buffer, size_t bufferSize, AstNameTable& names, Alloc
     nameError = names.getOrAdd(kParseNameError);
     nameDestructured = names.getOrAdd(kDestructuredLocalName);
     nameNil = names.getOrAdd("nil"); // nil is a reserved keyword
+    nameTrait = names.getOrAdd("trait");
 
     matchRecoveryStopOnToken.assign(Lexeme::Type::Reserved_END, 0);
     matchRecoveryStopOnToken[Lexeme::Type::Eof] = 1;
@@ -980,6 +990,8 @@ AstStat* Parser::parseStat()
 
     if (ident == "class")
     {
+        if (FFlag::LuwuClasses && startsClassType())
+            return parseClassType(start, expr->location, /* exported= */ false);
         if (FFlag::LuwuClasses)
             return parseClassStat(start, /*exported*/ false, start);
 
@@ -991,6 +1003,9 @@ AstStat* Parser::parseStat()
 
     // Luwu Traits (rfcs/classes/traits.md): `trait Name`. Like `class`, `trait` is only a keyword where a declaration starts,
     // so a variable named `trait` keeps working.
+    // Luwu Declare Statements (rfcs/declare-statements.md): `trait type Name`, a trait's type with no value
+    if (ident == "trait" && traitsEnabled() && startsClassType())
+        return parseClassType(start, expr->location, /* exported= */ false, /* isTrait= */ true);
     if (ident == "trait" && traitsEnabled() && lexer.current().type == Lexeme::Name)
         return parseClassStat(start, /* exported= */ false, start, {nullptr, 0}, /* declared= */ false, /* isTrait= */ true);
 
@@ -1003,6 +1018,30 @@ AstStat* Parser::parseStat()
             Location declareLocation = lexer.current().location;
             nextLexeme();
             return parseDeclaration(declareLocation, AstArray<AstAttr*>({nullptr, 0}), expr->location);
+        }
+
+        // Luwu Declare Statements (rfcs/declare-statements.md): `export class type Name`
+        bool exportsClassType = FFlag::LuwuClasses && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "class" &&
+                                lexer.lookahead().type == Lexeme::Name && AstName(lexer.lookahead().name) == "type";
+        if (exportsClassType)
+        {
+            Location classKeywordLocation = lexer.current().location;
+            nextLexeme();
+            if (startsClassType())
+                return parseClassType(start, classKeywordLocation, /* exported= */ true);
+            return parseClassStat(start, /*exported*/ true, classKeywordLocation);
+        }
+
+        // Luwu Traits (rfcs/classes/traits.md): `export trait type Name`
+        bool exportsTraitType = traitsEnabled() && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "trait" &&
+                                lexer.lookahead().type == Lexeme::Name && AstName(lexer.lookahead().name) == "type";
+        if (exportsTraitType)
+        {
+            Location traitKeywordLocation = lexer.current().location;
+            nextLexeme();
+            if (startsClassType())
+                return parseClassType(start, traitKeywordLocation, /* exported= */ true, /* isTrait= */ true);
+            return parseClassStat(start, /* exported= */ true, traitKeywordLocation, {nullptr, 0}, /* declared= */ false, /* isTrait= */ true);
         }
 
         if (FFlag::LuauExportValueSyntax)
@@ -3797,6 +3836,7 @@ bool Parser::classBodyLooksLikeStatement()
     return ident == "class" || ident == "export" || ident == "type" || (ident == "trait" && traitsEnabled());
 }
 
+
 // Luwu Classes (rfcs/classes): the grammar is also in the RFC's "Class definition syntax" section.
 // classStatement ::= [`export'] `class' Name [`<' GenericTypeListWithDefaults `>'] [primaryCtor] [`implements' traitRefList]
 //                    {classMember} `end'
@@ -4546,6 +4586,13 @@ LUAU_NOINLINE AstStat* Parser::parseClassStat(
                     if (body->args.size == 0 || body->args.data[0]->name != "self")
                         report(name.location, "'__init' must take 'self' as its first parameter");
                 }
+                // Luwu object notation: how a data file writes the class's objects and builds them back, for
+                // classes that implement `luwon.data`. The names are placeholders.
+                else if (name.name == "__todata" || name.name == "__fromdata")
+                {
+                    if (!implementsLuwonData(implements))
+                        report(name.location, "'%s' is only for classes that implement luwon.data", name.name.value);
+                }
                 else if (EXPLICITLY_DISALLOWED_METAMETHODS.count(name.name.value) > 0)
                     report(name.location, "%s cannot define '%s' as a metamethod", isTrait ? "Traits" : "Classes", name.name.value);
                 // Luwu: not while the parameter list is missing, which is how a special name being typed (`__ini`) reads
@@ -4964,8 +5011,8 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
 
     // Luwu Declare Statements (rfcs/declare-statements.md): `export declare extern type` and `export declare class`.
     // `export` leads, as in `export type` and `export class`; `declare export` is reported and parsed as meant. That
-    // keeps `declare export: T`, a global named `export`, unambiguous. Only types can be exported: a declared value is
-    // visible to its own file, and one that every file sees belongs in a definitions file.
+    // keeps `declare export: T`, a global named `export`, unambiguous. Only types and declared classes can be exported:
+    // a declared value is visible to its own file, and one that every file sees belongs in a definitions file.
     std::optional<Location> exportLocation = exportKeywordLocation;
     bool misplacedExport = FFlag::LuwuDeclareStatements && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "export" &&
                            lexer.lookahead().type != ':';
@@ -4988,21 +5035,23 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
         }
     }
 
-    // Luwu Traits (rfcs/classes/traits.md): `declare trait type Name` declares a trait the way `declare class type` declares a
-    // class, as the same shape.
+    // Luwu Traits (rfcs/classes/traits.md): `declare trait Name` declares a trait the way `declare class Name` declares a
+    // class, as the same shape, and the global holding it.
     bool isTrait = declaresTrait();
     if (isTrait || declaresClass())
     {
         Location classKeywordLocation = lexer.current().location;
         nextLexeme();
 
-        // `declare class type Name`: the `type` says this is a type and brings no value into scope. Without it, report
-        // and parse the class it meant.
+        // `declare class Name` declares the class: its type, and the global holding it, the way `class Name` defines both.
+        // `declare class type Name` mixes that with `class type Name` (the type alone); report it and parse the type.
         bool typeKeyword = lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "type" && lexer.lookahead().type == Lexeme::Name;
         if (typeKeyword)
+        {
+            const char* message = isTrait ? kDeclareTraitTypeError : kDeclareClassTypeError;
+            report(Location(classKeywordLocation, lexer.current().location), message, lexer.lookahead().name, lexer.lookahead().name);
             nextLexeme();
-        else
-            report(classKeywordLocation, "%s", isTrait ? kDeclareTraitNeedsTypeError : kDeclareClassNeedsTypeError);
+        }
 
         AstStat* stat = parseClassStat(
             start, /* exported= */ exportLocation.has_value(), classKeywordLocation, {nullptr, 0}, /* declared= */ true, isTrait
@@ -5014,6 +5063,9 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
         Location location = shape->location;
         if (exportKeywordLocation)
             location.begin = exportKeywordLocation->begin;
+
+        if (!typeKeyword)
+            declareClassValue(shape, isTrait ? nameTrait : nameClass, start);
 
         return allocator.alloc<AstStatDeclareClass>(location, shape, start);
     }
@@ -5326,6 +5378,12 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
             declaration->luwuOnly = true;
         return declaration;
     }
+    // Luwu Declare Statements (rfcs/declare-statements.md): one error for a `declare` with nothing it can declare after it.
+    // parseNameOpt would report a missing name, and the error below another.
+    else if (FFlag::LuwuDeclareStatements && lexer.current().type != Lexeme::Name)
+    {
+        return reportStatError(start, {}, {}, "declare must be followed by an identifier, 'function', 'class' or 'extern type'");
+    }
     else if (std::optional<Name> globalName = parseNameOpt("global variable name"))
     {
         // Luwu Declare Statements (rfcs/declare-statements.md): `declare name` with no type says the global exists and
@@ -5334,6 +5392,7 @@ AstStat* Parser::parseDeclaration(const Location& start, const AstArray<AstAttr*
         if (lexer.current().type == ':' || !FFlag::LuwuDeclareStatements)
         {
             expectAndConsume(':', "global variable declaration");
+
             type = parseType(/* in declaration context */ true);
         }
 
@@ -5378,7 +5437,7 @@ void Parser::skipClassOnlyExternTypeKeywords()
         if (keyword == "public" || keyword == "private")
             report(
                 lexer.current().location,
-                "Extern types have no access specifiers; every member is public. To declare a class, use 'declare class type'"
+                "Extern types have no access specifiers; every member is public. For a class's type, use 'class type'"
             );
         else if (keyword == "const")
             report(lexer.current().location, "Extern types have no 'const'; write 'read' for a read-only property");
@@ -5391,6 +5450,70 @@ void Parser::skipClassOnlyExternTypeKeywords()
     }
 }
 
+
+
+// Luwu Declare Statements (rfcs/declare-statements.md): whether `class` is followed by `type Name`. `class type` alone
+// (`class type(...)`) is a class named `type`.
+bool Parser::startsClassType()
+{
+    return FFlag::LuwuDeclareStatements && lexer.current().type == Lexeme::Name && AstName(lexer.current().name) == "type" &&
+           lexer.lookahead().type == Lexeme::Name;
+}
+
+// Luwu Declare Statements (rfcs/declare-statements.md): `class type Name ... end` (or `trait type`), a class's type with no
+// value, for objects that come from elsewhere. `declare class Name` declares the class value too. `class` is already parsed.
+AstStat* Parser::parseClassType(const Location& start, const Location& classKeywordLocation, bool exported, bool isTrait)
+{
+    nextLexeme(); // type
+
+    AstStat* stat = parseClassStat(start, exported, classKeywordLocation, {nullptr, 0}, /* declared= */ true, isTrait);
+    AstStatClass* shape = stat->as<AstStatClass>();
+    if (!shape)
+        return stat;
+
+    return allocator.alloc<AstStatDeclareClass>(shape->location, shape, std::nullopt);
+}
+// Luwu Declare Statements (rfcs/declare-statements.md): the global a `declare class` (or `declare trait`) brings into
+// scope, `declare Name: class<Name>`, queued to follow the declaration. `valueType` is `class` or `trait`. An exported
+// one is also exported as a value, `export Name = Name`, so a requirer gets the class along with its type.
+void Parser::declareClassValue(AstStatClass* shape, AstName valueType, const Location& declareLocation)
+{
+    Name name{shape->name->name, shape->name->location};
+    checkDuplicateDeclaration(name);
+
+    AstType* objectType = allocator.alloc<AstTypeReference>(name.location, std::nullopt, name.name, std::nullopt, name.location);
+    AstTypeOrPack parameter{objectType, nullptr};
+    AstType* type = allocator.alloc<AstTypeReference>(
+        shape->keywordLocation, std::nullopt, valueType, std::nullopt, shape->keywordLocation, /* hasParameterList= */ true, copy(&parameter, 1)
+    );
+
+    pendingStatements.push_back(allocator.alloc<AstStatDeclareGlobal>(shape->location, name.name, name.location, type, declareLocation));
+
+    if (!shape->exported || !FFlag::LuauExportValueSyntax)
+        return;
+
+    if (functionStack.size() != 1 || recursionCounter != 1)
+    {
+        report(shape->location, kDeclareExportNestedError, valueType.value);
+        return;
+    }
+
+    if (hasModuleReturn)
+        report(shape->location, "Exporting values is not compatible with top-level return (export/return conflict)");
+
+    if (declaredExportBindings.find(name.name))
+        report(name.location, "Duplicate exported identifier '%s'", name.name.value);
+    else
+        declaredExportBindings[name.name] = name.location;
+
+    AstExpr* global = allocator.alloc<AstExprGlobal>(name.location, name.name);
+    AstLocal* local = pushLocal(Binding(name, nullptr, {0, 0}, /* isConst= */ true));
+    local->isExported = true;
+
+    AstStatLocal* exported = allocator.alloc<AstStatLocal>(shape->location, copy(&local, 1), copy(&global, 1), std::nullopt, /* isConst= */ true);
+    exported->isExported = true;
+    pendingStatements.push_back(exported);
+}
 // Upstream's legacy `declare class Name`, an extern type, where it isn't a Luwu class
 bool Parser::legacyDeclareClass()
 {
@@ -8982,16 +9105,29 @@ bool Parser::matchExpressionsAvailable()
 const LuwuFeature kMatchFeature{"'match' expressions", /* plural= */ true, "DebugLuwuMatchExpressions"};
 const LuwuFeature kTypeTestFeature{"'is' and 'implements' type tests", /* plural= */ true, "DebugLuwuMatchExpressions"};
 
-// Luwu match expressions: `is` or `implements` after an operand, followed by a name, `not`, `function` or `nil`. Anything else
-// after it (`is = 1`, `is(f)`, `is.x`, `is "s"`) is a statement using a variable named `is`, which Luau code may have
-// on the same line, so it's never a type test.
+// Luwu match expressions: whether a literal a pattern compares with starts here: a string, a number, `true` or `false`
+bool Parser::literalPatternFollows()
+{
+    const Lexeme& current = lexer.current();
+    return current.type == Lexeme::QuotedString || current.type == Lexeme::RawString || current.type == Lexeme::Number ||
+           current.type == Lexeme::ReservedTrue || current.type == Lexeme::ReservedFalse ||
+           (current.type == '-' && lexer.lookahead().type == Lexeme::Number);
+}
+
+// Luwu match expressions: `is` or `implements` after an operand, followed by a name, `not`, `function`, `nil` or a
+// literal. Anything else after it (`is = 1`, `is(f)`, `is.x`) is a statement using a variable named `is`, which Luau
+// code may have on the same line, so it's never a type test. Only Luwu files have type tests, so `x is "s"` is one there
+// even though `is "s"` would call a function named `is` in Luau.
 bool Parser::typeTestFollows()
 {
     if (!matchExpressionsAvailable() || !isTypeTestKeyword(lexer.current()))
         return false;
 
-    Lexeme::Type next = lexer.lookahead().type;
-    return next == Lexeme::Name || next == Lexeme::ReservedNot || next == Lexeme::ReservedFunction || next == Lexeme::ReservedNil;
+    const Lexeme& next = lexer.lookahead();
+    bool literal = next.type == Lexeme::QuotedString || next.type == Lexeme::RawString || next.type == Lexeme::Number ||
+                   next.type == Lexeme::ReservedTrue || next.type == Lexeme::ReservedFalse || next.type == '-';
+    return literal || next.type == Lexeme::Name || next.type == Lexeme::ReservedNot || next.type == Lexeme::ReservedFunction ||
+           next.type == Lexeme::ReservedNil;
 }
 
 // Luwu match expressions: `library.function(args)` on the global `library`, never a local that shadows it
@@ -9028,49 +9164,144 @@ std::optional<AstExpr*> Parser::parseNothingValue()
     return std::nullopt;
 }
 
-// Luwu match expressions: the rest of `value is string`, `value is [not] Class` or `value implements Trait`, from the
-// keyword. They mean `type(value) == "string"`, `class.isinstance(value, Class)` and `class.implements(value, Trait)`,
-// and are parsed as those calls, so narrowing and the compiler's fused class checks apply as they do to the calls.
+// Luwu match expressions: points `test`'s reads of `from` at `to` instead. `test` is one the type test parser built,
+// so the value is only ever an operand of a comparison, a call or a `not`.
+static void retargetTestedValue(AstExpr* test, AstExpr* from, AstExpr* to)
+{
+    if (AstExprBinary* binary = test->as<AstExprBinary>())
+    {
+        if (binary->left == from)
+            binary->left = to;
+        else
+            retargetTestedValue(binary->left, from, to);
+    }
+    else if (AstExprCall* call = test->as<AstExprCall>())
+    {
+        for (size_t i = 0; i < call->args.size; ++i)
+        {
+            if (call->args.data[i] == from)
+                call->args.data[i] = to;
+        }
+    }
+    else if (AstExprUnary* unary = test->as<AstExprUnary>())
+    {
+        retargetTestedValue(unary->expr, from, to);
+    }
+}
+
+// Luwu match expressions: the rest of `value is <pattern>`, `value is not <pattern>` or `value implements Trait`, from the
+// keyword. A pattern is alternatives joined by `|`: `nil`, `none`, a literal, a primitive tag or a class
+// (`n is 1 | 2 | 3`, `x is string | Point`). They mean `value == 1`, `type(value) == "string"` and
+// `class.isinstance(value, Point)`, joined by `or`, and are parsed as those, so narrowing and the compiler's fused class
+// checks apply as they do to the written-out tests. `is not` negates each alternative and joins them with `and`.
 AstExpr* Parser::parseTypeTest(AstExpr* value, const Location& start)
 {
     checkLuwuFeature(lexer.current().location, kTypeTestFeature, FFlag::DebugLuwuMatchExpressions);
     bool implements = AstName(lexer.current().name) == "implements";
     nextLexeme(); // is / implements
 
+    if (implements)
+    {
+        AstExpr* trait = parseExpr(binaryPriority[AstExprBinary::CompareEq].right);
+        return makeGlobalCall(nameClass, nameImplements, Location(start, trait->location), {value, trait});
+    }
+
     bool negated = false;
-    if (!implements && lexer.current().type == Lexeme::ReservedNot)
+    if (lexer.current().type == Lexeme::ReservedNot)
     {
         negated = true;
         nextLexeme();
     }
 
-    // `x is nil` and `x is none` compare with the value; type() can't tell `none` from other symbols
-    if (std::optional<AstExpr*> nothing = implements ? std::nullopt : parseNothingValue())
+    AstExpr* test = parseTypeTestAlternative(value, start, negated);
+
+    // `case is A | is B` joins two patterns, which the `case` parser does
+    auto alternativeFollows = [&]()
     {
-        AstExprBinary::Op op = negated ? AstExprBinary::CompareNe : AstExprBinary::CompareEq;
-        return allocator.alloc<AstExprBinary>(Location(start, (*nothing)->location), op, value, *nothing);
+        return lexer.current().type == '|' && !isTypeTestKeyword(lexer.lookahead());
+    };
+    if (!alternativeFollows())
+        return test;
+
+    // Each alternative reads the value, so anything but a local or a constant is read once into a hidden local
+    bool readOnce = value->is<AstExprLocal>() || value->is<AstExprConstantString>() || value->is<AstExprConstantNumber>() ||
+                    value->is<AstExprConstantBool>() || value->is<AstExprConstantNil>();
+    unsigned int localsBegin = saveLocals();
+    AstStatLocal* declaration = nullptr;
+    AstExpr* tested = value;
+    if (!readOnce)
+    {
+        Binding binding(Name(nameMatched, value->location));
+        binding.isConst = true;
+        AstLocal* hidden = pushLocal(binding);
+        declaration = allocator.alloc<AstStatLocal>(value->location, copy({hidden}), copy({value}), std::nullopt, true);
+        tested = allocator.alloc<AstExprLocal>(value->location, hidden, /* upvalue= */ false);
+        retargetTestedValue(test, value, tested);
     }
 
-    if (std::optional<std::string> tag = implements ? std::nullopt : primitiveTagAt(lexer.current()))
+    AstExprBinary::Op join = negated ? AstExprBinary::And : AstExprBinary::Or;
+    while (alternativeFollows())
+    {
+        nextLexeme(); // |
+
+        // `n is 1 |` with nothing after it yet: the next line's statement isn't an alternative
+        if (valueEnds(lexer.current()) || nextLineStartsStatement(cantFollowValueName))
+        {
+            report(lexer.previousLocation(), "Expected a pattern after '|'");
+            break;
+        }
+
+        Location alternativeStart = lexer.current().location;
+        AstExpr* next = parseTypeTestAlternative(tested, alternativeStart, negated);
+        test = allocator.alloc<AstExprBinary>(Location(test->location, next->location), join, test, next);
+    }
+
+    restoreLocals(localsBegin);
+    if (!declaration)
+        return test;
+
+    Location location(start, test->location);
+    AstStatGive* give = allocator.alloc<AstStatGive>(test->location, test);
+    AstExprDo* node = allocator.alloc<AstExprDo>(location, allocator.alloc<AstStatBlock>(location, copy<AstStat*>({declaration, give})));
+    node->luwuOnly = true;
+    node->fromMatch = true;
+    return node;
+}
+
+// Luwu match expressions: one alternative of the pattern after `is`, testing `value`, negated for `is not`
+AstExpr* Parser::parseTypeTestAlternative(AstExpr* value, const Location& start, bool negated)
+{
+    AstExprBinary::Op compare = negated ? AstExprBinary::CompareNe : AstExprBinary::CompareEq;
+
+    // `x is nil` and `x is none` compare with the value; type() can't tell `none` from other symbols
+    if (std::optional<AstExpr*> nothing = parseNothingValue())
+        return allocator.alloc<AstExprBinary>(Location(start, (*nothing)->location), compare, value, *nothing);
+
+    if (literalPatternFollows())
+    {
+        AstExpr* literal = parseExpr(binaryPriority[AstExprBinary::CompareEq].right);
+        return allocator.alloc<AstExprBinary>(Location(start, literal->location), compare, value, literal);
+    }
+
+    if (std::optional<std::string> tag = primitiveTagAt(lexer.current()))
     {
         Location tagLocation = lexer.current().location;
         nextLexeme();
 
         Location location(start, tagLocation);
         AstExpr* typeName = allocator.alloc<AstExprConstantString>(tagLocation, copy(*tag), AstExprConstantString::QuoteStyle::Unquoted);
-        AstExprBinary::Op op = negated ? AstExprBinary::CompareNe : AstExprBinary::CompareEq;
-        return allocator.alloc<AstExprBinary>(location, op, makeGlobalCall(nameType, std::nullopt, location, {value}), typeName);
+        return allocator.alloc<AstExprBinary>(location, compare, makeGlobalCall(nameType, std::nullopt, location, {value}), typeName);
     }
 
-    typeTestOperand = !implements;
+    typeTestOperand = true;
     AstExpr* type = parseExpr(binaryPriority[AstExprBinary::CompareEq].right);
     typeTestOperand = false;
 
-    if (!implements && destructurePatternFollows())
+    if (destructurePatternFollows())
         return parseTypeTestBindings(value, type, negated, start);
 
     Location location(start, type->location);
-    AstExpr* test = makeGlobalCall(nameClass, implements ? nameImplements : nameIsinstance, location, {value, type});
+    AstExpr* test = makeGlobalCall(nameClass, nameIsinstance, location, {value, type});
 
     return negated ? allocator.alloc<AstExprUnary>(location, AstExprUnary::Op::Not, test) : test;
 }
@@ -9123,13 +9354,15 @@ AstExpr* Parser::parseTypeTestBindings(AstExpr* value, AstExpr* type, bool negat
     }
 
     AstExpr* test = makeTest(allocator.alloc<AstExprLocal>(value->location, tested, /* upvalue= */ false));
+    AstDestructurePattern* storedPattern = allocator.alloc<AstDestructurePattern>(pattern);
+    test->as<AstExprCall>()->typeTestPattern = storedPattern;
 
     // a pattern with no fields already reported that
     if (statements.empty())
         return test;
 
     AstStatLocal* first = statements.front()->as<AstStatLocal>();
-    first->destructure = allocator.alloc<AstDestructurePattern>(pattern);
+    first->destructure = storedPattern;
 
     TypeTestBindings bindings{test, location, {}};
     AstIfClause testClause;
@@ -9499,14 +9732,10 @@ AstExpr* Parser::parseMatchAlternative(AstLocal* subject)
     if (isTypeTestKeyword(lexer.current()))
         return parseTypeTest(subjectValue, start);
 
-    const Lexeme& current = lexer.current();
     if (std::optional<AstExpr*> nothing = parseNothingValue())
         return allocator.alloc<AstExprBinary>(Location(start, (*nothing)->location), AstExprBinary::CompareEq, subjectValue, *nothing);
 
-    bool literal = current.type == Lexeme::QuotedString || current.type == Lexeme::RawString || current.type == Lexeme::Number ||
-                   current.type == Lexeme::ReservedTrue || current.type == Lexeme::ReservedFalse ||
-                   (current.type == '-' && lexer.lookahead().type == Lexeme::Number);
-    if (literal)
+    if (literalPatternFollows())
     {
         AstExpr* value = parseExpr(binaryPriority[AstExprBinary::CompareEq].right);
         return allocator.alloc<AstExprBinary>(Location(start, value->location), AstExprBinary::CompareEq, subjectValue, value);

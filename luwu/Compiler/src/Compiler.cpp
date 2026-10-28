@@ -18,6 +18,7 @@
 #include "ValueTracking.h"
 
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <cstring>
 #include <memory>
@@ -33,6 +34,21 @@ LUAU_FASTINTVARIABLE(LuauCompileLoopUnrollThresholdMaxBoost, 300)
 LUAU_FASTINTVARIABLE(LuauCompileInlineThreshold, 25)
 LUAU_FASTINTVARIABLE(LuauCompileInlineThresholdMaxBoost, 300)
 LUAU_FASTINTVARIABLE(LuauCompileInlineDepth, 5)
+// Luwu: what the inliner's cost model counts a call as, the saving an inline weighs against the body's cost. Upstream
+// uses 3.
+LUAU_FASTINTVARIABLE(LuwuCompileInlineCallCost, 3)
+// Luwu: the call cost for a function compiled for native code (`--!native` or `@native`), where a call costs more next to
+// the code around it
+LUAU_FASTINTVARIABLE(LuwuCompileInlineNativeCallCost, 16)
+// Luwu: a loop-free function with fewer direct call sites than this gets a higher inlining threshold, scaled by this over
+// its call sites (2 call sites with 4 here: twice the threshold). Inlining adds a copy of the body per call site, so
+// fewer sites can afford a bigger body. 1 turns it off.
+LUAU_FASTINTVARIABLE(LuwuCompileInlineFewCallSites, 6)
+// Luwu: the most instructions inlining may add to one function, however the thresholds and the only-call-site rule are
+// set. It keeps bytecode size bounded: a module grows by at most this much per function. The cost model can't do that
+// on its own because it saturates at 127 and doesn't measure real size. The benchmarks, the classes benches, seal and
+// chimera never spend more than 2048.
+LUAU_FASTINTVARIABLE(LuwuCompileInlineBudget, 4096)
 
 LUAU_FASTFLAGVARIABLE(LuauCompileIifeInline)
 LUAU_FASTFLAG(LuwuDoExpr)
@@ -42,9 +58,9 @@ LUAU_FASTFLAGVARIABLE(LuauCompileStringInterpTargetTop)
 LUAU_FASTFLAG(LuwuNoinlineAttribute)
 LUAU_FASTFLAGVARIABLE(LuauEmitCallFeedback)
 LUAU_FASTFLAG(LuwuDefaultArguments)
+LUAU_FASTFLAG(DebugLuwuCollections)
 LUAU_FASTFLAGVARIABLE(LuwuExportedClassIsNilWorkaround)
 LUAU_FASTFLAG(LuwuStringExtensions)
-LUAU_FASTFLAG(DebugLuwuCollections)
 
 // May a file use the `--!trust` directive, which lets the compiler act on type annotations it cannot
 // verify (Compiler::trustsTypeAnnotations)? The flag only permits the directive; it never enables trust
@@ -293,7 +309,13 @@ struct Compiler
         Variable* v = variables.find(local);
 
         if (v && v->written)
-            locals[local].captured = true;
+        {
+            Local& l = locals[local];
+            l.captured = true;
+
+            if (l.allocated)
+                regCaptured[l.reg] = true;
+        }
 
         upvals.push_back(local);
 
@@ -540,6 +562,7 @@ struct Compiler
 
         LUAU_ASSERT(!functions.contains(func));
         LUAU_ASSERT(regTop == 0 && stackSize == 0 && localStack.empty() && upvals.empty());
+        inlinedInstructions = 0;
         if (FFlag::LuauExportValueSyntax)
             currentFunction = func;
 
@@ -755,11 +778,14 @@ struct Compiler
             costModel = modelCost(func->body, func->args.data, func->args.size, builtins, constants);
         }
 
+        uint32_t instructionCount = uint32_t(bytecode.getInstructionCount());
         bytecode.endFunction(uint8_t(stackSize), uint8_t(upvals.size()), protoflags, costModel);
 
         Function& f = functions[func];
         f.id = fid;
         f.upvals = upvals;
+        f.instructionCount = instructionCount;
+        f.hasLoops = hasLoops;
 
         // record information for inlining
         if (options.optimizationLevel >= 2 && !func->vararg && !func->self && !getfenvUsed && !setfenvUsed)
@@ -771,9 +797,17 @@ struct Compiler
             // track functions that only ever return a single value so that we can convert multret calls to fixedret calls
             if (alwaysTerminates(func->body))
             {
-                ReturnVisitor returnVisitor(this);
+                ReturnVisitor returnVisitor(this, func);
                 stat->visit(&returnVisitor);
                 f.returnsOne = returnVisitor.returnsOne;
+                f.returnKind = returnVisitor.returnKind;
+                f.returnLocal = returnVisitor.returnLocal;
+
+                if (f.returnLocal)
+                {
+                    if (Local* lc = locals.find(f.returnLocal); lc && lc->captured)
+                        f.returnLocalCaptured = true;
+                }
             }
         }
 
@@ -996,7 +1030,10 @@ struct Compiler
             else
             {
                 args[i] = uint8_t(regs + 1 + i);
-                compileExprTempTop(expr->args.data[i], uint8_t(args[i]));
+
+                // We temporarily swap out regTop to have targetTop work correctly here, see compileExprTempTop for info
+                RegScope rs(this, args[i] + 1);
+                args[i] = compileExprAutoTemp(expr->args.data[i], uint8_t(args[i]));
             }
         }
 
@@ -1164,16 +1201,30 @@ struct Compiler
 
         // we use a dynamic cost threshold that's based on the fixed limit boosted by the cost advantage we gain due to inlining
         int inlinedCost = computeCost(callCostModel, varc, std::min(int(func->args.size), 8));
-        int baselineCost = computeCost(fi->costModel, nullptr, 0) + 3;
+        bool compilingNative = nativeModule || (currentFunction && currentFunction->hasNativeAttribute());
+        int callCost = compilingNative ? FInt::LuwuCompileInlineNativeCallCost : FInt::LuwuCompileInlineCallCost;
+        int baselineCost = computeCost(fi->costModel, nullptr, 0) + callCost;
         int inlineProfit = (inlinedCost == 0) ? thresholdMaxBoost : std::min(thresholdMaxBoost, 100 * baselineCost / inlinedCost);
 
         int threshold = thresholdBase * inlineProfit / 100;
+
+        // Luwu: fewer call sites raise the threshold of a loop-free function (LuwuCompileInlineFewCallSites). A loop in
+        // the body does enough work per call that the call itself costs little next to it, and a call that runs once
+        // saves nothing worth a bigger body.
+        const unsigned* callSites = directCallSites.find(func);
+        bool fewCallSites = callSites && *callSites > 0 && int(*callSites) < FInt::LuwuCompileInlineFewCallSites;
+        if (fewCallSites && !fi->hasLoops && !callRunsOnce())
+            threshold = threshold * FInt::LuwuCompileInlineFewCallSites / int(*callSites);
+
+        // Luwu: a function with one call site inlines whatever it costs (isOnlyCallSite). Upstream inlines past the cost
+        // only an immediately called function expression.
+        bool onlyCallSite = isOnlyCallSite(func);
 
         if (FFlag::LuauCompileIifeInline)
         {
             bool isIife = unwrapExprOfType<AstExprFunction>(expr->func) != nullptr;
 
-            if (inlinedCost > threshold && !isIife)
+            if (inlinedCost > threshold && !isIife && !onlyCallSite)
             {
                 reportInlineTooExpensive(func, inlinedCost, inlineProfit);
                 return false;
@@ -1181,7 +1232,7 @@ struct Compiler
         }
         else
         {
-            if (inlinedCost > threshold)
+            if (inlinedCost > threshold && !onlyCallSite)
             {
                 reportInlineTooExpensive(func, inlinedCost, inlineProfit);
                 return false;
@@ -1190,6 +1241,25 @@ struct Compiler
 
         const char* inlinedOwner = nullptr;
         const char* inlinedName = describeInlineTarget(func, inlinedOwner);
+
+        // Luwu: the instructions inlining has added to this function so far, counting an inline still being compiled
+        uint32_t spent = inlinedInstructions;
+        if (!inlineFrames.empty())
+            spent += bytecode.getDebugPC() - outermostInlineStartPc;
+
+        if (spent + fi->instructionCount > uint32_t(FInt::LuwuCompileInlineBudget))
+        {
+            bytecode.addDebugRemark(
+                "inlining failed: %s would pass the function's inlining budget (%u of %d instructions spent)",
+                inlinedName,
+                spent,
+                FInt::LuwuCompileInlineBudget.value
+            );
+            return false;
+        }
+
+        if (onlyCallSite && inlinedCost > threshold)
+            bytecode.addDebugRemark("inlining past the cost model: the only call site of a function (cost %d)", inlinedCost);
 
         // Luwu Classes: a method call's remark says how its receiver's class was known, `proven` or `trusted` (from an
         // annotation under `--!trust`), since only a trusted one turns a wrong annotation into a runtime error
@@ -1221,9 +1291,86 @@ struct Compiler
                 int(inlineFrames.size())
             );
 
-        compileInlinedCall(expr, func, target, targetCount, selfExpr);
+        bool outermost = inlineFrames.empty();
+        if (outermost)
+            outermostInlineStartPc = bytecode.getDebugPC();
+
+        compileInlinedCall(expr, func, target, targetCount, selfExpr, onlyCallSite);
+
+        if (outermost)
+            inlinedInstructions += bytecode.getDebugPC() - outermostInlineStartPc;
         return true;
     }
+
+    // Luwu: whether this call is the only time `func`'s body gets compiled into a caller. The function has one direct
+    // call in the module, and that call isn't compiled more than once: not in an unrolled loop and not in a body
+    // inlined at several call sites. A class field's default that calls a function getFunctionExpr finds names a local
+    // besides the constructor's parameters. Such a default stays in `__init` instead of every construction site.
+    // A `@native` function called from code that isn't is left to the cost model: inlining would run its body
+    // interpreted. So is a call in top-level code outside any loop. That call runs once and saves no meaningful call
+    // overhead. A loop-free chunk also runs interpreted (LPF_NATIVE_COLD).
+    bool isOnlyCallSite(AstExprFunction* func)
+    {
+        const unsigned* calls = directCallSites.find(func);
+        if (!calls || *calls != 1 || repeatedCompileDepth > 0)
+            return false;
+
+        if (callRunsOnce())
+            return false;
+
+        bool leavesNativeCode = func->hasNativeAttribute() && currentFunction && !currentFunction->hasNativeAttribute();
+        if (leavesNativeCode)
+            return false;
+
+        for (const InlineFrame& frame : inlineFrames)
+        {
+            if (!frame.onlyCallSite)
+                return false;
+        }
+        return true;
+    }
+
+    // Luwu: the call being compiled is in top-level code outside any loop, so it runs once
+    bool callRunsOnce() const
+    {
+        return currentFunction && currentFunction->functionDepth == 0 && loops.empty();
+    }
+
+    // Luwu: counts the direct calls to each function (see isOnlyCallSite), after the passes getFunctionExpr reads
+    struct CallSiteVisitor : AstVisitor
+    {
+        Compiler* self;
+
+        explicit CallSiteVisitor(Compiler* self)
+            : self(self)
+        {
+        }
+
+        bool visit(AstExprCall* node) override
+        {
+            if (AstExprFunction* func = node->self ? nullptr : self->getFunctionExpr(node->func))
+                self->directCallSites[func]++;
+            return true;
+        }
+    };
+
+    // Luwu: marks code compiled more than once (an unrolled loop's body) while it's compiled. isOnlyCallSite never
+    // takes a call there for its function's only call site.
+    struct RepeatedCompile
+    {
+        Compiler* self;
+
+        explicit RepeatedCompile(Compiler* self)
+            : self(self)
+        {
+            self->repeatedCompileDepth++;
+        }
+
+        ~RepeatedCompile()
+        {
+            self->repeatedCompileDepth--;
+        }
+    };
 
     uint64_t costModelInlinedCall(AstExprCall* expr, AstExprFunction* func, AstExpr* selfExpr = nullptr)
     {
@@ -2041,8 +2188,72 @@ struct Compiler
         bytecode.emitAux(methodNameCid);
     }
 
-    void compileInlinedCall(AstExprCall* expr, AstExprFunction* func, uint8_t target, uint8_t targetCount, AstExpr* selfExpr = nullptr)
+    struct FindRegisterUseByLocal : AstVisitor
     {
+        FindRegisterUseByLocal(Compiler* self, uint8_t reg)
+            : self(self)
+            , reg(reg)
+        {
+        }
+
+        bool visit(AstExprLocal* node) override
+        {
+            if (self->getLocalReg(node->local) == reg)
+                used = true;
+
+            return !used;
+        }
+
+        Compiler* self = nullptr;
+        uint8_t reg = 0;
+        bool used = false;
+    };
+
+    // Luwu: ported from upstream 0.736's LuauCompileMoveElision with 0.742's LuauCompileMoveElisionFix. Whether a local
+    // in `reg` is read by argument `startArg` (unless that argument is the local itself) or by any argument after it.
+    // Luwu numbers the arguments as compileInlinedCall's argAt does, so an inlined method's receiver is argument 0.
+    bool isRegisterUsedInCallArguments(AstExprCall* expr, AstExpr* selfExpr, AstExpr* arg, size_t startArg, uint8_t reg)
+    {
+        FindRegisterUseByLocal visitor(this, reg);
+
+        size_t selfCount = selfExpr ? 1 : 0;
+        size_t providedArgs = expr->args.size + selfCount;
+
+        auto argAt = [&](size_t i) -> AstExpr*
+        {
+            if (selfExpr && i == 0)
+                return selfExpr;
+            return expr->args.data[i - selfCount];
+        };
+
+        // Allow direct use of the target register in the current argument
+        if (arg && getExprLocalReg(arg) != reg)
+            argAt(startArg)->visit(&visitor);
+
+        for (size_t i = startArg + 1; i < providedArgs && !visitor.used; ++i)
+            argAt(i)->visit(&visitor);
+
+        return visitor.used;
+    }
+
+    void compileInlinedCall(
+        AstExprCall* expr,
+        AstExprFunction* func,
+        uint8_t target,
+        uint8_t targetCount,
+        AstExpr* selfExpr = nullptr,
+        bool onlyCallSite = false
+    )
+    {
+        Function* fi = functions.find(func);
+
+        // We try to write result directly to the target register when possible, but there are a few blockers
+        // - function captures a reference to the local that is being returned and might close it
+        // - there might not be a target register (return value is unused)
+        // - target register is captured and might be read before inlined function completes
+        // Luwu: also when the callee has no function info
+        bool noTargetMoveElision = !fi || fi->returnLocalCaptured || targetCount == 0 || regCaptured[target];
+
         RegScope rs(this);
 
         size_t oldLocals = localStack.size();
@@ -2082,6 +2293,10 @@ struct Compiler
             AstLocal* var = func->args.data[i];
             AstExpr* arg = argAt(i);
 
+            // Luwu: not with parameter defaults, which assign into the parameter registers
+            bool canUseParameterTarget =
+                !hasArgDefaults && !noTargetMoveElision && fi->returnKind == ReturnKind::Parameter && fi->returnLocal == var;
+
             if (i + 1 == providedArgs && func->args.size > providedArgs && isExprMultRet(arg))
             {
                 // if the last argument can return multiple values, we need to compute all of them into the remaining arguments
@@ -2106,7 +2321,16 @@ struct Compiler
             {
                 Variable* vv = variables.find(var);
 
-                if (hasArgDefaults || (vv && vv->written))
+                if (vv && vv->written && canUseParameterTarget && !isRegisterUsedInCallArguments(expr, selfExpr, arg, i, target))
+                {
+                    if (arg)
+                        compileExprTemp(arg, target);
+                    else
+                        bytecode.emitABC(LOP_LOADNIL, target, 0, 0);
+
+                    args.push_back({var, target, {Constant::Type_Unknown}, kDefaultAllocPc});
+                }
+                else if (hasArgDefaults || (vv && vv->written))
                 {
                     // If the argument is mutated or this function has default values, we need to allocate a fresh register even if it's a constant.
                     // Default values assign into parameter registers, so reusing a caller local's register would let a default overwrite it, and a
@@ -2141,12 +2365,18 @@ struct Compiler
                     {
                         args.push_back({var, uint8_t(reg), {Constant::Type_Unknown}, kDefaultAllocPc, lv ? lv->init : nullptr});
                     }
+                    else if (canUseParameterTarget && !isRegisterUsedInCallArguments(expr, selfExpr, arg, i, target))
+                    {
+                        compileExprTemp(arg, target);
+
+                        args.push_back({var, target, {Constant::Type_Unknown}, kDefaultAllocPc});
+                    }
                     else
                     {
                         uint8_t temp = allocReg(arg, 1u);
                         uint32_t allocpc = bytecode.getDebugPC();
 
-                        compileExprTemp(arg, temp);
+                        temp = compileExprAutoTemp(arg, temp, target);
 
                         args.push_back({var, temp, {Constant::Type_Unknown}, allocpc, arg});
                     }
@@ -2243,8 +2473,11 @@ struct Compiler
             }
         }
 
+        AstLocal* resultLocal = !noTargetMoveElision && fi->returnKind == ReturnKind::Local ? fi->returnLocal : nullptr;
+
         // the inline frame will be used to compile return statements as well as to reject recursive inlining attempts
-        inlineFrames.push_back({func, oldLocals, target, targetCount});
+        inlineFrames.push_back({func, oldLocals, target, targetCount, resultLocal});
+        inlineFrames.back().onlyCallSite = onlyCallSite;
 
         if (selfProvenClass)
         {
@@ -3123,6 +3356,7 @@ struct Compiler
         uint8_t classReg = compileClassOperand(callee, rs);
 
         FieldsExpansion expansion(this, decl);
+
 
         for (size_t i = 0; i < primaryConstructor->args.size; ++i)
         {
@@ -7296,8 +7530,8 @@ struct Compiler
 
         if (int localReg = getExprLocalReg(expr->expr); localReg >= 0) // Locals can be indexed directly
             reg = uint8_t(localReg);
-        else if (targetTemp) // If target is a temp register, we can clobber it which allows us to compute the result directly into it
-            compileExprTemp(expr->expr, target);
+        else if (targetTemp) // If target is a temp register, we can compute the result directly into it
+            reg = compileExprAutoTemp(expr->expr, target);
         else
             reg = compileExprAuto(expr->expr, rs);
 
@@ -7674,18 +7908,51 @@ struct Compiler
         return compileExpr(node, target, /* targetTemp= */ true);
     }
 
+    // Luwu: ported from upstream 0.736's LuauCompileMoveElision, without the flag. Compiles `node` into `target`, unless all
+    // that takes is a MOVE from another register, in which case the MOVE is undone and that register is returned.
+    uint8_t compileExprAutoTemp(AstExpr* node, uint8_t target, uint8_t forbiddenSourceReg = kInvalidReg)
+    {
+        if (options.optimizationLevel == 0)
+        {
+            compileExprTemp(node, target);
+            return target;
+        }
+
+        size_t marker = bytecode.emitLabel();
+        compileExprTemp(node, target);
+
+        // If only a single instruction was generated, check if it's a move of a register that we can elide
+        if (bytecode.emitLabel() == marker + 1)
+        {
+            unsigned insn = bytecode.lastInstruction();
+
+            if (LUAU_INSN_OP(insn) == LOP_MOVE && LUAU_INSN_A(insn) == target)
+            {
+                uint8_t src = LUAU_INSN_B(insn);
+
+                // Captured registers might get modified while the operation is lowered and rely on the move copy to prevent that
+                if (!regCaptured[src] && src != forbiddenSourceReg)
+                {
+                    bytecode.undoEmit(LOP_MOVE);
+                    target = src;
+                }
+            }
+        }
+
+        return target;
+    }
+
     uint8_t compileExprAuto(AstExpr* node, RegScope&)
     {
         // Optimization: directly return locals instead of copying them to a temporary
+        // This can affect side-effect ordering on the register if it is captured
         if (int reg = getExprLocalReg(node); reg >= 0)
             return uint8_t(reg);
 
         // note: the register is owned by the parent scope
         uint8_t reg = allocReg(node, 1u);
 
-        compileExprTemp(node, reg);
-
-        return reg;
+        return compileExprAutoTemp(node, reg);
     }
 
     void compileExprSide(AstExpr* node)
@@ -8463,7 +8730,13 @@ struct Compiler
                 }
         }
 
-        if (!consecutive && stat->list.size > 0)
+        if (!consecutive && stat->list.size == 1 && !isExprMultRet(stat->list.data[0]))
+        {
+            // Single expression return might be able to elide the extra move into the fresh register
+            temp = allocReg(stat, 1u);
+            temp = compileExprAutoTemp(stat->list.data[0], temp);
+        }
+        else if (!consecutive && stat->list.size > 0)
         {
             temp = allocReg(stat, unsigned(stat->list.size));
 
@@ -8516,26 +8789,6 @@ struct Compiler
                 return int(i);
         }
         return -1;
-    }
-
-    // Luwu collections: the size of the tuple `expr` constructs, a `collections.pair`, `triple` or `quad` call with one
-    // argument per element, or 0 for anything else
-    unsigned tupleConstructionSize(AstExpr* expr)
-    {
-        AstExprCall* call = expr->as<AstExprCall>();
-        if (!FFlag::DebugLuwuCollections || !call || call->self)
-            return 0;
-
-        Builtin builtin = getBuiltin(call->func, globals, variables);
-        unsigned size = 0;
-        if (builtin.isMethod("collections", "pair"))
-            size = 2;
-        else if (builtin.isMethod("collections", "triple"))
-            size = 3;
-        else if (builtin.isMethod("collections", "quad"))
-            size = 4;
-
-        return call->args.size == size ? size : 0;
     }
 
     // Luwu collections: the size of the tuple every `give` of `expr` constructs, or 0 when one gives anything else or
@@ -8681,6 +8934,14 @@ struct Compiler
                     return;
                 }
             }
+
+            // Declaration of a local that becomes the inlined function result can use the return target register
+            if (!inlineFrames.empty() && inlineFrames.back().resultLocal == stat->vars.data[0])
+            {
+                compileExprTemp(stat->values.data[0], inlineFrames.back().target);
+                pushLocal(stat->vars.data[0], inlineFrames.back().target, kDefaultAllocPc);
+                return;
+            }
         }
 
         // note: allocReg in this case allocates into parent block register - note that we don't have RegScope here
@@ -8779,6 +9040,9 @@ struct Compiler
         // record changes on the first iteration to capture the pre-loop state
         exprChanges.clear();
         localChanges.clear();
+
+        // Luwu: the body is compiled once per iteration
+        RepeatedCompile repeated(this);
 
         for (int iv = 0; iv < tripCount; ++iv)
         {
@@ -8920,8 +9184,197 @@ struct Compiler
         loops.pop_back();
     }
 
+    // Luwu collections: the size of the tuple `expr` constructs, a `collections.pair`, `triple` or `quad` call with one
+    // argument per element, or 0 for anything else
+    unsigned tupleConstructionSize(AstExpr* expr)
+    {
+        AstExprCall* call = expr->as<AstExprCall>();
+        if (!FFlag::DebugLuwuCollections || !call || call->self)
+            return 0;
+
+        Builtin builtin = getBuiltin(call->func, globals, variables);
+        unsigned size = 0;
+        if (builtin.isMethod("collections", "pair"))
+            size = 2;
+        else if (builtin.isMethod("collections", "triple"))
+            size = 3;
+        else if (builtin.isMethod("collections", "quad"))
+            size = 4;
+
+        return call->args.size == size ? size : 0;
+    }
+
+    // Luwu collections: the largest table literal in a loop header (`for _, v in { a, b }`) that is unfolded
+    static constexpr size_t kMaxUnfoldedLoopItems = 4;
+
+    // Luwu collections: the elements of the value a `for ... in` loop unfolds instead of building it (see
+    // tryCompileUnfoldedForIn). Empty when it can't be unfolded.
+    struct UnfoldedLoopValue
+    {
+        std::vector<AstExpr*> elements;
+        // A table skips its `nil` items when iterated; a tuple yields every slot
+        bool skipsNil = false;
+    };
+
+    UnfoldedLoopValue unfoldedLoopValue(AstExpr* value)
+    {
+        UnfoldedLoopValue unfolded;
+        if (tupleConstructionSize(value) > 0)
+        {
+            AstExprCall* call = value->as<AstExprCall>();
+            unfolded.elements.assign(call->args.begin(), call->args.end());
+            return unfolded;
+        }
+
+        AstExprTable* table = value->as<AstExprTable>();
+        if (!table || table->items.size == 0 || table->items.size > kMaxUnfoldedLoopItems)
+            return unfolded;
+
+        for (const AstExprTable::Item& item : table->items)
+        {
+            if (item.kind != AstExprTable::Item::Kind::List)
+                return {};
+        }
+
+        // a call or `...` as the last item adds as many items as it returns; a tuple's construction returns one
+        AstExpr* last = table->items.data[table->items.size - 1].value;
+        if (isExprMultRet(last) && tupleConstructionSize(last) == 0)
+            return unfolded;
+
+        for (const AstExprTable::Item& item : table->items)
+            unfolded.elements.push_back(item.value);
+        unfolded.skipsNil = true;
+        return unfolded;
+    }
+
+    // Luwu collections: whether `body` reads or writes `local`
+    static bool mentionsLocal(AstStat* body, AstLocal* local)
+    {
+        struct Visitor : AstVisitor
+        {
+            AstLocal* local = nullptr;
+            bool found = false;
+
+            bool visit(AstExprLocal* node) override
+            {
+                found = found || node->local == local;
+                return !found;
+            }
+        };
+
+        Visitor visitor;
+        visitor.local = local;
+        body->visit(&visitor);
+        return visitor.found;
+    }
+
+    // Luwu collections: `for i, v in collections.pair(a, b)`, and `for i, v in { a, b }` with up to four plain items,
+    // build no tuple or table. Each element goes into a register and the body is compiled once per element. Each copy
+    // binds `v` to its element's register and `i` to its position, and a closure in one copy captures that copy's `v`.
+    // A table literal's `nil` items are skipped the way iterating the table skips them. Like a fastcall, this assumes
+    // `collections` is the builtin library when the module never assigns it.
+    bool tryCompileUnfoldedForIn(AstStatForIn* stat)
+    {
+        if (stat->values.size != 1 || stat->vars.size == 0)
+            return false;
+
+        UnfoldedLoopValue unfolded = unfoldedLoopValue(stat->values.data[0]);
+        if (unfolded.elements.empty())
+            return false;
+
+        RegScope rs(this);
+        uint8_t elements = allocReg(stat, unsigned(unfolded.elements.size()));
+        for (size_t i = 0; i < unfolded.elements.size(); i++)
+        {
+            RegScope rsElement(this);
+            compileExpr(unfolded.elements[i], uint8_t(elements + i), /* targetTemp= */ true);
+        }
+
+        // the position and any extra variables only get a register when the body uses them
+        std::vector<uint8_t> extraRegs(stat->vars.size, kInvalidReg);
+        for (size_t v = 0; v < stat->vars.size; v++)
+        {
+            if (v != 1 && mentionsLocal(stat->body, stat->vars.data[v]))
+                extraRegs[v] = allocReg(stat, 1u);
+        }
+
+        size_t oldLocals = localStack.size();
+        size_t oldJumps = loopJumps.size();
+        loops.push_back({oldLocals, oldLocals, nullptr});
+        // Luwu: the body is compiled once per element
+        RepeatedCompile repeated(this);
+
+        for (size_t i = 0; i < unfolded.elements.size(); i++)
+        {
+            uint8_t element = uint8_t(elements + i);
+
+            Constant constant = getConstant(unfolded.elements[i]);
+            if (unfolded.skipsNil && constant.type == Constant::Type_Nil)
+                continue;
+
+            std::optional<size_t> skipLabel;
+            if (unfolded.skipsNil && constant.type == Constant::Type_Unknown)
+            {
+                skipLabel = bytecode.emitLabel();
+                bytecode.emitAD(LOP_JUMPXEQKNIL, element, 0);
+                bytecode.emitAux(0);
+            }
+
+            for (size_t v = 0; v < stat->vars.size; v++)
+            {
+                if (v == 1)
+                {
+                    pushLocal(stat->vars.data[v], element, kDefaultAllocPc);
+                    continue;
+                }
+
+                if (extraRegs[v] == kInvalidReg)
+                    continue;
+
+                if (v == 0)
+                    bytecode.emitAD(LOP_LOADN, extraRegs[v], int16_t(i + 1));
+                else
+                    bytecode.emitABC(LOP_LOADNIL, extraRegs[v], 0, 0);
+                pushLocal(stat->vars.data[v], extraRegs[v], kDefaultAllocPc);
+            }
+
+            size_t iterJumps = loopJumps.size();
+
+            compileStat(stat->body);
+
+            closeLocals(oldLocals);
+            popLocals(oldLocals);
+
+            // a `continue` and a skipped `nil` item go to the next element
+            size_t contLabel = bytecode.emitLabel();
+            for (size_t j = iterJumps; j < loopJumps.size(); ++j)
+            {
+                if (loopJumps[j].type == LoopJump::Continue)
+                    patchJump(stat, loopJumps[j].label, contLabel);
+            }
+            if (skipLabel)
+                patchJump(stat, *skipLabel, contLabel);
+        }
+
+        // a `break` goes past the last element
+        size_t endLabel = bytecode.emitLabel();
+        for (size_t j = oldJumps; j < loopJumps.size(); ++j)
+        {
+            if (loopJumps[j].type == LoopJump::Break)
+                patchJump(stat, loopJumps[j].label, endLabel);
+        }
+
+        loopJumps.resize(oldJumps);
+        loops.pop_back();
+        return true;
+    }
+
     void compileStatForIn(AstStatForIn* stat)
     {
+        // Luwu collections: a tuple or small table literal in the loop header is never built (tryCompileUnfoldedForIn)
+        if (options.optimizationLevel >= 1 && tryCompileUnfoldedForIn(stat))
+            return;
+
         RegScope rs(this);
 
         size_t oldLocals = localStack.size();
@@ -9628,6 +10081,8 @@ struct Compiler
         l.debugpc = bytecode.getDebugPC();
         l.allocpc = allocpc == kDefaultAllocPc ? l.debugpc : allocpc;
 
+        regCaptured[reg] = l.captured;
+
         // A local's register is allocated before its initializer runs, and the initializer may use that
         // register as a temporary. For example, `local l: List<number> = List.new()` first loads the *class*
         // into l's register. Codegen prefers a declared type over the type it computed (getRegTag) and guards
@@ -9696,6 +10151,7 @@ struct Compiler
             LUAU_ASSERT(l->allocated);
 
             l->allocated = false;
+            regCaptured[l->reg] = false;
 
             if (options.debugLevel >= 2)
             {
@@ -10673,13 +11129,28 @@ struct Compiler
         std::vector<AstLocal*> upvals;
     };
 
+    enum class ReturnKind
+    {
+        None,       // No returns in the function
+        Expression, // Function returns some expression (could be a constant)
+        Parameter,  // Function returns one of its parameters
+        Local,      // Function returns one of its locals
+
+        Unknown // Function has multiple conflicting return kinds or return targets (for Parameter/Local)
+    };
+
     struct ReturnVisitor : AstVisitor
     {
-        Compiler* self;
-        bool returnsOne = true;
+        Compiler* self = nullptr;
+        AstExprFunction* func = nullptr;
 
-        ReturnVisitor(Compiler* self)
+        bool returnsOne = true;
+        ReturnKind returnKind = ReturnKind::None;
+        AstLocal* returnLocal = nullptr; // For Parameter/Local ReturnKind
+
+        ReturnVisitor(Compiler* self, AstExprFunction* func)
             : self(self)
+            , func(func)
         {
         }
 
@@ -10697,10 +11168,51 @@ struct Compiler
             return false;
         }
 
+        // Luwu: ported from upstream 0.736's LuauCompileMoveElision (see compileExprAutoTemp)
+        void merge(ReturnKind kind, AstLocal* local)
+        {
+            if (returnKind == ReturnKind::None)
+            {
+                returnKind = kind;
+                returnLocal = local;
+            }
+            else if (returnKind != kind || returnLocal != local)
+            {
+                returnKind = ReturnKind::Unknown;
+                returnLocal = nullptr;
+            }
+        }
+
         bool visit(AstStatReturn* stat) override
         {
-            returnsOne &= stat->list.size == 1 && !self->isExprMultRet(stat->list.data[0]);
+            if (stat->list.size != 1 || self->isExprMultRet(stat->list.data[0]))
+            {
+                returnsOne = false;
+                returnKind = ReturnKind::Unknown;
+                returnLocal = nullptr;
+                return false;
+            }
 
+            AstExprLocal* exprLocal = unwrapExprOfType<AstExprLocal>(stat->list.data[0]);
+
+            if (!exprLocal || exprLocal->upvalue)
+            {
+                merge(ReturnKind::Expression, nullptr);
+                return false;
+            }
+
+            ReturnKind kind = ReturnKind::Local;
+
+            for (AstLocal* arg : func->args)
+            {
+                if (arg == exprLocal->local)
+                {
+                    kind = ReturnKind::Parameter;
+                    break;
+                }
+            }
+
+            merge(kind, exprLocal->local);
             return false;
         }
     };
@@ -10740,7 +11252,15 @@ struct Compiler
         uint64_t costModel = 0;
         unsigned int stackSize = 0;
         bool canInline = false;
+        // Luwu: the size of the function's own body, what inlining it adds to a caller (LuwuCompileInlineBudget)
+        uint32_t instructionCount = 0;
+        // Luwu: the body has a loop that wasn't unrolled (LuwuCompileInlineFewCallSites)
+        bool hasLoops = false;
         bool returnsOne = false;
+
+        ReturnKind returnKind = ReturnKind::None;
+        AstLocal* returnLocal = nullptr; // For Parameter/Local ReturnKind
+        bool returnLocalCaptured = false;
     };
 
     struct Local
@@ -10799,6 +11319,9 @@ struct Compiler
         uint8_t target;
         uint8_t targetCount;
 
+        // The callee's local that every return returns, declared straight into `target` (compileStatLocal)
+        AstLocal* resultLocal = nullptr;
+
         std::vector<size_t> returnJumps;
 
         // Luwu Classes (rfcs/classes): an inlined method's `self`, when the inline site proved its class
@@ -10806,6 +11329,9 @@ struct Compiler
         AstLocal* provenSelf = nullptr;
         AstStatClass* provenSelfClass = nullptr;
         AstExprFunction* caller = nullptr;
+
+        // Luwu: this body is compiled at its function's only call site (isOnlyCallSite)
+        bool onlyCallSite = false;
     };
 
     struct Capture
@@ -10968,6 +11494,8 @@ struct Compiler
     bool setfenvUsed = false;
 
     std::vector<AstLocal*> localStack;
+    // Registers holding a local that a closure captures by reference (compileExprAutoTemp keeps their MOVEs)
+    std::array<bool, kMaxRegisterCount> regCaptured{};
     std::vector<AstLocal*> upvals;
     std::vector<LoopJump> loopJumps;
     std::vector<Loop> loops;
@@ -11009,6 +11537,19 @@ struct Compiler
     // Luwu Table Comprehensions (rfcs/table-comprehensions.md): the longest constant range a comprehension is folded to
     // a literal for (tryCompileConstantComprehension). Past it, the loop is less bytecode than the constants.
     static const int kConstantComprehensionLimit = 64;
+
+    // Luwu: how many direct calls each function has in the module (CallSiteVisitor), and how deep the compiler is in
+    // code it compiles more than once (RepeatedCompile)
+    DenseHashMap<AstExprFunction*, unsigned> directCallSites{nullptr};
+    unsigned repeatedCompileDepth = 0;
+
+    // Luwu: the instructions inlining has added to the function being compiled (LuwuCompileInlineBudget), and where the
+    // outermost inline being compiled began
+    uint32_t inlinedInstructions = 0;
+    uint32_t outermostInlineStartPc = 0;
+
+    // Luwu: the module says `--!native` (LuwuCompileInlineNativeCallCost)
+    bool nativeModule = false;
     // Luwu Classes (rfcs/classes): classes whose initializers are being compiled at a construction site
     // (tryCompileNewObjectFieldParameters), innermost last
     std::vector<AstStatClass*> fieldsExpansionStack;
@@ -11064,6 +11605,7 @@ void compileOrThrow(BytecodeBuilder& bytecode, const ParseResult& parseResult, A
 
     Compiler compiler(bytecode, options, names);
     compiler.trustTypeAnnotations = trustTypeAnnotations;
+    compiler.nativeModule = (mainFlags & LPF_NATIVE_MODULE) != 0;
 
     // Backing storage for AstExprFunction/AstStatBlock/AstStatReturn/AstStatAssign nodes synthesized
     // by ClassInitDefaultsVisitor (POD classes' `__defaults` functions, and the `__init` a primary
@@ -11193,6 +11735,13 @@ void compileOrThrow(BytecodeBuilder& bytecode, const ParseResult& parseResult, A
 
         // this pass analyzes table assignments to estimate table shapes for initially empty tables
         predictTableShapes(compiler.tableShapes, root);
+    }
+
+    // Luwu: counts each function's direct calls for inlining (Compiler::isOnlyCallSite)
+    if (options.optimizationLevel >= 2)
+    {
+        Compiler::CallSiteVisitor callSiteVisitor(&compiler);
+        root->visit(&callSiteVisitor);
     }
 
     if (const char* const* ptr = options.userdataTypes)

@@ -163,6 +163,7 @@ IrValueKind getCmdValueKind(IrCmd cmd)
     case IrCmd::LOAD_DOUBLE:
         return IrValueKind::Double;
     case IrCmd::LOAD_INT:
+    case IrCmd::LOAD_STORAGE_INT:
         return IrValueKind::Int;
     case IrCmd::LOAD_FLOAT:
         return IrValueKind::Float;
@@ -176,6 +177,8 @@ IrValueKind getCmdValueKind(IrCmd cmd)
     case IrCmd::LOAD_OWNER_CLASS:
     case IrCmd::TRY_OBJECT_MEMBER_ADDR:
     case IrCmd::OBJECT_MEMBER_ADDR:
+    case IrCmd::LOAD_STORAGE:
+    case IrCmd::GET_STORAGE_ENTRY_ADDR:
     case IrCmd::TRY_CLASS_MEMBER_ADDR:
     case IrCmd::TRY_OBJECT_NAMECALL_ADDR:
         return IrValueKind::Pointer;
@@ -331,6 +334,7 @@ IrValueKind getCmdValueKind(IrCmd cmd)
     case IrCmd::FASTCALL:
         return IrValueKind::None;
     case IrCmd::INVOKE_FASTCALL:
+    case IrCmd::INVOKE_FAST_METHOD:
         return IrValueKind::Int;
     case IrCmd::CHECK_FASTCALL_RES:
     case IrCmd::DO_ARITH:
@@ -353,6 +357,9 @@ IrValueKind getCmdValueKind(IrCmd cmd)
     case IrCmd::CHECK_NODE_NO_NEXT:
     case IrCmd::CHECK_NODE_VALUE:
     case IrCmd::CHECK_OBJECT_CLASS:
+    case IrCmd::CHECK_STORAGE:
+    case IrCmd::CHECK_STORAGE_ELEMENT:
+    case IrCmd::STORE_STORAGE_INT:
     case IrCmd::CHECK_CLASS_FIELDS_CONSTRUCTIBLE:
     case IrCmd::CHECK_CLASS_ALLOCATABLE:
     case IrCmd::CHECK_BUFFER_LEN:
@@ -1891,6 +1898,12 @@ void propagateTagsFromPredecessors(
     if (blockIdx >= function.cfg.predecessorsOffsets.size())
         return;
 
+    // Luwu: this and the Dead predecessor skips below come with upstream 0.734's LuauCodegenPropagateFallbackTags. With
+    // fallback blocks propagated, a jump back to the entry block brings tags the function start doesn't have.
+    // Entry block has an implicit edge as the function start and it has no tag info at that moment
+    if (function.entryBlock == blockIdx)
+        return;
+
     BlockIteratorWrapper preds = predecessors(function.cfg, blockIdx);
 
     if (preds.empty())
@@ -1902,6 +1915,9 @@ void propagateTagsFromPredecessors(
 
     for (uint32_t predIdx : preds)
     {
+        if (function.blocks[predIdx].kind == IrBlockKind::Dead)
+            continue;
+
         if (predIdx >= numBlockExitTags)
             return;
 
@@ -1914,6 +1930,9 @@ void propagateTagsFromPredecessors(
 
     for (uint32_t predIdx : preds)
     {
+        if (function.blocks[predIdx].kind == IrBlockKind::Dead)
+            continue;
+
         const std::vector<uint8_t>& predTags = function.blockExitTags[predIdx];
 
         CODEGEN_ASSERT(minRegsKnown <= predTags.size());

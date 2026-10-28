@@ -1298,7 +1298,8 @@ struct ConstPropState
         else
         {
             // GET_CLOSURE_UPVAL_ADDR writes aren't cached anywhere else in this pass, nothing to invalidate
-            CODEGEN_ASSERT(targetAddr.cmd == IrCmd::GET_CLOSURE_UPVAL_ADDR);
+            // Luwu collections: neither are GET_STORAGE_ENTRY_ADDR writes
+            CODEGEN_ASSERT(targetAddr.cmd == IrCmd::GET_CLOSURE_UPVAL_ADDR || targetAddr.cmd == IrCmd::GET_STORAGE_ENTRY_ADDR);
         }
     }
 
@@ -1323,7 +1324,11 @@ struct ConstPropState
         }
         else
         {
-            CODEGEN_ASSERT(targetAddr.cmd == IrCmd::TABLE_SETNUM || targetAddr.cmd == IrCmd::GET_CLOSURE_UPVAL_ADDR);
+            // Luwu collections: loads from a GET_STORAGE_ENTRY_ADDR aren't cached, so nothing reads a forwarded store
+            CODEGEN_ASSERT(
+                targetAddr.cmd == IrCmd::TABLE_SETNUM || targetAddr.cmd == IrCmd::GET_CLOSURE_UPVAL_ADDR ||
+                targetAddr.cmd == IrCmd::GET_STORAGE_ENTRY_ADDR
+            );
         }
     }
 
@@ -2668,6 +2673,11 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
     case IrCmd::INVOKE_FASTCALL:
         handleBuiltinEffects(state, LuauBuiltinFunction(function.uintOp(OP_A(inst))), vmRegOp(OP_B(inst)), function.intOp(OP_G(inst)));
         break;
+    case IrCmd::INVOKE_FAST_METHOD:
+        // Luwu collections: a fast method writes its container's tables and its results, and never calls Lua
+        state.invalidateHeap();
+        state.invalidateRegistersFrom(vmRegOp(OP_C(inst)));
+        break;
 
         // These instructions don't have an effect on register/memory state we are tracking
     case IrCmd::NOP:
@@ -2782,6 +2792,12 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
     }
     case IrCmd::GET_HASH_NODE_ADDR:
     case IrCmd::GET_CLOSURE_UPVAL_ADDR:
+        break;
+    case IrCmd::LOAD_STORAGE:
+    case IrCmd::LOAD_STORAGE_INT:
+    case IrCmd::STORE_STORAGE_INT:
+    case IrCmd::GET_STORAGE_ENTRY_ADDR:
+        // Luwu collections: a storage block changes under calls and its own stores, so nothing is cached
         break;
     case IrCmd::LOAD_OWNER_CLASS:
         // Proto::ownerclass is fixed for the executing closure; there is nothing to propagate
@@ -3483,6 +3499,9 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
     case IrCmd::CHECK_OBJECT_CLASS:
         // TODO(rfcs/classes): no redundant-check elimination yet, unlike CHECK_SLOT_MATCH above
         break;
+    case IrCmd::CHECK_STORAGE:
+    case IrCmd::CHECK_STORAGE_ELEMENT:
+        break;
 
     case IrCmd::ADD_VEC:
     case IrCmd::SUB_VEC:
@@ -3751,6 +3770,49 @@ static void saveBlockExitState(IrFunction& function, const IrBlock& block, Const
     function.blockExitTags[blockIdx] = std::move(tags);
 }
 
+// Luwu: ported from upstream 0.734's LuauCodegenPropagateFallbackTags, without the flag. Tags known where each jump into
+// a fallback block is taken are intersected, so constant propagation can run inside fallbacks and the blocks they rejoin.
+static void snapshotFallbackEntryTags(IrFunction& function, IrInst& inst, ConstPropState& state)
+{
+    visitArguments(
+        inst,
+        [&](IrOp op)
+        {
+            if (op.kind != IrOpKind::Block)
+                return;
+
+            const IrBlock& block = function.blockOp(op);
+
+            if (block.kind != IrBlockKind::Fallback)
+                return;
+
+            uint32_t blockIdx = function.getBlockIndex(block);
+            std::vector<uint8_t>& tags = function.fallbackEntryTags[blockIdx];
+
+            if (tags.empty())
+            {
+                tags.reserve(state.maxReg + 1);
+
+                for (int i = 0; i <= state.maxReg; i++)
+                    tags.emplace_back(state.regs[i].tag);
+            }
+            else
+            {
+                // Disagreeing tags result make them unknown
+                for (int i = 0; i <= state.maxReg && i < int(tags.size()); i++)
+                {
+                    if (tags[i] != state.regs[i].tag)
+                        tags[i] = kUnknownTag;
+                }
+
+                // Tags we don't know about are unknown
+                for (int i = state.maxReg + 1; i < int(tags.size()); i++)
+                    tags[i] = kUnknownTag;
+            }
+        }
+    );
+}
+
 static void constPropInBlock(IrBuilder& build, IrBlock& block, ConstPropState& state)
 {
     IrFunction& function = build.function;
@@ -3767,6 +3829,9 @@ static void constPropInBlock(IrBuilder& build, IrBlock& block, ConstPropState& s
         applySubstitutions(function, inst);
 
         foldConstants(build, function, block, index);
+
+        if (!isPseudo(inst.cmd))
+            snapshotFallbackEntryTags(function, inst, state);
 
         constPropInInst(state, build, function, block, inst, index);
 
@@ -4021,6 +4086,46 @@ static void tryCreateLinearBlock(IrBuilder& build, std::vector<uint8_t>& visited
     constPropInBlock(build, linearBlock, state);
 }
 
+// Luwu: ported from upstream 0.734's LuauCodegenPropagateFallbackTags (see snapshotFallbackEntryTags)
+static void constPropInFallback(IrBuilder& build, std::vector<uint8_t>& visited, IrBlock& block, ConstPropState& state)
+{
+    IrFunction& function = build.function;
+    const uint32_t blockIdx = function.getBlockIndex(block);
+
+    if (blockIdx >= function.cfg.predecessorsOffsets.size())
+        return;
+
+    // All predecessors must be visited for fallbackEntryTags info to be correct
+    for (uint32_t predIdx : predecessors(function.cfg, blockIdx))
+    {
+        if (visited[predIdx] == 0)
+            return;
+    }
+
+    CODEGEN_ASSERT(!visited[blockIdx]);
+    visited[blockIdx] = 1;
+
+    state.clear();
+
+    const std::vector<uint8_t>& tags = function.fallbackEntryTags[blockIdx];
+    const RegisterSet& in = function.cfg.in[blockIdx];
+
+    // Setup entry state for the fallback block
+    for (size_t i = 0; i < tags.size(); i++)
+    {
+        if (tags[i] != kUnknownTag)
+        {
+            // Only live in registers can have entry tags recorded
+            if (in.regs.test(i) || (in.varargSeq && i >= in.varargStart))
+                state.updateTag(build.vmReg(uint8_t(i)), tags[i]);
+        }
+    }
+
+    constPropInBlock(build, block, state);
+
+    saveBlockExitState(function, block, state);
+}
+
 void constPropInBlockChains(IrBuilder& build)
 {
     IrFunction& function = build.function;
@@ -4030,16 +4135,20 @@ void constPropInBlockChains(IrBuilder& build)
     std::vector<uint8_t> visited(function.blocks.size(), false);
 
     function.blockExitTags.resize(function.blocks.size());
+    function.fallbackEntryTags.resize(function.blocks.size());
 
     for (IrBlock& block : function.blocks)
     {
-        if (block.kind == IrBlockKind::Fallback || block.kind == IrBlockKind::Dead)
+        if (block.kind == IrBlockKind::Dead)
             continue;
 
         if (visited[function.getBlockIndex(block)])
             continue;
 
-        constPropInBlockChain(build, visited, &block, state);
+        if (block.kind == IrBlockKind::Fallback)
+            constPropInFallback(build, visited, block, state);
+        else
+            constPropInBlockChain(build, visited, &block, state);
     }
 }
 

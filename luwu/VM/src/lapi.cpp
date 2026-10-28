@@ -838,6 +838,14 @@ void* lua_pushcclosurewithdatak(lua_State* L, lua_CFunction fn, const char* debu
     return (void*)cl->fatc.data;
 }
 
+void* lua_pushdatacfunctionk(lua_State* L, lua_DataCFunction fn, const char* debugname, lua_Continuation cont, size_t size, lua_ClosureWithDataFree dtor)
+{
+    api_check(L, fn != nullptr);
+    void* data = lua_pushcclosurewithdatak(L, luaF_calldatacfunction, debugname, cont, size, dtor);
+    clvalue(L->top - 1)->fatc.df = fn;
+    return data;
+}
+
 void* lua_getcclosuredata(lua_State* L)
 {
     LUAU_ASSERT(FFlag::LuwuFatCClosure);
@@ -1309,6 +1317,13 @@ int lua_cpcall(lua_State* L, lua_CFunction func, void* ud)
     c.ud = ud;
 
     return luaD_pcall(L, f_Ccall, &c, savestack(L, L->top), 0);
+}
+
+int lua_rawpcall(lua_State* L, int nargs, void (*func)(lua_State* L, void* ud), void* ud)
+{
+    api_check(L, func != nullptr);
+    api_checknelems(L, nargs);
+    return luaD_pcall(L, func, ud, savestack(L, L->top - nargs), 0);
 }
 
 int lua_status(lua_State* L)
@@ -1822,6 +1837,64 @@ const char* lua_getclassname(lua_State* L, int idx)
 {
     LuauClass* classdef = classofvalue(index2addr(L, idx));
     return classdef ? getstr(classdef->name) : NULL;
+}
+
+// Whether the class has members that are functions, other than the constructor and the defaults a POD class computes
+static bool classhasmethods(const LuauClass* classdef)
+{
+    if (classdef->instancemetatable)
+        return true;
+
+    for (uint32_t offset = classdef->numberofinstancemembers; offset < classdef->numberofallmembers; offset++)
+    {
+        bool constructor = offset == classdef->initoffset;
+        bool defaults = classdef->haspoddefaultsfn && offset == classdef->poddefaultsoffset;
+        if (!constructor && !defaults && ttisfunction(&classdef->staticmembers[offset - classdef->numberofinstancemembers]))
+            return true;
+    }
+
+    return false;
+}
+
+// The number of parameters a primary constructor takes, not counting `self`
+static int primaryparameters(const LuauClass* classdef)
+{
+    const TValue* init = &classdef->staticmembers[classdef->initoffset - classdef->numberofinstancemembers];
+    if (!ttisfunction(init) || clvalue(init)->isC)
+        return -1;
+
+    return clvalue(init)->l.p->numparams - 1;
+}
+
+int lua_getclassdatashape(lua_State* L, int idx, int* hasmethods)
+{
+    const LuauClass* classdef = classofvalue(index2addr(L, idx));
+    api_check(L, classdef);
+
+    *hasmethods = classhasmethods(classdef);
+
+    int shape = LUA_CLASSDATA_TABLE;
+    if (classdef->hasprimaryinit)
+    {
+        bool coversfields = primaryparameters(classdef) == int(classdef->numberofinstancemembers);
+        shape = coversfields ? LUA_CLASSDATA_POSITIONAL : LUA_CLASSDATA_NONE;
+    }
+    else if (classdef->hascustominit)
+        shape = LUA_CLASSDATA_NONE;
+
+    if (shape == LUA_CLASSDATA_NONE)
+        return shape;
+
+    lua_createtable(L, int(classdef->numberofinstancemembers), 0);
+    for (uint32_t offset = 0; offset < classdef->numberofinstancemembers; offset++)
+    {
+        ensure_stack(L, 1);
+        setsvalue(L, L->top, classdef->offsettomember[offset]);
+        api_incr_top(L);
+        lua_rawseti(L, -2, int(offset + 1));
+    }
+
+    return shape;
 }
 
 static const char* aux_upvalue(StkId fi, int n, TValue** val)

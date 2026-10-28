@@ -347,6 +347,9 @@ private:
 
     // Luwu Traits (rfcs/classes/traits.md): whether `trait` declarations parse.
     bool traitsEnabled() const;
+    void declareClassValue(AstStatClass* shape, AstName valueType, const Location& declareLocation);
+    bool startsClassType();
+    AstStat* parseClassType(const Location& start, const Location& classKeywordLocation, bool exported, bool isTrait = false);
     bool legacyDeclareClass();
     void skipClassOnlyExternTypeKeywords();
     AstType* untypedDeclarationType(const Location& location);
@@ -551,6 +554,8 @@ private:
     bool matchExpressionsAvailable();
     bool typeTestFollows();
     AstExpr* parseTypeTest(AstExpr* value, const Location& start);
+    AstExpr* parseTypeTestAlternative(AstExpr* value, const Location& start, bool negated);
+    bool literalPatternFollows();
     std::optional<AstExpr*> parseNothingValue();
     AstExpr* parseTypeTestBindings(AstExpr* value, AstExpr* type, bool negated, const Location& start);
     struct TypeTestBindings;
@@ -907,6 +912,7 @@ private:
     AstName nameDestructured;
     AstName nameNil;
     AstName nameContinue;
+    AstName nameTrait;
 
     MatchLexeme endMismatchSuspect;
 
@@ -971,10 +977,6 @@ private:
 
     CstNodeMap cstNodeMap;
 
-    // Luwu Destructuring (rfcs/destructuring.md): a destructuring declaration desugars to several
-    // statements. parseStat returns the first, and parseBlockNoScope appends these right after it.
-    std::vector<AstStat*> pendingStatements;
-
     // Luwu Declare Statements (rfcs/declare-statements.md): whether the block being parsed may contain `declare`
     // (the top level, or a `do` block there), and what the next block parseBlockNoScope starts should allow.
     // fileDeclarations holds each global this file declares, so a second declaration of it is an error.
@@ -1006,6 +1008,12 @@ private:
         TempVector<CstAttrList*>* cstAttrLists;
     };
     std::optional<PendingFunctionAttributes> pendingFunctionAttributes;
+
+    // Luwu Declare Statements (rfcs/declare-statements.md) and Luwu Destructuring (rfcs/destructuring.md): a
+    // declaration can desugar to several statements, as `declare class Name` does to the class and the global holding it,
+    // and a destructuring to one `local` per name. parseStat returns the first, and parseBlockNoScope appends these right
+    // after it.
+    std::vector<AstStat*> pendingStatements;
 };
 
 } // namespace Luau

@@ -27,8 +27,6 @@ LUAU_FASTFLAGVARIABLE(LuauCIProto)
 LUAU_FASTFLAGVARIABLE(LuauCallFeedback)
 LUAU_FASTFLAGVARIABLE(LuauYieldIter2)
 LUAU_FASTFLAGVARIABLE(LuauPromoteProto)
-LUAU_FASTFLAGVARIABLE(LuauBackedgeHeapCheck)
-LUAU_FLAGVERSION(LuauBackedgeHeapCheck, 2)
 
 // Disable c99-designator to avoid the warning in computed goto dispatch table
 #ifdef __clang__
@@ -816,7 +814,7 @@ reentry:
                                 if (inst->lclass->hasconstmembers)
                                     luaR_checkconstassignfast(L, kv, inst, cl, slot);
                             }
-                            setobj2class(L, &inst->members[slot], ra);
+                            setobj2class(L, &luaR_members(inst)[slot], ra);
                             luaC_barrier(L, inst, ra);
                             VM_NEXT();
                         }
@@ -836,7 +834,7 @@ reentry:
                                 if (inst->lclass->hasconstmembers)
                                     luaR_checkconstassignfast(L, kv, inst, cl, offsetnum);
                             }
-                            setobj2class(L, &inst->members[offsetnum], ra);
+                            setobj2class(L, &luaR_members(inst)[offsetnum], ra);
                             luaC_barrier(L, inst, ra);
                             VM_PATCH_MEMBER_SLOT(pc - 2, offsetnum);
                             VM_NEXT();
@@ -1073,6 +1071,26 @@ reentry:
                     {
                         if (LUAU_UNLIKELY(inst->lclass->hasprivatemembers))
                             luaR_checkprivateaccessfast(L, kv, inst->lclass, cl, slot);
+
+                        // Luwu collections: a builtin class's fast method runs here instead of the call that follows
+                        if (LUAU_UNLIKELY(inst->lclass->fastmethods != NULL) && inst->lclass->fastmethods[slot])
+                        {
+                            Instruction call = *pc;
+                            LUAU_ASSERT(LUAU_INSN_OP(call) == LOP_CALL || LUAU_INSN_OP(call) == LOP_CALLFB);
+                            // B counts `self` and is 0 when the arguments end in a multret call
+                            int nargs = LUAU_INSN_B(call) - 2;
+                            int nresults = LUAU_INSN_C(call) - 1;
+                            int n = nargs >= 0 ? inst->lclass->fastmethods[slot](L, inst, ra, ra + 2, nargs) : -1;
+                            if (n >= 0)
+                            {
+                                for (int i = n; i < nresults; i++)
+                                    setnilvalue(ra + i);
+                                L->top = (nresults == LUA_MULTRET) ? ra + n : L->ci->top;
+                                pc += (LUAU_INSN_OP(call) == LOP_CALLFB) ? 2 : 1;
+                                VM_NEXT();
+                            }
+                        }
+
                         // note: order of copies allows rb to alias ra+1 or ra
                         setobj2s(L, ra + 1, rb);
                         setobj2s(L, ra, luaR_lookupmemberatoffset(inst, slot));
@@ -1221,8 +1239,7 @@ reentry:
                 }
                 else
                 {
-                    lua_CFunction func = ccl->c.f;
-                    int n = func(L);
+                    int n = luaD_callcfunction(L, ccl);
 
                     // yield
                     if (n < 0)
@@ -1334,8 +1351,7 @@ reentry:
                     if (feedback_slot != LUAU_INSN_FBSLOT_SEALED)
                         VM_PATCH_AUX(pc - 1, LUAU_INSN_FBSLOT_SEALED);
 
-                    lua_CFunction func = ccl->c.f;
-                    int n = func(L);
+                    int n = luaD_callcfunction(L, ccl);
 
                     // yield
                     if (n < 0)
@@ -2551,6 +2567,12 @@ reentry:
                     setnvalue(ra, cast_num(ts->len));
                     VM_NEXT();
                 }
+                // Luwu collections: builtin containers know their length without `__len`
+                else if (ttisobject(rb) && luaR_objectlength(objectvalue(rb)) >= 0)
+                {
+                    setnvalue(ra, luaR_objectlength(objectvalue(rb)));
+                    VM_NEXT();
+                }
                 else
                 {
                     // slow-path, may invoke C/Lua via metamethods
@@ -2568,7 +2590,10 @@ reentry:
 
                 VM_PROTECT_PC(); // luaH_new may fail due to OOM
 
-                sethvalue(L, ra, luaH_new(L, aux, b == 0 ? 0 : (1 << (b - 1))));
+                // Luwu table presizing: the table starts as long as the last one made here got
+                Proto* p = FFlag::LuauCIProto ? L->ci->p : cl->l.p;
+                uint32_t site = uint32_t(pc - 2 - p->code);
+                sethvalue(L, ra, luaH_newatsite(L, p, site, aux, b == 0 ? 0 : (1 << (b - 1))));
                 VM_PROTECT(luaC_checkGC(L));
                 VM_NEXT();
             }
@@ -2650,8 +2675,7 @@ reentry:
             VM_CASE(LOP_FORNLOOP)
             {
                 VM_INTERRUPT();
-                if (FFlag::LuauBackedgeHeapCheck)
-                    VM_CHECK_GC(L);
+                VM_CHECK_GC(L);
                 VM_CASE_INSTRUCTION insn = *pc++;
                 VM_CASE_STKID ra = VM_REG(LUAU_INSN_A(insn));
                 LUAU_ASSERT(ttisnumber(ra + 0) && ttisnumber(ra + 1) && ttisnumber(ra + 2));
@@ -2689,26 +2713,24 @@ reentry:
                     {
                         LuaTable* mt = ttistable(ra) ? hvalue(ra)->metatable : ttisuserdata(ra) ? uvalue(ra)->metatable : cast_to(LuaTable*, NULL);
                         const TValue* fn = fasttm(L, mt, TM_ITER);
-                        // Luwu collections: a vec or vecdeque runs on the table iteration below over its storage
-                        LuaTable* items = NULL;
+                        // Luwu collections: a builtin container's loop needs no `__iter` (luaR_collectionprep)
+                        bool collection = false;
 
                         if (LUAU_UNLIKELY(fn == NULL && ttisobject(ra)))
                         {
-                            items = luaR_collectionitems(L, objectvalue(ra));
-                            fn = items ? NULL : luaT_gettmbyobj(L, ra, TM_ITER);
+                            collection = luaR_collectionprep(L, ra);
+                            fn = collection ? NULL : luaT_gettmbyobj(L, ra, TM_ITER);
                             // if the metamethod is not present, error.
-                            if (!items && ttisnil(fn))
+                            if (!collection && ttisnil(fn))
                             {
                                 VM_PROTECT_PC();
                                 luaG_typeerror(L, ra, "iterate over");
                             }
                         }
 
-                        if (items)
+                        if (collection)
                         {
-                            sethvalue(L, ra + 1, items);
-                            setpvalue(ra + 2, reinterpret_cast<void*>(uintptr_t(0)), LU_TAG_ITERATOR);
-                            setnilvalue(ra);
+                            // luaR_collectionprep set up the registers
                         }
                         else if (fn)
                         {
@@ -2725,7 +2747,9 @@ reentry:
                             ra = VM_REG(LUAU_INSN_A(insn));
 
                             // protect against __iter returning nil, since nil is used as a marker for builtin iteration in FORGLOOP
-                            if (ttisnil(ra))
+                            // Luwu collections: booleans too, which mark a builtin container's loop (luaR_collectionprep). It
+                            // raises the same error before the first step that calling it in FORGLOOP would.
+                            if (ttisnil(ra) || ttisboolean(ra))
                             {
                                 VM_PROTECT_PC(); // next call always errors
                                 luaG_typeerror(L, ra, "call");
@@ -2776,7 +2800,8 @@ reentry:
                             ra = VM_REG(LUAU_INSN_A(insn));
 
                             // protect against __iter returning nil, since nil is used as a marker for builtin iteration in FORGLOOP
-                            if (ttisnil(ra))
+                            // Luwu collections: booleans too (see above)
+                            if (ttisnil(ra) || ttisboolean(ra))
                             {
                                 VM_PROTECT_PC(); // next call always errors
                                 luaG_typeerror(L, ra, "call");
@@ -2810,8 +2835,7 @@ reentry:
             VM_CASE(LOP_FORGLOOP)
             {
                 VM_INTERRUPT();
-                if (FFlag::LuauBackedgeHeapCheck)
-                    VM_CHECK_GC(L);
+                VM_CHECK_GC(L);
                 VM_CASE_INSTRUCTION insn = *pc++;
                 VM_CASE_STKID ra = VM_REG(LUAU_INSN_A(insn));
                 uint32_t aux = *pc;
@@ -2881,6 +2905,30 @@ reentry:
 
                     // fallthrough to exit
                     pc++;
+                    VM_NEXT();
+                }
+                // Luwu collections: a builtin container's loop (luaR_collectionprep), stepped without a call. A `vec` or
+                // `vecdeque` (true) steps inline and can't raise.
+                else if (LUAU_UNLIKELY(ttisboolean(ra)))
+                {
+                    bool more;
+                    if (bvalue(ra))
+                        more = luaR_storagenext(L, objectvalue(ra + 1), ra);
+                    else
+                        VM_PROTECT(more = luaR_collectionnext(L, ra));
+
+                    if (!more)
+                    {
+                        pc++;
+                        VM_NEXT();
+                    }
+
+                    ra = VM_REG(LUAU_INSN_A(insn));
+                    for (int i = 2; i < int(aux); ++i)
+                        setnilvalue(ra + 3 + i);
+
+                    pc += LUAU_INSN_D(insn);
+                    VM_ASSERT_PC(pc);
                     VM_NEXT();
                 }
                 else
@@ -3106,8 +3154,7 @@ reentry:
             VM_CASE(LOP_JUMPBACK)
             {
                 VM_INTERRUPT();
-                if (FFlag::LuauBackedgeHeapCheck)
-                    VM_CHECK_GC(L);
+                VM_CHECK_GC(L);
                 VM_CASE_INSTRUCTION insn = *pc++;
 
                 pc += LUAU_INSN_D(insn);
@@ -3129,8 +3176,7 @@ reentry:
             VM_CASE(LOP_JUMPX)
             {
                 VM_INTERRUPT();
-                if (FFlag::LuauBackedgeHeapCheck)
-                    VM_CHECK_GC(L);
+                VM_CHECK_GC(L);
                 VM_CASE_INSTRUCTION insn = *pc++;
 
                 pc += LUAU_INSN_E(insn);
@@ -3944,7 +3990,7 @@ reentry:
                     LuauObject* object = luaR_newobjectuninit(L, classdef);
 
                     for (uint32_t idx = 0; idx < aux; idx++)
-                        setobj(L, &object->members[idx], ra + 1 + idx);
+                        setobj(L, &luaR_members(object)[idx], ra + 1 + idx);
 
                     setobjectvalue(L, ra, object);
 
@@ -3977,7 +4023,7 @@ reentry:
                         StkId value = ra + 1 + idx;
 
                         if (!ttisnil(value))
-                            setobj(L, &object->members[idx], value);
+                            setobj(L, &luaR_members(object)[idx], value);
                     }
                 }
                 else if (aux == 1)
@@ -4024,7 +4070,7 @@ reentry:
 
                 LUAU_ASSERT(ttisobject(rb) && aux < objectvalue(rb)->numberofmembers);
 
-                setobj2s(L, ra, &objectvalue(rb)->members[aux]);
+                setobj2s(L, ra, &luaR_members(objectvalue(rb))[aux]);
                 VM_NEXT();
             }
 
@@ -4040,7 +4086,7 @@ reentry:
                 LUAU_ASSERT(ttisobject(rb) && aux < objectvalue(rb)->numberofmembers);
 
                 LuauObject* inst = objectvalue(rb);
-                setobj2class(L, &inst->members[aux], ra);
+                setobj2class(L, &luaR_members(inst)[aux], ra);
                 luaC_barrier(L, inst, ra);
                 VM_NEXT();
             }
@@ -4310,8 +4356,7 @@ int luau_precall(lua_State* L, StkId func, int nresults)
     }
     else
     {
-        lua_CFunction func = ccl->c.f;
-        int n = func(L);
+        int n = luaD_callcfunction(L, ccl);
 
         // yield
         if (n < 0)

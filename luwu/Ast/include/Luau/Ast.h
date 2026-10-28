@@ -562,6 +562,8 @@ public:
     void visit(AstVisitor* visitor) override;
 };
 
+struct AstDestructurePattern;
+
 class AstExprCall : public AstExpr
 {
 public:
@@ -589,6 +591,9 @@ public:
     // Luwu match expressions: a call the parser wrote for a type test (`x is Point` is `class.isinstance(x, Point)`),
     // not one in the code. Editor features that show a call's parameters skip it.
     bool fromTypeTest = false;
+    // Luwu match expressions: the `.{...}` after the type test (`x is Point.{x, y}`), kept even with no fields yet so
+    // autocomplete can offer the class's fields there
+    const AstDestructurePattern* typeTestPattern = nullptr;
 };
 
 class AstExprIndexName : public AstExpr
@@ -1686,8 +1691,10 @@ public:
     AstArray<AstClassTraitRef> needs{nullptr, 0};
 };
 
-// Luwu Declare Statements (rfcs/declare-statements.md): `declare [export] class`, a class that exists at runtime but
-// whose implementation the type checker doesn't see (an embedder's class compiled into its binary, say). Its shape is
+// Luwu Declare Statements (rfcs/declare-statements.md): `[export] declare class`, a class that exists at runtime but
+// whose implementation the type checker doesn't see (an embedder's class compiled into its binary, say), and
+// `[export] class type`, the type alone. `declare class Name` is followed by the global holding it,
+// `declare Name: class<Name>`. Its shape is
 // parsed with the class grammar, minus implementations: methods are signatures and `name = T` is a field or primary
 // constructor parameter of type T that has a default. The shape is never a statement of its own, and this node's
 // visit only walks its type annotations, so nothing treats a declared class as a class it can compile or run.
@@ -1696,14 +1703,14 @@ class AstStatDeclareClass : public AstStat
 public:
     LUAU_RTTI(AstStatDeclareClass)
 
-    AstStatDeclareClass(const Location& location, AstStatClass* shape, const Location& declareLocation);
+    AstStatDeclareClass(const Location& location, AstStatClass* shape, std::optional<Location> declareLocation);
 
     void visit(AstVisitor* visitor) override;
 
     AstStatClass* shape;
 
-    // Location of the leading 'declare' keyword token only.
-    Location declareLocation;
+    // Location of the leading 'declare' keyword token only. Unset for `class type Name`, which declares no value.
+    std::optional<Location> declareLocation;
 };
 
 struct AstTableIndexer
