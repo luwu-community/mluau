@@ -78,6 +78,15 @@ macro_rules! mlua_expect {
     };
 }
 
+// Like `protect_lua!`, but runs the closure on the caller's stack with no Lua call frame and no error handler
+// (`protect_lua_raw_closure`). Only for raw API calls that can't run Lua code: allocations, raw gets and sets. The closure
+// must index from the top, since positive indices count from the caller's frame.
+macro_rules! protect_lua_raw {
+    ($state:expr, $nargs:expr, $nresults:expr, $f:expr) => {
+        crate::util::protect_lua_raw_closure($state, $nargs, $nresults, $f)
+    };
+}
+
 macro_rules! protect_lua {
     ($state:expr, $nargs:expr, $nresults:expr, $f:expr) => {
         crate::util::protect_lua_closure($state, $nargs, $nresults, $f)

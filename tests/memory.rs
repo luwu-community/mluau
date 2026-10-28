@@ -109,3 +109,20 @@ fn test_bump_allocator() {
     let x: i32 = lua.globals().get("x").unwrap();
     assert_eq!(x, 3);
 }
+
+// Luwu's frameless protected calls (`protect_lua_raw!`) catch an out of memory error raised while a Rust function fills
+// a table, and the state stays usable
+#[test]
+fn test_memory_limit_in_raw_protected_calls() -> Result<()> {
+    let lua = Lua::new();
+    let build = lua.create_function(|lua, n: usize| lua.create_sequence_from((0..n).map(|i| format!("item {i}"))))?;
+
+    // note: the error's message is lost on the way out (`runtime error: <nil>`), with protect_lua! as well
+    lua.set_memory_limit(lua.used_memory() + 100_000)?;
+    build.call::<mluau::Table>(1_000_000).expect_err("filling past the limit should fail");
+    lua.set_memory_limit(0)?;
+
+    let table: mluau::Table = build.call(10)?;
+    assert_eq!(table.raw_len(), 10);
+    Ok(())
+}

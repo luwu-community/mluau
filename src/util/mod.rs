@@ -6,11 +6,11 @@ use std::{slice, str};
 use crate::error::{Error, Result};
 pub(crate) use error::{
     error_traceback, func_call_error_traceback, 
-    func_call_error, protect_lua_closure, call_trampoline, pop_error,
+    func_call_error, protect_lua_closure, protect_lua_raw_closure, call_trampoline, pop_error,
     get_error
 };
 pub(crate) use short_names::short_type_name;
-pub(crate) use userdata::{push_fat_cclosure};
+pub(crate) use userdata::{push_fat_cclosure, push_fat_data_cfunction};
 
 // Checks that Lua has enough free stack space for future stack operations. On failure, this will
 // panic with an internal error message.
@@ -74,7 +74,7 @@ impl Drop for StackGuard {
 // Uses 3 (or 1 if unprotected) stack spaces, does not call checkstack.
 #[inline(always)]
 pub(crate) unsafe fn push_string(state: *mut ffi::lua_State, s: &[u8]) -> Result<()> {
-    protect_lua!(state, 0, 1, |state| {
+    protect_lua_raw!(state, 0, 1, |state| {
         ffi::lua_pushlstring(state, s.as_ptr() as *const c_char, s.len());
     })
 }
@@ -83,7 +83,7 @@ pub(crate) unsafe fn push_string(state: *mut ffi::lua_State, s: &[u8]) -> Result
 
 #[inline(always)]
 pub(crate) unsafe fn push_buffer(state: *mut ffi::lua_State, size: usize) -> Result<*mut u8> {
-    let data = protect_lua!(state, 0, 1, |state| ffi::lua_newbuffer(state, size))?;
+    let data = protect_lua_raw!(state, 0, 1, |state| ffi::lua_newbuffer(state, size))?;
     Ok(data as *mut u8)
 }
 
@@ -96,7 +96,7 @@ pub(crate) unsafe fn push_external_buffer(
     free_cb: Option<ffi::lua_BufferFree>,
     mode: std::os::raw::c_int,
 ) -> Result<*mut u8> {
-    let buf_data = protect_lua!(state, 0, 1, |state| ffi::lua_newexternalbuffer(
+    let buf_data = protect_lua_raw!(state, 0, 1, |state| ffi::lua_newexternalbuffer(
         state,
         size,
         data as *mut std::ffi::c_void,
@@ -115,7 +115,7 @@ pub(crate) unsafe fn push_external_string(
     userdata: *mut std::ffi::c_void,
     free_cb: Option<ffi::lua_StringFree>,
 ) -> Result<()> {
-    protect_lua!(state, 0, 1, |state| ffi::lua_pushexternalstring(
+    protect_lua_raw!(state, 0, 1, |state| ffi::lua_pushexternalstring(
         state, s, len, userdata, free_cb
     ))
 }
@@ -125,7 +125,7 @@ pub(crate) unsafe fn push_external_string(
 pub(crate) unsafe fn push_table(state: *mut ffi::lua_State, narr: usize, nrec: usize) -> Result<()> {
     let narr: c_int = narr.try_into().unwrap_or(c_int::MAX);
     let nrec: c_int = nrec.try_into().unwrap_or(c_int::MAX);
-    protect_lua!(state, 0, 1, |state| ffi::lua_createtable(state, narr, nrec))
+    protect_lua_raw!(state, 0, 1, |state| ffi::lua_createtable(state, narr, nrec))
 }
 
 // Returns Lua main thread for Lua >= 5.2 or checks that the passed thread is main for Lua 5.1.

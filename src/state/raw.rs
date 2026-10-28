@@ -6,7 +6,7 @@ use std::ptr::{self, NonNull};
 use std::string::String as StdString;
 
 use crate::chunk::ChunkMode;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::function::Function;
 use crate::luau::ENABLED_FFLAGS;
 use crate::memory::{MemoryState, ALLOCATOR};
@@ -404,7 +404,7 @@ impl RawLua {
         for (k, v) in iter {
             self.push_at(state, k)?;
             self.push_at(state, v)?;
-            protect_lua!(state, 3, 1, fn(state) ffi::lua_rawset(state, -3))?;
+            protect_lua_raw!(state, 3, 1, |state| ffi::lua_rawset(state, -3))?;
         }
 
         Ok(Table(self.pop_ref()))
@@ -425,10 +425,29 @@ impl RawLua {
         push_table(state, lower_bound, 0)?;
         for (i, v) in iter.enumerate() {
             self.push_at(state, v)?;
-            protect_lua!(state, 2, 1, |state| {
+            protect_lua_raw!(state, 2, 1, |state| {
                 ffi::lua_rawseti(state, -2, (i + 1) as Integer);
             })?;
         }
+
+        Ok(Table(self.pop_ref()))
+    }
+
+    // Creates a sequence of strings in one protected call: no Rust code but `AsRef` runs inside it
+    pub(crate) unsafe fn create_string_sequence<T: AsRef<[u8]>>(&self, items: &[T]) -> Result<Table> {
+        let state = self.state();
+        let _sg = StackGuard::new(state);
+        check_stack(state, 3)?;
+
+        let narr: c_int = items.len().try_into().map_err(|_| Error::MemoryError("too many items".to_string()))?;
+        protect_lua_raw!(state, 0, 1, |state| {
+            ffi::lua_createtable(state, narr, 0);
+            for (i, item) in items.iter().enumerate() {
+                let bytes = item.as_ref();
+                ffi::lua_pushlstring(state, bytes.as_ptr() as *const c_char, bytes.len());
+                ffi::lua_rawseti(state, -2, (i + 1) as Integer);
+            }
+        })?;
 
         Ok(Table(self.pop_ref()))
     }
@@ -443,7 +462,7 @@ impl RawLua {
         let thread_state = {
             check_stack(state, 3)?;
 
-            let thread_state = protect_lua!(state, 0, 1, |state| ffi::lua_newthread(state))?;
+            let thread_state = protect_lua_raw!(state, 0, 1, |state| ffi::lua_newthread(state))?;
 
             thread_state
         };
@@ -667,15 +686,21 @@ impl RawLua {
 
     // Creates a Function out of a Callback containing a 'static Fn.
     pub(crate) fn create_callback(&self, func: Callback, debugname: *const c_char) -> Result<Function> {
-        unsafe extern "C-unwind" fn call_callback(state: *mut ffi::lua_State) -> c_int {
-            let upvalue = ffi::lua_getcclosuredata(state) as *mut Callback;
-            let extra = crate::state::extra::ExtraData::get(state);
+        // The closure's data: the callback, and the state's ExtraData, which outlives every function the state makes
+        struct CallbackData {
+            extra: *mut ExtraData,
+            func: Callback,
+        }
+
+        // A Luwu data function: the VM passes the closure's data and the argument count
+        unsafe extern "C-unwind" fn call_callback(state: *mut ffi::lua_State, data: *mut c_void, nargs: c_int) -> c_int {
+            let data = &*(data as *const CallbackData);
+            let extra = data.extra;
             match catch_unwind(AssertUnwindSafe(|| {
                 // Lua ensures that `LUA_MINSTACK` stack spaces are available (after pushing arguments)
-                let nargs = ffi::lua_gettop(state);
                 let rawlua = (*extra).raw_lua();
                 let _guard = StateGuard::new(rawlua, state);
-                (*upvalue)(rawlua, nargs)
+                (data.func)(rawlua, nargs)
             })) {
                 Ok(ret) => ret.finish(state),
                 Err(panic) => {
@@ -691,13 +716,11 @@ impl RawLua {
             let _sg = StackGuard::new(state);
             check_stack(state, 4)?;
 
-            crate::util::push_fat_cclosure(
-                state,
+            let data = CallbackData {
+                extra: self.extra(),
                 func,
-                call_callback,
-                debugname,
-                None,
-            )?;
+            };
+            crate::util::push_fat_data_cfunction(state, data, call_callback, debugname)?;
 
             Ok(Function(self.pop_ref()))
         }

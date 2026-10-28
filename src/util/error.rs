@@ -137,6 +137,60 @@ where
     }
 }
 
+// Runs `f` on the current stack under Luwu's `lua_rawpcall`, which catches a Lua error without a Lua call frame. `f` gets
+// the `nargs` values on top of the stack, and its top `nresults` values replace them (all of them with LUA_MULTRET), as
+// with `protect_lua_closure`. On an error the arguments are removed and the error is returned. A protected `lua_pcall` (`protect_lua_closure`) costs a closure call; this costs a C++ `try`, which is free
+// unless something throws.
+//
+// `f` must not panic, and must index from the top: positive indices and `lua_gettop` count from the caller's frame. It
+// gets no error handler, so an error raised in it has no traceback. That suits raw API calls, whose only error is out of
+// memory.
+pub(crate) unsafe fn protect_lua_raw_closure<F, R>(
+    state: *mut ffi::lua_State,
+    nargs: c_int,
+    nresults: c_int,
+    f: F,
+) -> Result<R>
+where
+    F: FnOnce(*mut ffi::lua_State) -> R,
+    R: Copy,
+{
+    struct Params<F, R> {
+        function: Option<F>,
+        result: MaybeUninit<R>,
+    }
+
+    unsafe extern "C-unwind" fn run<F, R>(state: *mut ffi::lua_State, data: *mut c_void)
+    where
+        F: FnOnce(*mut ffi::lua_State) -> R,
+        R: Copy,
+    {
+        let params = &mut *(data as *mut Params<F, R>);
+        let f = params.function.take().unwrap();
+        params.result.write(f(state));
+    }
+
+    let stack_start = ffi::lua_gettop(state) - nargs;
+    let mut params = Params {
+        function: Some(f),
+        result: MaybeUninit::uninit(),
+    };
+    let ret = ffi::lua_rawpcall(state, nargs, run::<F, R>, &mut params as *mut _ as *mut c_void);
+    if ret != ffi::LUA_OK {
+        return Err(pop_error(state, ret));
+    }
+
+    // Arguments `f` left below its results go, as they would have with a call. LUA_MULTRET keeps everything.
+    let leftover = ffi::lua_gettop(state) - stack_start - nresults;
+    if nresults != ffi::LUA_MULTRET && leftover > 0 {
+        ffi::lua_rotate(state, stack_start + 1, nresults);
+        ffi::lua_settop(state, stack_start + nresults);
+    }
+
+    // `run` completed, so it wrote the result
+    Ok(params.result.assume_init())
+}
+
 pub(crate) unsafe extern "C-unwind" fn error_traceback(state: *mut ffi::lua_State) -> c_int {
     // Luau calls error handler for memory allocation errors, skip it
     // See https://github.com/luau-lang/luau/issues/880

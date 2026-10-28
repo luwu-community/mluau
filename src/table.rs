@@ -251,7 +251,7 @@ impl Table {
             key.push_into_specified_stack(&lua, state)?;
             value.push_into_specified_stack(&lua, state)?;
 
-            protect_lua!(state, 3, 0, fn(state) ffi::lua_rawset(state, -3))
+            protect_lua_raw!(state, 3, 0, |state| ffi::lua_rawset(state, -3))
         }
     }
 
@@ -289,7 +289,7 @@ impl Table {
 
             lua.push_ref_at(&self.0, state);
             value.push_into_specified_stack(&lua, state)?;
-            protect_lua!(state, 2, 0, |state| {
+            protect_lua_raw!(state, 2, 0, |state| {
                 for i in (idx..=size).rev() {
                     // table[i+1] = table[i]
                     ffi::lua_rawgeti(state, -2, i);
@@ -366,7 +366,7 @@ impl Table {
                     check_stack(state, 4)?;
 
                     lua.push_ref_at(&self.0, state);
-                    protect_lua!(state, 1, 0, |state| {
+                    protect_lua_raw!(state, 1, 0, |state| {
                         for i in idx..size {
                             ffi::lua_rawgeti(state, -1, i + 1);
                             ffi::lua_rawseti(state, -2, i);
@@ -725,7 +725,7 @@ impl Table {
             value.push_into_specified_stack(&lua, state)?;
 
             let idx = idx.try_into().unwrap();
-            protect_lua!(state, 2, 0, |state| ffi::lua_rawseti(state, -2, idx))?;
+            protect_lua_raw!(state, 2, 0, |state| ffi::lua_rawseti(state, -2, idx))?;
         }
         Ok(())
     }

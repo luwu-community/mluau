@@ -823,12 +823,12 @@ impl FromLua for char {
 }
 
 #[inline]
-unsafe fn push_bytes_into_stack<T>(this: T, lua: &RawLua, state: *mut ffi::lua_State) -> Result<()>
+// Pushes the bytes as a string straight onto the stack, without making a `String` (a ref) first
+unsafe fn push_bytes_into_stack<T>(this: T, _lua: &RawLua, state: *mut ffi::lua_State) -> Result<()>
 where
     T: IntoLua + AsRef<[u8]>,
 {
-    lua.push_value_at(&T::into_lua(this, lua.lua())?, state);
-    Ok(())
+    crate::util::push_string(state, this.as_ref())
 }
 
 macro_rules! lua_convert_int {
@@ -930,6 +930,12 @@ macro_rules! lua_convert_float {
             #[inline]
             fn into_lua(self, _: &Lua) -> Result<Value> {
                 Ok(Value::Number(self as _))
+            }
+
+            #[inline]
+            unsafe fn push_into_specified_stack(self, _lua: &RawLua, state: *mut ffi::lua_State) -> Result<()> {
+                ffi::lua_pushnumber(state, self as ffi::lua_Number);
+                Ok(())
             }
         }
 

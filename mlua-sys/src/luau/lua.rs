@@ -107,6 +107,12 @@ pub type lua_Destructor = unsafe extern "C" fn(L: *mut lua_State, *mut c_void);
 
 pub type lua_ClosureWithDataFree = unsafe extern "C" fn(L: *mut lua_State, data: *mut c_void, sz: usize);
 
+/// Luwu: a C function that gets its closure's data and its argument count passed in (`lua_pushdatacfunctionk`).
+pub type lua_DataCFunction = unsafe extern "C-unwind" fn(L: *mut lua_State, data: *mut c_void, nargs: c_int) -> c_int;
+
+/// Luwu: the callback `lua_rawpcall` runs.
+pub type lua_RawPcallFunction = unsafe extern "C-unwind" fn(L: *mut lua_State, ud: *mut c_void);
+
 /// Type for externally managed buffer destructor functions (no unwinding).
 pub type lua_BufferFree =
     unsafe extern "C" fn(L: *mut lua_State, data: *mut c_void, sz: usize, userdata: *mut c_void);
@@ -233,6 +239,14 @@ unsafe extern "C-unwind" {
         dtor: Option<lua_ClosureWithDataFree>,
     ) -> *mut c_void;
     pub fn lua_getcclosuredata(L: *mut lua_State) -> *mut c_void;
+    pub fn lua_pushdatacfunctionk(
+        L: *mut lua_State,
+        f: lua_DataCFunction,
+        debugname: *const c_char,
+        cont: Option<lua_Continuation>,
+        size: usize,
+        dtor: Option<lua_ClosureWithDataFree>,
+    ) -> *mut c_void;
     pub fn lua_pushboolean(L: *mut lua_State, b: c_int);
     pub fn lua_pushthread(L: *mut lua_State) -> c_int;
 
@@ -299,6 +313,7 @@ unsafe extern "C-unwind" {
     pub fn lua_pcall(L: *mut lua_State, nargs: c_int, nresults: c_int, errfunc: c_int) -> c_int;
     pub fn lua_pcallmulti(L: *mut lua_State, nargs: c_int, nresults: c_int, errfunc: c_int) -> c_int;
     pub fn lua_cpcall(L: *mut lua_State, f: lua_CFunction, ud: *mut c_void) -> c_int;
+    pub fn lua_rawpcall(L: *mut lua_State, nargs: c_int, f: lua_RawPcallFunction, ud: *mut c_void) -> c_int;
 
     //
     // Coroutine functions

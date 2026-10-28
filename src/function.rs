@@ -257,7 +257,7 @@ impl Function {
                 return Ok(self.clone());
             }
 
-            protect_lua!(state, 1, 1, move |state| {
+            protect_lua_raw!(state, 1, 1, move |state| {
                 ffi::lua_clonefunction(state, -1)
             })?;
 

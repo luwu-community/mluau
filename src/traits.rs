@@ -128,6 +128,17 @@ where
             Err(error) => CallbackResult::LuaError(error)
         }
     }
+
+    // Pushes the values straight onto the stack, like `LuaOk` does, instead of converting them to a `MultiValue` first
+    unsafe fn finalize(self, lua: &RawLua, state: *mut ffi::lua_State) -> CallbackFinalizeAction {
+        match self {
+            Ok(success) => match success.push_into_specified_stack_multi(lua, state) {
+                Ok(nres) => CallbackFinalizeAction::Return(nres),
+                Err(e) => finalize_error(state, lua.extra(), e),
+            },
+            Err(error) => finalize_error(state, lua.extra(), error),
+        }
+    }
 }
 
 /// Trait for types convertible to [`Value`].

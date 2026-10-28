@@ -265,6 +265,50 @@ impl Lua {
         R::from_specified_stack_multi(nresults, &lua, state)
     }
 
+    /// Like [`Lua::exec_raw`], but without a Lua call frame (Luwu's `lua_rawpcall`), which makes the protection cost a
+    /// C++ `try` instead of a function call.
+    ///
+    /// The function runs on the caller's stack, so it must index from the top: positive indices and `lua_gettop` count
+    /// from below the arguments. It gets the index of its first argument. Everything it leaves above the values that
+    /// were on the stack before the arguments is returned. A Lua error raised in it is caught and returned, with no
+    /// traceback.
+    ///
+    /// # Example
+    /// ```
+    /// # use mluau::{Lua, Result};
+    /// # fn main() -> Result<()> {
+    /// let lua = Lua::new();
+    /// let n: i32 = unsafe {
+    ///     lua.exec_raw_unframed((3, 4, 5), |state, first| {
+    ///         let mut sum = 0;
+    ///         for i in 0..3 {
+    ///             sum += ffi::lua_tointeger(state, first + i);
+    ///         }
+    ///         ffi::lua_settop(state, first - 1);
+    ///         ffi::lua_pushinteger(state, sum);
+    ///     })
+    /// }?;
+    /// assert_eq!(n, 12);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn exec_raw_unframed<R: FromLuaMulti>(
+        &self,
+        args: impl IntoLuaMulti,
+        f: impl FnOnce(*mut ffi::lua_State, c_int),
+    ) -> Result<R> {
+        let lua = self.lock();
+        let state = lua.state();
+        let _sg = StackGuard::new(state);
+        let stack_start = ffi::lua_gettop(state);
+        let nargs = args.push_into_specified_stack_multi(&lua, state)?;
+        check_stack(state, 3)?;
+        crate::util::protect_lua_raw_closure::<_, ()>(state, nargs, ffi::LUA_MULTRET, |state| f(state, stack_start + 1))?;
+        let nresults = ffi::lua_gettop(state) - stack_start;
+        R::from_specified_stack_multi(nresults, &lua, state)
+    }
+
     /// Loads the specified subset of the standard libraries into an existing Lua state.
     ///
     /// Use the [`StdLib`] flags to specify the libraries you want to load.
@@ -985,6 +1029,12 @@ impl Lua {
         unsafe { self.lock().create_sequence_from(iter) }
     }
 
+    /// Creates a sequence table of the strings in `items`, like `create_sequence_from` but faster: the table and every
+    /// string are made in a single protected call instead of two per item.
+    pub fn create_string_sequence<T: AsRef<[u8]>>(&self, items: &[T]) -> Result<Table> {
+        unsafe { self.lock().create_string_sequence(items) }
+    }
+
     /// Wraps a Rust function or closure, creating a callable Lua function handle to it.
     ///
     /// The function's return value is always a `Result`: If the function returns `Err`, the error
@@ -1144,7 +1194,7 @@ impl Lua {
             let _sg = StackGuard::new(state);
             check_stack(state, 3)?;
 
-            protect_lua!(state, 0, 1, |state| ffi::lua_pushcfunction(state, func))?;
+            protect_lua_raw!(state, 0, 1, |state| ffi::lua_pushcfunction(state, func))?;
             Ok(Function(lua.pop_ref()))
         }
     }
