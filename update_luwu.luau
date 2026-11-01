@@ -42,7 +42,16 @@ const function find_relevant_directories(path: string)
     return relevant_dirs
 end
 
-const function replace_relevant_directories(relevant_directories: { string })
+--- Short hash of the checked-out commit in the luwu repository at `repo_path`
+const function commit_of(repo_path: string): string
+    return process.run {
+        program = "git",
+        args = { "-C", repo_path, "rev-parse", "--short=8", "HEAD" },
+    }:unwrap()
+end
+
+--- Replaces ./luwu with `relevant_directories` and records `commit` in luwu/LUWU_COMMIT for mluau::LUWU_COMMIT
+const function replace_relevant_directories(relevant_directories: { string }, commit: string)
     fs.dir.try_remove(vendored_path)
     const vendored = fs.dir.ensure(vendored_path)
     for _, r in relevant_directories do
@@ -50,6 +59,8 @@ const function replace_relevant_directories(relevant_directories: { string })
         const directory_vendored_path = vendored:join(child)
         fs.copy(r, directory_vendored_path)
     end
+    fs.writefile(vendored:join("LUWU_COMMIT"), `{commit}\n`)
+    print(`vendored luwu commit {commit}`)
 end
 
 const function replace_using_local_path()
@@ -59,7 +70,7 @@ const function replace_using_local_path()
         error(`update_luwu.luau: path provided '{path} is not a directory`)
     end
     const relevant_dirs = find_relevant_directories(path)
-    replace_relevant_directories(relevant_dirs)
+    replace_relevant_directories(relevant_dirs, commit_of(path))
 end
 
 const function replace_using_git_clone()
@@ -71,7 +82,7 @@ const function replace_using_git_clone()
         stdio = "Inherit"
     }:unwrap()
     const relevant_directories = find_relevant_directories(temp_path)
-    replace_relevant_directories(relevant_directories)
+    replace_relevant_directories(relevant_directories, commit_of(temp_path))
     fs.dir.try_remove(temp_path)
 end
 

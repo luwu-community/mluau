@@ -92,7 +92,7 @@ pub mod auxlib;
 pub mod prelude;
 
 pub use bstr::BString;
-pub use ffi::{self, lua_CFunction, lua_State};
+pub use ffi::{self, lua_CFunction, lua_State, LUWU_COMMIT};
 
 pub use crate::chunk::{AsChunk, Chunk, ChunkMode, ChunkSource, Language};
 pub use crate::debug::{Debug, DebugEvent, DebugNames, DebugSource, DebugStack};
