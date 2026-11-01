@@ -64,6 +64,9 @@ public:
         // `implements` list (LBC_CLASSSHAPE_IMPLEMENTS)
         bool isTrait = false;
         bool implementsTraits = false;
+        // Luwu Destructuring (rfcs/destructuring.md): parallel to propertyNames: for a member flagged
+        // LBC_CLASSMEMBER_POSITIONAL, its position among the primary constructor's parameters; -1 for every other member.
+        std::vector<int32_t> propertyPositions;
     };
 
     BytecodeBuilder(BytecodeEncoder* encoder = 0);
@@ -120,6 +123,9 @@ public:
     void setDebugLine(int line);
     void pushDebugLocal(StringRef name, uint8_t reg, uint32_t startpc, uint32_t endpc);
     void pushDebugUpval(StringRef name);
+
+    // Luwu try expressions: an error raised while running [startpc, endpc) resumes at handlerpc, with the error in target
+    void pushTryRange(uint32_t startpc, uint32_t endpc, uint32_t handlerpc, uint8_t target);
 
     size_t getInstructionCount() const;
     size_t getTotalInstructionCount() const;
@@ -274,6 +280,14 @@ protected:
         unsigned int name;
     };
 
+    struct TryRange
+    {
+        uint32_t startpc;
+        uint32_t endpc;
+        uint32_t handlerpc;
+        uint8_t target;
+    };
+
     struct TypedLocal
     {
         LuauBytecodeType type;
@@ -340,6 +354,7 @@ protected:
     int debugLine = 0;
 
     std::vector<DebugLocal> debugLocals;
+    std::vector<TryRange> tryRanges;
     std::vector<DebugUpval> debugUpvals;
 
     std::vector<TypedLocal> typedLocals;

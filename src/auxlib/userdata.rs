@@ -367,15 +367,14 @@ impl<'a, const TAG: c_int, T: UserData<TAG>> UserDataRegistry<'a, TAG, T> {
 
     // TODO: Make this re-entrant/multiple threads safe
 
-    /// Creates the actual userdata w/ shared metatable for all `T` of same type
-    fn create_userdata(lua: &'a Lua, data: T) -> crate::Result<AnyUserData> {
-        // Check if `ud` already exists
+    /// The metatable every `T` shares, made on first use
+    fn metatable(lua: &'a Lua) -> crate::Result<Table> {
         struct Ud<T> {
             tab: Table,
             _phantom: PhantomData<T>
         }
         if let Some(tab) = lua.try_app_data_ref::<Ud<T>>().map_err(crate::Error::external)? {
-            return lua.create_any_userdata_with_tag::<_, TAG>(data, Some(&tab.tab));
+            return Ok(tab.tab.clone());
         }
 
         let mt = Self::new_metatable(lua)?;
@@ -383,7 +382,19 @@ impl<'a, const TAG: c_int, T: UserData<TAG>> UserDataRegistry<'a, TAG, T> {
             tab: mt.clone(),
             _phantom: PhantomData::<T>
         });
+        Ok(mt)
+    }
+
+    /// Creates the actual userdata w/ shared metatable for all `T` of same type
+    fn create_userdata(lua: &'a Lua, data: T) -> crate::Result<AnyUserData> {
+        let mt = Self::metatable(lua)?;
         lua.create_any_userdata_with_tag::<_, TAG>(data, Some(&mt))
+    }
+
+    /// Pushes a userdata of `data` onto `state` without making a ref, for a value that goes straight to Lua
+    unsafe fn push_userdata_at(lua: &'a crate::state::RawLua, state: *mut crate::ffi::lua_State, data: T) -> crate::Result<()> {
+        let mt = Self::metatable(lua.lua())?;
+        lua.push_any_userdata_at::<T, TAG>(state, data, Some(&mt))
     }
 }
 
@@ -477,6 +488,11 @@ impl<T: UserData> IntoLua for T {
     fn into_lua(self, lua: &Lua) -> crate::Result<Value> {
         let ud = UserDataRegistry::create_userdata(lua, self)?;
         Ok(Value::UserData(ud))
+    }
+
+    #[inline]
+    unsafe fn push_into_specified_stack(self, lua: &crate::state::RawLua, state: *mut crate::ffi::lua_State) -> crate::Result<()> {
+        UserDataRegistry::push_userdata_at(lua, state, self)
     }
 }
 

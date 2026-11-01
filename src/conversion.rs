@@ -979,6 +979,10 @@ where
     fn into_lua(self, lua: &Lua) -> Result<Value> {
         Ok(Value::Table(lua.create_sequence_from(self.iter().cloned())?))
     }
+    #[inline]
+    unsafe fn push_into_specified_stack(self, lua: &RawLua, state: *mut ffi::lua_State) -> Result<()> {
+        lua.push_sequence_at(state, self.iter().cloned())
+    }
 }
 
 impl<T, const N: usize> IntoLua for [T; N]
@@ -988,6 +992,10 @@ where
     #[inline]
     fn into_lua(self, lua: &Lua) -> Result<Value> {
         Ok(Value::Table(lua.create_sequence_from(self)?))
+    }
+    #[inline]
+    unsafe fn push_into_specified_stack(self, lua: &RawLua, state: *mut ffi::lua_State) -> Result<()> {
+        lua.push_sequence_at(state, self)
     }
 }
 
@@ -1032,6 +1040,10 @@ impl<T: IntoLua> IntoLua for Box<[T]> {
     fn into_lua(self, lua: &Lua) -> Result<Value> {
         Ok(Value::Table(lua.create_sequence_from(self.into_vec())?))
     }
+    #[inline]
+    unsafe fn push_into_specified_stack(self, lua: &RawLua, state: *mut ffi::lua_State) -> Result<()> {
+        lua.push_sequence_at(state, self.into_vec())
+    }
 }
 
 impl<T: FromLua> FromLua for Box<[T]> {
@@ -1045,6 +1057,10 @@ impl<T: IntoLua> IntoLua for Vec<T> {
     #[inline]
     fn into_lua(self, lua: &Lua) -> Result<Value> {
         Ok(Value::Table(lua.create_sequence_from(self)?))
+    }
+    #[inline]
+    unsafe fn push_into_specified_stack(self, lua: &RawLua, state: *mut ffi::lua_State) -> Result<()> {
+        lua.push_sequence_at(state, self)
     }
 }
 
@@ -1067,6 +1083,10 @@ impl<K: Eq + Hash + IntoLua, V: IntoLua, S: BuildHasher> IntoLua for HashMap<K, 
     fn into_lua(self, lua: &Lua) -> Result<Value> {
         Ok(Value::Table(lua.create_table_from(self)?))
     }
+    #[inline]
+    unsafe fn push_into_specified_stack(self, lua: &RawLua, state: *mut ffi::lua_State) -> Result<()> {
+        lua.push_table_at(state, self)
+    }
 }
 
 impl<K: Eq + Hash + FromLua, V: FromLua, S: BuildHasher + Default> FromLua for HashMap<K, V, S> {
@@ -1088,6 +1108,10 @@ impl<K: Ord + IntoLua, V: IntoLua> IntoLua for BTreeMap<K, V> {
     #[inline]
     fn into_lua(self, lua: &Lua) -> Result<Value> {
         Ok(Value::Table(lua.create_table_from(self)?))
+    }
+    #[inline]
+    unsafe fn push_into_specified_stack(self, lua: &RawLua, state: *mut ffi::lua_State) -> Result<()> {
+        lua.push_table_at(state, self)
     }
 }
 
@@ -1113,6 +1137,10 @@ impl<T: Eq + Hash + IntoLua, S: BuildHasher> IntoLua for HashSet<T, S> {
             lua.create_table_from(self.into_iter().map(|val| (val, true)))?,
         ))
     }
+    #[inline]
+    unsafe fn push_into_specified_stack(self, lua: &RawLua, state: *mut ffi::lua_State) -> Result<()> {
+        lua.push_table_at(state, self.into_iter().map(|val| (val, true)))
+    }
 }
 
 impl<T: Eq + Hash + FromLua, S: BuildHasher + Default> FromLua for HashSet<T, S> {
@@ -1136,6 +1164,10 @@ impl<T: Ord + IntoLua> IntoLua for BTreeSet<T> {
         Ok(Value::Table(
             lua.create_table_from(self.into_iter().map(|val| (val, true)))?,
         ))
+    }
+    #[inline]
+    unsafe fn push_into_specified_stack(self, lua: &RawLua, state: *mut ffi::lua_State) -> Result<()> {
+        lua.push_table_at(state, self.into_iter().map(|val| (val, true)))
     }
 }
 

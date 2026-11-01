@@ -67,6 +67,7 @@ void translateInstForGPrep(IrBuilder& build, const Instruction* pc, int pcpos);
 void translateInstForGLoopIpairs(IrBuilder& build, const Instruction* pc, int pcpos);
 void translateInstGetTableN(IrBuilder& build, const Instruction* pc, int pcpos);
 void translateInstSetTableN(IrBuilder& build, const Instruction* pc, int pcpos);
+void translateInstGetPositional(IrBuilder& build, const Instruction* pc, int pcpos);
 void translateInstAppendTable(IrBuilder& build, const Instruction* pc, int pcpos);
 void translateInstPush(IrBuilder& build, const Instruction* pc, int pcpos);
 void translateInstPop(IrBuilder& build, const Instruction* pc, int pcpos);

@@ -25,9 +25,14 @@ pub static ENABLED_FFLAGS: &[&str] = &[
     "LuwuStringExtensions",
     "LuwuBufferBatched",
     "LuwuBufferMemcmp",
+    // destructuring; positional patterns `.(a, b)` compile to LOP_GETPOSITIONAL only with it on
+    "LuwuDestructuring",
     // the `collections` library; it also needs LuwuClasses and LuwuNonePrimitive, and stays closed without them
     #[cfg(feature = "luwu-classes")]
-    "DebugLuwuCollections"
+    "DebugLuwuCollections",
+    // `try` expressions, which give a `collections.result`
+    #[cfg(feature = "luwu-classes")]
+    "DebugLuwuTryExpressions"
 ];
 
 pub static RESTRICTED_FFLAGS: &[&str] = &[
@@ -141,6 +146,17 @@ impl Lua {
             let state = lua.state();
             protect_lua!(state, 0, 0, |state| {
                 ffi::luaL_requiref(state, ffi::LUA_COLLECTIONSLIBNAME, ffi::luaopen_collections, 1)
+            })?;
+        }
+
+        // The `luwon` library reads and writes `.luwon` data files. luwu's `luaL_openlibs` doesn't open it, since the
+        // VM doesn't link the parser it needs.
+        #[cfg(feature = "luwu-classes")]
+        {
+            let lua = self.lock();
+            let state = lua.state();
+            protect_lua!(state, 0, 0, |state| {
+                ffi::luaL_requiref(state, ffi::LUA_LUWONLIBNAME, ffi::luaopen_luwon, 1)
             })?;
         }
 

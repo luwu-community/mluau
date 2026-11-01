@@ -73,7 +73,10 @@
 //   LBF_CLASS_ISINSTANCE.
 //   Luwu Traits (rfcs/classes/traits.md): the shape flags varint in LBC_CONSTANT_CLASS_SHAPE (LBC_CLASSSHAPE_TRAIT,
 //   LBC_CLASSSHAPE_IMPLEMENTS), the EXPECTED, OPTIONAL and FINAL member flags, and NEWCLASSMEMBER's IMPLEMENTS form.
-
+//   Luwu Destructuring: GETPOSITIONAL, and LBC_CLASSMEMBER_POSITIONAL with its position in LBC_CONSTANT_CLASS_SHAPE.
+//   Luwu collections: LBF_COLLECTIONS_PAIR to LBF_COLLECTIONS_RESULT_ERR.
+//   Luwu try expressions: WRAPRESULT, RESULTGET, and each function's protected ranges after its inlining cost: a varint count,
+//   then per range the varints start pc, end pc (exclusive) and handler pc, and a byte for the target register.
 
 // # Bytecode type information history
 // Version 1: (from bytecode version 4) Type information for function signature. Currently supported.
@@ -580,6 +583,15 @@ enum LuauOpcode
     // D: jump offset (-32768..32767) past the CALL, taken when the class has no trait initializers
     LOP_INITTRAITS,
 
+    // GETPOSITIONAL: Luwu Destructuring (rfcs/destructuring.md): the element at position C + 1 of a positional pattern
+    // `.(a, b)`. For an object, the member at that position of its class (LuauClass::positionalmembers), read with the
+    // same private-access check as reading it by name; a class without a primary constructor, or a position past its
+    // last parameter, raises. For any other value, B[C + 1], like GETTABLEN.
+    // A: target register
+    // B: register holding the value
+    // C: position - 1 (0..255)
+    LOP_GETPOSITIONAL,
+
     // PRESIZETABLE: Luwu Table Comprehensions (rfcs/table-comprehensions.md): sizes the table a comprehension builds from
     // what its loop iterates, so filling it doesn't rehash, and trims it afterwards. Emitted after the loop's registers are
     // loaded and before its FORNPREP/FORGPREP, and once more after the loop. A size is a capacity hint, never a result:
@@ -622,6 +634,20 @@ enum LuauOpcode
     // B: register holding the container
     LOP_POP,
 
+    // WRAPRESULT: Luwu try expressions: wraps a value in a `collections.result`, an `ok` or an `err`. A `try` expression
+    // ends with the `ok` form, and its protected range's handler starts with the `err` form: when the VM resumes there,
+    // it has put the caught error in A and where it was raised in A + 1 to A + 3 (module, line, traceback).
+    // A: register holding the value, and receiving the result
+    // B: LBC_WRAPRESULT_OK or LBC_WRAPRESULT_ERR
+    LOP_WRAPRESULT,
+
+    // RESULTGET: Luwu try expressions: `r:ok()` or `r:err()` of a `try` result the compiler keeps in registers instead of
+    // an object: its value or error at B, and at B + LBC_TRYRESULT_OKFLAG whether it's an `ok`
+    // A: target register
+    // B: the result's first register
+    // C: LBC_RESULTGET_OK (the value of an ok, else none) or LBC_RESULTGET_ERR (the error of an err, else none)
+    LOP_RESULTGET,
+
     // Enum entry for number of opcodes, not a valid opcode by itself!
     LOP__COUNT
 };
@@ -657,6 +683,25 @@ enum LuauOpcode
 // Auxiliary NOT: 1-bit negation flag
 // Used in LOP_JUMPXEQK* instructions
 #define LUAU_INSN_AUX_NOT(aux) ((aux) >> 31)
+
+// Luwu try expressions: operand B of LOP_WRAPRESULT
+enum LuauWrapResultForm
+{
+    LBC_WRAPRESULT_OK = 0,
+    // The error in A, then its module, line and traceback in A + 1 to A + 3
+    LBC_WRAPRESULT_ERR = 1,
+};
+
+// Luwu try expressions: operand C of LOP_RESULTGET
+enum LuauResultGetForm
+{
+    LBC_RESULTGET_OK = 0,
+    LBC_RESULTGET_ERR = 1,
+};
+
+// Luwu try expressions: a result kept in registers holds its value or error, the three registers LOP_WRAPRESULT's `err`
+// form reads, then whether it's an `ok`
+#define LBC_TRYRESULT_OKFLAG 4
 
 // Luwu Classes (rfcs/classes): JUMPXISA aux flags (see LOP_JUMPXISA)
 // Jump when the value is an instance of the class, rather than when it is not
@@ -767,6 +812,11 @@ enum LuwuBytecodeTag
 #define LBC_CLASSMEMBER_EXPECTED (1 << 5)
 // Luwu Traits (rfcs/classes/traits.md): set on a trait's `final` functions, which implementing classes can't define.
 #define LBC_CLASSMEMBER_FINAL (1 << 6)
+// Luwu Destructuring (rfcs/destructuring.md): set on an instance member that a primary constructor parameter declares.
+// Its position, 0 for the first parameter, follows the flags byte (after the constant default's index, when it has
+// one). A positional pattern `.(a, b)` reads members in that order (LOP_GETPOSITIONAL). Shares its bit with
+// LBC_CLASSMEMBER_PRIMARYINIT, which only `__init` carries: a position is only ever read for a field.
+#define LBC_CLASSMEMBER_POSITIONAL (1 << 4)
 // Never serialized: the VM sets this on every class's `__init` when it builds the class. Reading `__init`
 // as a member raises, since calling it on a constructed object would re-run construction, which may
 // reassign its `const` fields. Construction never reads `__init` by name, so it is unaffected. Lives
@@ -1029,6 +1079,14 @@ enum LuauBuiltinFunction
     LBF_STRING_STARTSWITH,
     LBF_STRING_ENDSWITH,
     LBF_STRING_CONTAINS,
+
+    // Luwu collections: constructing a builtin class without a call frame
+    LBF_COLLECTIONS_PAIR,
+    LBF_COLLECTIONS_TRIPLE,
+    LBF_COLLECTIONS_QUAD,
+    LBF_COLLECTIONS_OPTION_SOME,
+    LBF_COLLECTIONS_RESULT_OK,
+    LBF_COLLECTIONS_RESULT_ERR,
 };
 
 // Capture type, used in LOP_CAPTURE

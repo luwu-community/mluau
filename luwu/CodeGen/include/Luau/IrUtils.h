@@ -115,6 +115,7 @@ inline bool canInvalidateSafeEnv(IrCmd cmd)
     case IrCmd::FALLBACK_NEWOBJECT:
     case IrCmd::FALLBACK_NEWCLASSMEMBER:
     case IrCmd::FALLBACK_INITTRAITS:
+    case IrCmd::FALLBACK_GETPOSITIONAL:
     case IrCmd::FALLBACK_PRESIZETABLE:
     case IrCmd::FALLBACK_PUSH:
     case IrCmd::FALLBACK_POP:

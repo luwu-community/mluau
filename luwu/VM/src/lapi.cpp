@@ -1833,10 +1833,107 @@ int lua_ismemberconst(lua_State* L, int idx, const char* membername)
     return offsetnum >= classdef->numberofinstancemembers || (classdef->memberflags[offsetnum] & LBC_CLASSMEMBER_CONST) != 0;
 }
 
+// Whether a trait the class implements, directly or through `needs`, declares `name` final. The class's own copy of a
+// trait's function doesn't carry the trait's `final` flag.
+static bool finalintrait(const LuauClass* classdef, TString* name)
+{
+    for (uint32_t i = 0; i < classdef->numtraits; i++)
+    {
+        const LuauClass* trait = classdef->traits[i];
+        const TValue* offset = luaH_getstr(trait->memberstooffset, name);
+        if (!ttisnil(offset) && (trait->memberflags[uint32_t(nvalue(offset))] & LBC_CLASSMEMBER_FINAL))
+            return true;
+    }
+
+    return false;
+}
+
+int lua_ismemberfinal(lua_State* L, int idx, const char* membername)
+{
+    LuauClass* classdef;
+    const TValue* offset = findclassmember(L, idx, membername, &classdef);
+    if (ttisnil(offset))
+        return 0;
+
+    if (classdef->memberflags[uint32_t(nvalue(offset))] & LBC_CLASSMEMBER_FINAL)
+        return 1;
+
+    return finalintrait(classdef, luaS_new(L, membername));
+}
+
+int lua_classimplements(lua_State* L, int idx, int traitidx)
+{
+    const TValue* trait = index2addr(L, traitidx);
+    if (!ttisclass(trait) || !classvalue(trait)->istrait)
+        luaG_runerror(L, "expected a trait, got %s", luaT_objtypename(L, trait));
+
+    const TValue* o = index2addr(L, idx);
+    return ttisobject(o) && luaR_implements(objectvalue(o)->lclass, classvalue(trait));
+}
+
 const char* lua_getclassname(lua_State* L, int idx)
 {
     LuauClass* classdef = classofvalue(index2addr(L, idx));
     return classdef ? getstr(classdef->name) : NULL;
+}
+
+static void pushpayload(lua_State* L, LuwuBuiltinClass kind, int idx)
+{
+    luaC_checkGC(L);
+    luaC_threadbarrier(L);
+    ensure_stack(L, 1);
+    LuauObject* object = luaR_newpayload(L, kind, index2addr(L, idx));
+    setobjectvalue(L, L->top, object);
+    api_incr_top(L);
+}
+
+void lua_pushsome(lua_State* L, int idx)
+{
+    pushpayload(L, LUWU_BUILTIN_SOME, idx);
+}
+
+void lua_pushresultok(lua_State* L, int idx)
+{
+    pushpayload(L, LUWU_BUILTIN_OK, idx);
+}
+
+void lua_pushresulterr(lua_State* L, int idx)
+{
+    pushpayload(L, LUWU_BUILTIN_ERR, idx);
+}
+
+static bool isbuiltinobject(lua_State* L, int idx, LuwuBuiltinClass kind)
+{
+    const TValue* o = index2addr(L, idx);
+    return ttisobject(o) && objectvalue(o)->lclass == L->global->builtinclasses[kind];
+}
+
+int lua_issome(lua_State* L, int idx)
+{
+    return isbuiltinobject(L, idx, LUWU_BUILTIN_SOME);
+}
+
+int lua_isresultok(lua_State* L, int idx)
+{
+    return isbuiltinobject(L, idx, LUWU_BUILTIN_OK);
+}
+
+int lua_isresulterr(lua_State* L, int idx)
+{
+    return isbuiltinobject(L, idx, LUWU_BUILTIN_ERR);
+}
+
+int lua_getpayload(lua_State* L, int idx)
+{
+    const TValue* payload = luaR_payload(L, index2addr(L, idx));
+    if (!payload)
+        return LUA_TNONE;
+
+    luaC_threadbarrier(L);
+    ensure_stack(L, 1);
+    setobj2s(L, L->top, payload);
+    api_incr_top(L);
+    return ttype(payload);
 }
 
 // Whether the class has members that are functions, other than the constructor and the defaults a POD class computes
@@ -1856,16 +1953,6 @@ static bool classhasmethods(const LuauClass* classdef)
     return false;
 }
 
-// The number of parameters a primary constructor takes, not counting `self`
-static int primaryparameters(const LuauClass* classdef)
-{
-    const TValue* init = &classdef->staticmembers[classdef->initoffset - classdef->numberofinstancemembers];
-    if (!ttisfunction(init) || clvalue(init)->isC)
-        return -1;
-
-    return clvalue(init)->l.p->numparams - 1;
-}
-
 int lua_getclassdatashape(lua_State* L, int idx, int* hasmethods)
 {
     const LuauClass* classdef = classofvalue(index2addr(L, idx));
@@ -1873,10 +1960,12 @@ int lua_getclassdatashape(lua_State* L, int idx, int* hasmethods)
 
     *hasmethods = classhasmethods(classdef);
 
+    // Luwu Destructuring (rfcs/destructuring.md): a primary constructor's parameters are the class's positional members,
+    // which a data file writes in parameter order (LuauClass::positionalmembers)
     int shape = LUA_CLASSDATA_TABLE;
-    if (classdef->hasprimaryinit)
+    if (classdef->numberofpositional >= 0)
     {
-        bool coversfields = primaryparameters(classdef) == int(classdef->numberofinstancemembers);
+        bool coversfields = uint32_t(classdef->numberofpositional) == classdef->numberofinstancemembers;
         shape = coversfields ? LUA_CLASSDATA_POSITIONAL : LUA_CLASSDATA_NONE;
     }
     else if (classdef->hascustominit)
@@ -1886,15 +1975,38 @@ int lua_getclassdatashape(lua_State* L, int idx, int* hasmethods)
         return shape;
 
     lua_createtable(L, int(classdef->numberofinstancemembers), 0);
-    for (uint32_t offset = 0; offset < classdef->numberofinstancemembers; offset++)
+    for (uint32_t i = 0; i < classdef->numberofinstancemembers; i++)
     {
+        uint32_t offset = shape == LUA_CLASSDATA_POSITIONAL ? classdef->positionalmembers[i] : i;
         ensure_stack(L, 1);
         setsvalue(L, L->top, classdef->offsettomember[offset]);
         api_incr_top(L);
-        lua_rawseti(L, -2, int(offset + 1));
+        lua_rawseti(L, -2, int(i + 1));
     }
 
     return shape;
+}
+
+int lua_classof(lua_State* L, int idx)
+{
+    const TValue* o = index2addr(L, idx);
+    if (!ttisobject(o))
+        return 0;
+
+    luaC_threadbarrier(L);
+    setclassvalue(L, L->top, objectvalue(o)->lclass);
+    api_incr_top(L);
+    return 1;
+}
+
+int lua_classis(lua_State* L, int idx, int classidx)
+{
+    const TValue* cls = index2addr(L, classidx);
+    if (!ttisclass(cls))
+        luaG_runerror(L, "expected a class, got %s", luaT_objtypename(L, cls));
+
+    const TValue* o = index2addr(L, idx);
+    return ttisobject(o) && objectvalue(o)->lclass == classvalue(cls);
 }
 
 static const char* aux_upvalue(StkId fi, int n, TValue** val)

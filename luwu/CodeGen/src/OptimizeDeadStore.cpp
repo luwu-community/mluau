@@ -1294,6 +1294,7 @@ static void markDeadStoresInInst(RemoveDeadStoreState& state, IrBuilder& build, 
     case IrCmd::FALLBACK_NEWOBJECT:
     case IrCmd::FALLBACK_NEWCLASSMEMBER:
     case IrCmd::FALLBACK_INITTRAITS:
+    case IrCmd::FALLBACK_GETPOSITIONAL:
     case IrCmd::FALLBACK_PRESIZETABLE:
     case IrCmd::FALLBACK_PUSH:
     case IrCmd::FALLBACK_POP:
@@ -1343,6 +1344,7 @@ static void markDeadStoresInInst(RemoveDeadStoreState& state, IrBuilder& build, 
     case IrCmd::FALLBACK_NEWOBJECT:
     case IrCmd::FALLBACK_NEWCLASSMEMBER:
     case IrCmd::FALLBACK_INITTRAITS:
+    case IrCmd::FALLBACK_GETPOSITIONAL:
     case IrCmd::FALLBACK_PRESIZETABLE:
     case IrCmd::FALLBACK_PUSH:
     case IrCmd::FALLBACK_POP:

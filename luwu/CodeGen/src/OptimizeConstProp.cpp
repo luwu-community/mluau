@@ -1626,6 +1626,12 @@ static void handleBuiltinEffects(ConstPropState& state, LuauBuiltinFunction bfid
     case LBF_STRING_STARTSWITH:
     case LBF_STRING_ENDSWITH:
     case LBF_STRING_CONTAINS:
+    case LBF_COLLECTIONS_PAIR:
+    case LBF_COLLECTIONS_TRIPLE:
+    case LBF_COLLECTIONS_QUAD:
+    case LBF_COLLECTIONS_OPTION_SOME:
+    case LBF_COLLECTIONS_RESULT_OK:
+    case LBF_COLLECTIONS_RESULT_ERR:
         break;
     case LBF_BUFFER_WRITEU8:
     case LBF_BUFFER_WRITEU16:
@@ -3658,6 +3664,7 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
         state.invalidateUserCall();
         break;
     case IrCmd::FALLBACK_GETTABLEKS:
+    case IrCmd::FALLBACK_GETPOSITIONAL:
         state.invalidate(OP_B(inst));
         state.invalidateUserCall();
         break;

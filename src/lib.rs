@@ -68,6 +68,8 @@ mod buffer;
 mod chunk;
 #[cfg(any(feature = "luwu-classes", doc))]
 mod class;
+#[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+mod collections;
 mod conversion;
 mod debug;
 mod error;
@@ -128,6 +130,10 @@ pub use crate::{
 #[cfg(any(feature = "luwu-classes", doc))]
 #[cfg_attr(docsrs, doc(cfg(feature = "luwu-classes")))]
 pub use crate::class::{Class, Object};
+
+#[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "luwu-classes", feature = "none-primitive"))))]
+pub use crate::collections::{LuwuOption, LuwuResult};
 
 #[cfg(feature = "serde")]
 #[doc(inline)]

@@ -787,3 +787,65 @@ fn test_thread_state_change_event() -> Result<()> {
 
 #[path = "luau/require.rs"]
 mod require;
+
+// Options and results built in Rust are the `collections` library's own values, and read back into Rust
+#[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+#[test]
+fn test_collections_option_and_result_roundtrip() -> Result<()> {
+    use mluau::{IntoLua, LuwuOption, LuwuResult};
+
+    let lua = Lua::new();
+
+    let parse = lua.create_function(|_, text: String| {
+        Ok(LuwuResult(text.parse::<f64>().map_err(|err| err.to_string())))
+    })?;
+    lua.globals().set("parse", parse)?;
+
+    let find = lua.create_function(|_, key: String| {
+        Ok(LuwuOption((key == "here").then_some(42)))
+    })?;
+    lua.globals().set("find", find)?;
+
+    let ok_or_default = lua.create_function(|_, result: LuwuResult<f64, String>| Ok(result.0.unwrap_or(-1.0)))?;
+    lua.globals().set("ok_or_default", ok_or_default)?;
+
+    let option_or_default = lua.create_function(|_, option: LuwuOption<i64>| Ok(option.0.unwrap_or(-1)))?;
+    lua.globals().set("option_or_default", option_or_default)?;
+
+    lua.load(
+        r#"
+        const parsed = parse("1.5")
+        assert(class.isinstance(parsed, collections.result.ok))
+        assert(parsed:ok() == 1.5)
+        assert(parsed:err() == none)
+
+        const failed = parse("nope")
+        assert(class.isinstance(failed, collections.result.err))
+        assert(failed:err() == "invalid float literal")
+
+        assert(class.isinstance(find("here"), collections.option.some))
+        assert(find("here"):get() == 42)
+        assert(find("gone") == none)
+
+        assert(ok_or_default(collections.result.ok(2)) == 2)
+        assert(ok_or_default(collections.result.err("no")) == -1)
+        assert(option_or_default(collections.option.some(3)) == 3)
+        assert(option_or_default(none) == -1)
+        "#,
+    )
+    .set_language(mluau::Language::Luwu)
+    .eval::<()>()?;
+
+    // A table is neither an option nor a result
+    let err = lua.load("ok_or_default({})").eval::<()>().unwrap_err().to_string();
+    assert!(err.contains("table") && err.contains("result"), "unexpected error: {err}");
+
+    // `some` needs a value
+    let some_nil = LuwuOption(Some(Value::Nil)).into_lua(&lua).unwrap_err().to_string();
+    assert!(some_nil.contains("option.some needs a value, but you passed nil"), "unexpected error: {some_nil}");
+
+    let none = LuwuOption::<i64>(None).into_lua(&lua)?;
+    assert_eq!(none, Value::None);
+
+    Ok(())
+}

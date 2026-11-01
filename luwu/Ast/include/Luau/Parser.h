@@ -237,15 +237,21 @@ private:
     );
 
     // Luwu Destructuring (rfcs/destructuring.md):
-    // destructuring ::= (`local' | `const') [Name] `.' `{' fieldlist `}' [`:' Type] `=' exp
+    // destructuring ::= (`local' | `const') target `=' exp
+    // pattern ::= `.' `{' fieldlist `}' | `.' `(' elementlist `)'
     // fieldlist ::= field {`,' field} [`,']
-    // field ::= Name [`.' `{' fieldlist `}'] [`:' Type] | Name `as' target
-    // target ::= Name [`.' `{' fieldlist `}'] [`:' Type] | `.' `{' fieldlist `}' [`:' Type]
+    // field ::= Name [pattern] [`:' Type] | Name `as' target
+    // elementlist ::= target {`,' target} [`,']
+    // target ::= Name [pattern] [`:' Type] | pattern [`:' Type]
     // An annotation follows the binding it types; after a pattern, it types the value the pattern destructures.
     struct DestructureTarget;
 
     bool destructuringFollows();
     bool destructurePatternFollows();
+    bool positionalPatternFollows();
+    bool dotTableFollows();
+    void parseDestructureElements(DestructureTarget& target);
+    void parseDestructureTarget(DestructureTarget& target);
     bool destructuringAssignmentFollows();
     bool dotTableMissingBraceFollows();
     bool destructuringAvailable();
@@ -455,6 +461,8 @@ private:
 
     AstTypePack* parseOptionalReturnType(Position* returnSpecifierPosition = nullptr);
     AstTypePack* parseReturnType();
+    // Luwu try expressions: `! E` after a return type, or nullptr
+    AstType* parseOptionalErrorHint(Position* bangPosition = nullptr);
 
     struct TableIndexerResult
     {
@@ -474,7 +482,8 @@ private:
         AstArray<AstGenericTypePack*> genericPacks,
         AstArray<AstType*> params,
         AstArray<std::optional<AstArgumentName>> paramNames,
-        AstTypePack* varargAnnotation
+        AstTypePack* varargAnnotation,
+        Position* errorHintPosition = nullptr
     );
 
     AstType* parseTableType(bool inDeclarationContext = false);
@@ -546,6 +555,7 @@ private:
     // dottable ::= `.' `{' [dotfield {fieldsep dotfield} [fieldsep]] `}'
     // dotfield ::= Name | Name `=' exp
     AstExpr* parseDotTableConstructor();
+    AstExpr* parseDotPositional();
 
     // TODO: Add grammar rules here?
     AstExpr* parseIfElseExpr();
@@ -558,8 +568,12 @@ private:
     bool literalPatternFollows();
     std::optional<AstExpr*> parseNothingValue();
     AstExpr* parseTypeTestBindings(AstExpr* value, AstExpr* type, bool negated, const Location& start);
+    AstExpr* recoverTypeTestCall(AstExpr* value, AstExpr* type, bool negated, const Location& start);
+    AstExpr* bindTypeTestPattern(AstExpr* value, AstExpr* type, const DestructureTarget& target, bool negated, const Location& location);
+    AstExpr* bindWholeValue(AstExpr* value, bool negated, const Location& start);
     struct TypeTestBindings;
     struct TypeTestBindingsFrame;
+    void reportTryAroundTypeTest(AstExprTry* tryExpr, const TypeTestBindings& bindings);
     TypeTestBindingsFrame allowTypeTestBindings();
     void appendConditionClauses(
         std::vector<AstIfClause>& chain,
@@ -568,7 +582,9 @@ private:
         TypeTestBindingsFrame outer
     );
     bool matchExpressionFollows();
-    AstExpr* parseMatchExpr(bool inStatement = false);
+    AstExpr* parseMatchExpr(bool inStatement = false, AstExprTry* tried = nullptr);
+    // Luwu try expressions: set while a `match` subject is parsed, so a `try` there leaves the `case` arms to the `match`
+    bool inMatchSubject = false;
     AstExpr* parseMatchPattern(AstLocal* subject);
     AstExpr* parseMatchAlternative(AstLocal* subject);
     AstExprCall* makeGlobalCall(AstName library, std::optional<AstName> function, const Location& location, std::initializer_list<AstExpr*> args);
@@ -592,9 +608,14 @@ private:
     bool orContinueFollows();
     void resolveOrContinues();
     AstExpr* parseOrLeave(const char* introducer = "or");
+    bool closesOpenBracket(const Lexeme& l);
     bool doExprBodyFollow(const Lexeme& l);
     bool valueEnds(const Lexeme& l);
     void checkDoExprKeywordAsName(const Name& name);
+
+    // Luwu try expressions
+    bool tryExpressionFollows();
+    AstExpr* parseTryExpr();
 
     // stringinterp ::= <INTERP_BEGIN> exp {<INTERP_MID> exp} <INTERP_END>
     AstExpr* parseInterpString();
@@ -810,6 +831,8 @@ private:
         // `: Type` after the binding, typing the local it binds.
         AstType* annotation = nullptr;
         bool closed = true;
+        // `.(a, b)`: `fields` are elements read by position, with empty keys
+        bool positional = false;
         std::vector<DestructureField> fields;
     };
     struct DestructureField
@@ -837,6 +860,26 @@ private:
     // Luwu Do Expressions (rfcs/do-expressions.md): where the expression directly inside the innermost `(` being parsed
     // starts, so a `do` expression can tell it is parenthesized.
     std::optional<Position> parenthesizedExprStart;
+
+    // Luwu: how many table constructors, call argument lists and parentheses enclose the position being parsed. While
+    // one is open, a block ends at a closing bracket, so a function missing its `end` leaves the bracket to them.
+    unsigned int openBracketDepth = 0;
+
+    struct OpenBracket
+    {
+        explicit OpenBracket(unsigned int& depth)
+            : depth(depth)
+        {
+            depth++;
+        }
+
+        ~OpenBracket()
+        {
+            depth--;
+        }
+
+        unsigned int& depth;
+    };
 
     // Luwu Do Expressions (rfcs/do-expressions.md): the statement being parsed is directly in a `do` expression's block, not
     // in a block nested in it. A `give` there ends the expression, so a `,` after its value belongs to the list around it.
@@ -893,6 +936,8 @@ private:
     {
         AstExpr* test = nullptr;
         Location location;
+        // `.{...}` or `.(...)`, for messages
+        const char* form = nullptr;
         std::vector<AstIfClause> clauses;
     };
     // Whether a type test here may bind (the condition being parsed is a whole `if`, `when` or `case` condition), and
@@ -903,6 +948,9 @@ private:
         std::optional<TypeTestBindings> bindings;
     };
     TypeTestBindingsFrame typeTestBindings;
+    // Luwu match expressions: the always-true test the last bare `.(name)` pattern made (bindWholeValue), so a `case`
+    // that is only that pattern can be told apart as a catch-all
+    AstExpr* wholeValueTest = nullptr;
     // Set while parsing the class after `is`, so `Point.{x, y}` stops before the `.{` instead of calling `Point`
     bool typeTestOperand = false;
     AstName nameNumber;
@@ -913,6 +961,9 @@ private:
     AstName nameNil;
     AstName nameContinue;
     AstName nameTrait;
+    // Luwu collections: what `.(a, b)` calls, `collections.pair`, `triple` or `quad` by its count
+    AstName nameCollections;
+    AstName nameCollectionsClasses[3];
 
     MatchLexeme endMismatchSuspect;
 

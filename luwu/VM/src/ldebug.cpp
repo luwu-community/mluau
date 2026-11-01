@@ -10,7 +10,9 @@
 #include "lbytecode.h"
 #include "lvm.h"
 #include "lclass.h"
+#include "lstring.h"
 
+#include <limits.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -391,6 +393,24 @@ l_noret luaG_methoderror(lua_State* L, const TValue* p1, const TString* p2)
     const char* t1 = luaT_objtypename(L, p1);
 
     luaG_runerror(L, "attempt to call missing method '%s' of %s", getstr(p2), t1);
+}
+
+// Luwu Destructuring (rfcs/destructuring.md): a positional pattern `.(a, b)` on an object without that position
+l_noret luaG_positionalerror(lua_State* L, const LuauClass* classdef, int position)
+{
+    const char* className = getstr(classdef->name);
+
+    if (classdef->numberofpositional < 0)
+        luaG_runerrorL(L, "can't destructure an object of class '%s' positionally: '%s' has no primary constructor", className, className);
+
+    luaG_runerrorL(
+        L,
+        "can't destructure an object of class '%s' at position %d: its primary constructor has %d parameter%s",
+        className,
+        position + 1,
+        classdef->numberofpositional,
+        classdef->numberofpositional == 1 ? "" : "s"
+    );
 }
 
 l_noret luaG_readonlyerror(lua_State* L)
@@ -826,51 +846,74 @@ static size_t append(char* buf, size_t bufsize, size_t offset, const char* data)
     return offset + copy;
 }
 
-const char* lua_debugtrace(lua_State* L)
+// Luwu try expressions: lua_debugtrace's lines for the top `levels` frames, so a `try` expression's traceback stops at
+// the frame that caught the error
+static size_t appendtrace(lua_State* L, char* buf, size_t bufsize, int levels)
 {
-    static char buf[4096];
-
     const int limit1 = 10;
     const int limit2 = 10;
 
     int depth = int(L->ci - L->base_ci);
+    if (depth > levels)
+        depth = levels;
     size_t offset = 0;
 
     lua_Debug ar;
-    for (int level = 0; lua_getinfo(L, level, "sln", &ar); ++level)
+    for (int level = 0; level < levels && lua_getinfo(L, level, "sln", &ar); ++level)
     {
         if (ar.source)
-            offset = append(buf, sizeof(buf), offset, ar.short_src);
+            offset = append(buf, bufsize, offset, ar.short_src);
 
         if (ar.currentline > 0)
         {
             char line[32];
             snprintf(line, sizeof(line), ":%d", ar.currentline);
 
-            offset = append(buf, sizeof(buf), offset, line);
+            offset = append(buf, bufsize, offset, line);
         }
 
         if (ar.name)
         {
-            offset = append(buf, sizeof(buf), offset, " function ");
-            offset = append(buf, sizeof(buf), offset, ar.name);
+            offset = append(buf, bufsize, offset, " function ");
+            offset = append(buf, bufsize, offset, ar.name);
         }
 
-        offset = append(buf, sizeof(buf), offset, "\n");
+        offset = append(buf, bufsize, offset, "\n");
 
         if (depth > limit1 + limit2 && level == limit1 - 1)
         {
             char skip[32];
             snprintf(skip, sizeof(skip), "... (+%d frames)\n", int(depth - limit1 - limit2));
 
-            offset = append(buf, sizeof(buf), offset, skip);
+            offset = append(buf, bufsize, offset, skip);
 
             level = depth - limit2 - 1;
         }
     }
 
+    return offset;
+}
+
+const char* lua_debugtrace(lua_State* L)
+{
+    static char buf[4096];
+
+    size_t offset = appendtrace(L, buf, sizeof(buf), INT_MAX);
+
     LUAU_ASSERT(offset < sizeof(buf));
     buf[offset] = '\0';
 
     return buf;
+}
+
+TString* luaG_traceback(lua_State* L, int levels)
+{
+    char buf[4096];
+    size_t offset = appendtrace(L, buf, sizeof(buf), levels);
+
+    // without the last line's newline
+    if (offset > 0 && buf[offset - 1] == '\n')
+        offset--;
+
+    return luaS_newlstr(L, buf, offset);
 }

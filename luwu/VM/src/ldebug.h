@@ -26,6 +26,7 @@ LUAI_FUNC l_noret luaG_runerroratlua(lua_State* L, const char* msg);
 LUAI_FUNC l_noret luaG_methoderror(lua_State* L, const TValue* p1, const TString* p2);
 LUAI_FUNC l_noret luaG_missingmembererror(lua_State* L, const TValue* p1, const TValue* p2);
 LUAI_FUNC l_noret luaG_instancefieldonclasserror(lua_State* L, const TValue* p1, const TValue* p2);
+LUAI_FUNC l_noret luaG_positionalerror(lua_State* L, const LuauClass* classdef, int position);
 LUAI_FUNC l_noret luaG_readonlyerror(lua_State* L);
 LUAI_FUNC l_noret luaG_privateaccesserror(lua_State* L, const TValue* p2, const TString* className);
 LUAI_FUNC l_noret luaG_constassignerror(lua_State* L, const TValue* p2, const TString* className);
@@ -41,6 +42,8 @@ LUAI_FUNC void luaG_breakpoint(lua_State* L, Proto* p, int line, bool enable);
 LUAI_FUNC bool luaG_onbreak(lua_State* L);
 
 LUAI_FUNC int luaG_getline(Proto* p, int pc);
+// Luwu try expressions: the trace lua_debugtrace writes, for the top `levels` frames only
+LUAI_FUNC TString* luaG_traceback(lua_State* L, int levels);
 
 LUAI_FUNC int luaG_isnative(lua_State* L, int level);
 LUAI_FUNC int luaG_hasnative(lua_State* L, int level);

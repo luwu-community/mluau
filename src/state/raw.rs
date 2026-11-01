@@ -396,18 +396,34 @@ impl RawLua {
     {
         let state = self.state();
         let _sg = StackGuard::new(state);
-        check_stack(state, 6)?;
-
-        let iter = iter.into_iter();
-        let lower_bound = iter.size_hint().0;
-        push_table(state, 0, lower_bound)?;
-        for (k, v) in iter {
-            self.push_at(state, k)?;
-            self.push_at(state, v)?;
-            protect_lua_raw!(state, 3, 1, |state| ffi::lua_rawset(state, -3))?;
-        }
-
+        self.push_table_at(state, iter)?;
         Ok(Table(self.pop_ref()))
+    }
+
+    /// Pushes a table of `iter`'s pairs onto `state` without making a ref, for a value that goes straight to Lua.
+    /// On an error the stack is left as it was.
+    pub(crate) unsafe fn push_table_at<I, K, V>(&self, state: *mut ffi::lua_State, iter: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: IntoLua,
+        V: IntoLua,
+    {
+        check_stack(state, 6)?;
+        let top = ffi::lua_gettop(state);
+        let result = (move || {
+            let iter = iter.into_iter();
+            push_table(state, 0, iter.size_hint().0)?;
+            for (k, v) in iter {
+                self.push_at(state, k)?;
+                self.push_at(state, v)?;
+                protect_lua_raw!(state, 3, 1, |state| ffi::lua_rawset(state, -3))?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            ffi::lua_settop(state, top);
+        }
+        result
     }
 
     /// See [`Lua::create_sequence_from`]
@@ -418,19 +434,68 @@ impl RawLua {
     {
         let state = self.state();
         let _sg = StackGuard::new(state);
-        check_stack(state, 5)?;
+        self.push_sequence_at(state, iter)?;
+        Ok(Table(self.pop_ref()))
+    }
 
-        let iter = iter.into_iter();
-        let lower_bound = iter.size_hint().0;
-        push_table(state, lower_bound, 0)?;
-        for (i, v) in iter.enumerate() {
-            self.push_at(state, v)?;
-            protect_lua_raw!(state, 2, 1, |state| {
-                ffi::lua_rawseti(state, -2, (i + 1) as Integer);
-            })?;
+    /// Pushes a sequence table of `iter`'s values onto `state` without making a ref, for a value that goes straight
+    /// to Lua. On an error the stack is left as it was.
+    pub(crate) unsafe fn push_sequence_at<T, I>(&self, state: *mut ffi::lua_State, iter: I) -> Result<()>
+    where
+        T: IntoLua,
+        I: IntoIterator<Item = T>,
+    {
+        check_stack(state, 5)?;
+        let top = ffi::lua_gettop(state);
+        let result = (move || {
+            let iter = iter.into_iter();
+            push_table(state, iter.size_hint().0, 0)?;
+            for (i, v) in iter.enumerate() {
+                self.push_at(state, v)?;
+                protect_lua_raw!(state, 2, 1, |state| {
+                    ffi::lua_rawseti(state, -2, (i + 1) as Integer);
+                })?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            ffi::lua_settop(state, top);
+        }
+        result
+    }
+
+    /// Pushes a new userdata holding `data`, with `metatable`, onto `state` without making a ref. Used by
+    /// `Lua::create_any_userdata_with_tag` and by userdata returned straight to Lua.
+    pub(crate) unsafe fn push_any_userdata_at<T: 'static, const TAG: c_int>(
+        &self,
+        state: *mut ffi::lua_State,
+        data: T,
+        metatable: Option<&Table>,
+    ) -> Result<()> {
+        check_stack(state, 3)?;
+
+        // If not default tag, set dtor lazily
+        if const { TAG != crate::USERDATA2_TAG } {
+            let is_registered = &(*self.extra()).registered_tags[TAG as usize];
+            if !is_registered.get() {
+                ExtraData::set_userdata_dtor(state, TAG);
+                is_registered.set(true);
+            }
         }
 
-        Ok(Table(self.pop_ref()))
+        // Create ud_ptr, then use place_into_gc_memory to write data onto the GC allocated memory. Only stack-relative
+        // indices are used, so it runs in place instead of in a new call frame.
+        protect_lua_raw!(state, 0, 1, |state| {
+            let ud_ptr = ffi::lua_newuserdatatagged(state, crate::types::ErasedHeader::wrapper_size::<T>(), TAG);
+            crate::types::ErasedHeader::place_into_gc_memory(ud_ptr, data);
+
+            // Set metatable if we have one
+            if let Some(mt) = metatable {
+                self.push_ref_at(&mt.0, state);
+                ffi::lua_setmetatable(state, -2);
+            }
+        })?;
+        Ok(())
     }
 
     // Creates a sequence of strings in one protected call: no Rust code but `AsRef` runs inside it

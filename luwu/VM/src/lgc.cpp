@@ -628,7 +628,8 @@ static size_t propagatemark(global_State* g)
         traverseproto(g, p);
 
         return sizeof(Proto) + sizeof(Instruction) * p->sizecode + sizeof(Proto*) * p->sizep + sizeof(TValue) * p->sizek + p->sizelineinfo +
-               sizeof(LocVar) * p->sizelocvars + sizeof(TString*) * p->sizeupvalues + p->sizetypeinfo;
+               sizeof(LocVar) * p->sizelocvars + sizeof(TString*) * p->sizeupvalues + p->sizetypeinfo +
+               sizeof(LuauTryRange) * p->sizetryranges;
     }
     case LUA_TCLASS:
     {
@@ -716,7 +717,7 @@ static void tableresizeprotected(lua_State* L, LuaTable* t, int nhsize)
 ** clear collected entries from weaktables
 */
 // Luwu table presizing: forgets the last tables of the marked protos' sites that are about to be collected. Only this
-// empties g->sitedprotos: a mark that luaC_fullgc abandons keeps its protos listed, which is safe because the sweep that
+// empties g->sitedprotos: a mark that luaC_fullgc abandons leaves its protos listed, which is safe because the sweep that
 // follows it frees nothing. Emptying the list anywhere else would leave protos marked as listed but off it, never
 // cleared, with sites pointing at freed tables.
 static size_t cleartablesites(global_State* g)

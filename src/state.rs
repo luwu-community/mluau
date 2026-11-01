@@ -1223,28 +1223,7 @@ impl Lua {
         let state = lua.state();
         unsafe {
             let _sg = StackGuard::new(state);
-            check_stack(state, 3)?;
-
-            // If not default tag, set dtor lazily
-            if const { TAG != USERDATA2_TAG } {
-                let is_registered = &(*lua.extra()).registered_tags[TAG as usize];
-                if !is_registered.get() {
-                    ExtraData::set_userdata_dtor(state, TAG);
-                    is_registered.set(true);
-                }
-            }
-                
-            // Create ud_ptr, then use place_into_gc_memory to write data onto the GC allocated memory
-            protect_lua!(state, 0, 1, |state| {
-                let ud_ptr = ffi::lua_newuserdatatagged(state, crate::types::ErasedHeader::wrapper_size::<T>(), TAG);
-                crate::types::ErasedHeader::place_into_gc_memory(ud_ptr, data);
-
-                // Set metatable if we have one
-                if let Some(mt) = metatable {
-                    lua.push_ref_at(&mt.0, state);
-                    ffi::lua_setmetatable(state, -2);
-                }
-            })?;
+            lua.push_any_userdata_at::<T, TAG>(state, data, metatable)?;
             Ok(AnyUserData(lua.pop_ref()))
         }
     }

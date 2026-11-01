@@ -379,6 +379,16 @@ struct FeedbackVectorSlot
     };
 };
 
+// Luwu try expressions: an error raised while the function runs [startpc, endpc) resumes at handlerpc, with the error
+// in register target and where it was raised in the three registers after it (see LOP_WRAPRESULT)
+struct LuauTryRange
+{
+    uint32_t startpc;
+    uint32_t endpc;
+    uint32_t handlerpc;
+    uint8_t target;
+};
+
 /*
 ** Function Prototypes
 */
@@ -461,6 +471,10 @@ typedef struct Proto
     Proto* optimized;
     Proto* deoptimized;
     uint64_t cost;
+
+    // Luwu try expressions: the protected ranges, innermost first where they nest; NULL when there are none
+    LuauTryRange* tryranges;
+    int sizetryranges;
 } Proto;
 // clang-format on
 
@@ -765,6 +779,13 @@ typedef struct LuauClass
     // (LBC_NEWCLASSMEMBER_TRAITCOPY), keyed by the trait's own closure, for luaR_implementtraits to use instead of copying
     // those functions. Only set while the class statement runs: implementing drops it. Marked in traverseclass.
     struct LuaTable* compiledtraitcopies;
+
+    // Luwu Destructuring (rfcs/destructuring.md): what a positional pattern `.(a, b)` reads from an object of this class.
+    // `positionalmembers[i]` is the offset of the member at position i: a primary constructor's parameters, in order.
+    // `numberofpositional` is -1 for a class whose objects can't be destructured positionally (no primary constructor),
+    // and `positionalmembers` is NULL while it's 0 or less. Owned by this class object; freed in luaR_freeclass.
+    uint32_t* positionalmembers;
+    int numberofpositional;
 
     // Luwu collections: the number field `#` reads for a builtin container (vec, vecdeque, orderedmap) instead of
     // calling its `__len`, which returns the same number. LUAR_NO_LENGTH_FIELD for every other class.

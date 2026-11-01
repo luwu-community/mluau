@@ -588,6 +588,8 @@ public:
     AstArray<AstExpr*> args;
     bool self;
     Location argLocation;
+    // Luwu collections: `.(a, b)`, which the parser writes as `collections.pair(a, b)` (Parser::parseDotPositional)
+    bool fromDotPositional = false;
     // Luwu match expressions: a call the parser wrote for a type test (`x is Point` is `class.isinstance(x, Point)`),
     // not one in the code. Editor features that show a call's parameters skip it.
     bool fromTypeTest = false;
@@ -630,6 +632,11 @@ public:
 
     AstExpr* expr;
     AstExpr* index;
+
+    // Luwu Destructuring (rfcs/destructuring.md): an element of a positional pattern `.(a, b)`, read from `expr` at the
+    // constant position `index`. For an object, that's the member its class's primary constructor takes at that position
+    // (LOP_GETPOSITIONAL); for anything else it's `expr[index]`.
+    bool positional = false;
 };
 
 class AstExprFunction : public AstExpr
@@ -668,6 +675,8 @@ public:
     AstArray<AstLocal*> args;
     AstArray<AstExpr*> argsDefaults;
     AstTypePack* returnAnnotation = nullptr;
+    // Luwu try expressions: the errors `! E` says the function raises, or nullptr
+    AstType* errorHint = nullptr;
     bool vararg = false;
     Location varargLocation;
     AstTypePack* varargAnnotation;
@@ -870,6 +879,21 @@ public:
     /// `strings` will always have one more element than `expressions`.
     AstArray<AstArray<char>> strings;
     AstArray<AstExpr*> expressions;
+};
+
+// Luwu try expressions: `try expr`, a `collections.result` holding expr's value, or the error evaluating it raised
+class AstExprTry : public AstExpr
+{
+public:
+    LUAU_RTTI(AstExprTry)
+
+    AstExprTry(const Location& location, const Location& tryLocation, AstExpr* expr);
+
+    void visit(AstVisitor* visitor) override;
+
+    // The `try` keyword
+    Location tryLocation;
+    AstExpr* expr;
 };
 
 // f<<T>>
@@ -1112,11 +1136,14 @@ struct AstDestructurePattern
     // False when the `}` is missing, as it is while a pattern is being written: `location` then ends where the
     // pattern stopped, and a cursor there is still inside it.
     bool closed = true;
+    // `.(a, b)`: the fields are elements read by position, in order, and have no keys.
+    bool positional = false;
     AstArray<AstDestructureField> fields{nullptr, 0};
 };
 
 struct AstDestructureField
 {
+    // Empty for an element of a positional pattern, whose `keyLocation` is where the element starts.
     AstName key;
     Location keyLocation;
     // The `as` keyword, when the field is bound under another name or only destructured.
@@ -1506,6 +1533,8 @@ public:
     bool vararg = false;
     Location varargLocation;
     AstTypePack* retTypes;
+    // Luwu try expressions: the errors `! E` says the function raises, or nullptr
+    AstType* errorHint = nullptr;
 
     // Location of the leading 'declare' keyword token only.
     Location declareLocation;
@@ -1875,6 +1904,8 @@ public:
     AstTypeList argTypes;
     AstArray<std::optional<AstArgumentName>> argNames;
     AstTypePack* returnTypes;
+    // Luwu try expressions: the errors `! E` says the function raises, or nullptr
+    AstType* errorHint = nullptr;
 };
 
 class AstTypeTypeof : public AstType
@@ -2256,6 +2287,10 @@ public:
         return visit(static_cast<AstExpr*>(node));
     }
     virtual bool visit(class AstExprInstantiate* node)
+    {
+        return visit(static_cast<AstExpr*>(node));
+    }
+    virtual bool visit(class AstExprTry* node)
     {
         return visit(static_cast<AstExpr*>(node));
     }

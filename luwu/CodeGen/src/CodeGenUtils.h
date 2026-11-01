@@ -39,6 +39,7 @@ const Instruction* executeFORGPREP(lua_State* L, const Instruction* pc, StkId ba
 const Instruction* executeNEWOBJECT(lua_State* L, const Instruction* pc, StkId base, TValue* k);
 const Instruction* executeNEWCLASSMEMBER(lua_State* L, const Instruction* pc, StkId base, TValue* k);
 const Instruction* executeINITTRAITS(lua_State* L, const Instruction* pc, StkId base, TValue* k);
+const Instruction* executeGETPOSITIONAL(lua_State* L, const Instruction* pc, StkId base, TValue* k);
 const Instruction* executePRESIZETABLE(lua_State* L, const Instruction* pc, StkId base, TValue* k);
 const Instruction* executePUSH(lua_State* L, const Instruction* pc, StkId base, TValue* k);
 const Instruction* executePOP(lua_State* L, const Instruction* pc, StkId base, TValue* k);

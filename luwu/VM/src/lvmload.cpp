@@ -264,6 +264,8 @@ struct BytecodeFeatures
     bool feedbackVector = false;
     bool protoSizePrefix = false;
     bool inlineCost = false;
+    // Luwu try expressions: each function's protected ranges, after its inlining cost
+    bool tryRanges = false;
 };
 
 static BytecodeFeatures getLegacyFeatures(uint8_t version)
@@ -277,13 +279,14 @@ static BytecodeFeatures getLegacyFeatures(uint8_t version)
     return features;
 }
 
-static BytecodeFeatures getLuwuFeatures()
+static BytecodeFeatures getLuwuFeatures(uint8_t luwuVersion)
 {
     BytecodeFeatures features;
     features.typeInfo = true;
     features.feedbackVector = true;
     features.protoSizePrefix = true;
     features.inlineCost = true;
+    features.tryRanges = luwuVersion == LWBC_VERSION_WIP;
     return features;
 }
 
@@ -443,7 +446,7 @@ static int loadsafe(
                 LWBC_VERSION_WIP
             );
 
-        features = getLuwuFeatures();
+        features = getLuwuFeatures(luwuVersion);
     }
     else if (version >= LBC_VERSION_MIN && version <= LBC_VERSION_MAX)
     {
@@ -807,18 +810,29 @@ static int loadsafe(
                 bool hasCustomInit = false;
                 size_t peekOffset = offset;
                 bool hasConstDefaults = false;
+                bool hasPrimaryInit = false;
+                int numPositional = 0;
 
                 for (uint32_t idx = 0; idx < numMembers; idx++)
                 {
                     uint32_t mid = readVarInt(data, size, peekOffset);
                     uint32_t flags = readVarInt(data, size, peekOffset);
-                    hasCustomInit |= tsvalue(&p->k[mid]) == initName;
+                    bool isInit = tsvalue(&p->k[mid]) == initName;
+                    hasCustomInit |= isInit;
+                    hasPrimaryInit |= isInit && (flags & LBC_CLASSMEMBER_PRIMARYINIT) != 0;
 
                     // a constant default is stored inline right after its member's flags
                     if (flags & LBC_CLASSMEMBER_CONSTDEFAULT)
                     {
                         readVarInt(data, size, peekOffset);
                         hasConstDefaults = true;
+                    }
+
+                    // so is a primary constructor parameter's position
+                    if (idx < numProperties && (flags & LBC_CLASSMEMBER_POSITIONAL))
+                    {
+                        readVarInt(data, size, peekOffset);
+                        numPositional++;
                     }
                 }
 
@@ -831,6 +845,11 @@ static int loadsafe(
                 // Luwu Traits (rfcs/classes/traits.md): read by luaR_sealclassshape below
                 lco->istrait = (shapeFlags & LBC_CLASSSHAPE_TRAIT) != 0;
                 lco->traitspending = (shapeFlags & LBC_CLASSSHAPE_IMPLEMENTS) != 0;
+
+                // Luwu Destructuring (rfcs/destructuring.md): only a primary constructor's parameters have positions
+                LUAU_ASSERT(hasPrimaryInit || numPositional == 0);
+                if (hasPrimaryInit)
+                    luaR_newpositionalmembers(L, lco, numPositional);
 
                 // Members are written properties-first, so index idx here is exactly the member's runtime
                 // offset.
@@ -849,6 +868,13 @@ static int loadsafe(
                         // a constant field default; its own constant is written before the shape, so it's
                         // already loaded
                         setobj(L, &lco->memberdefaults[idx], &p->k[did]);
+                    }
+
+                    if (idx < numProperties && (lco->memberflags[idx] & LBC_CLASSMEMBER_POSITIONAL))
+                    {
+                        uint32_t position = readVarInt(data, size, offset);
+                        LUAU_ASSERT(int(position) < lco->numberofpositional);
+                        lco->positionalmembers[position] = idx;
                     }
 
                     TValue* val = luaH_setstr(L, lco->memberstooffset, tsvalue(memberName));
@@ -1018,6 +1044,28 @@ static int loadsafe(
         {
             if ((p->flags & LPF_INLINABLE) != 0)
                 p->cost = readVarInt64(data, size, offset);
+        }
+
+        if (features.tryRanges)
+        {
+            int sizetryranges = readVarInt(data, size, offset);
+
+            if (sizetryranges > 0)
+            {
+                p->tryranges = luaM_newarray(L, sizetryranges, LuauTryRange, p->memcat);
+                p->sizetryranges = sizetryranges;
+
+                for (int j = 0; j < sizetryranges; ++j)
+                {
+                    LuauTryRange& range = p->tryranges[j];
+                    range.startpc = readVarInt(data, size, offset);
+                    range.endpc = readVarInt(data, size, offset);
+                    range.handlerpc = readVarInt(data, size, offset);
+                    range.target = read<uint8_t>(data, size, offset);
+                    LUAU_ASSERT(range.startpc < range.endpc && range.endpc <= range.handlerpc);
+                    LUAU_ASSERT(range.handlerpc < uint32_t(p->sizecode) && range.target + 3 < p->maxstacksize);
+                }
+            }
         }
 
         if (features.protoSizePrefix)

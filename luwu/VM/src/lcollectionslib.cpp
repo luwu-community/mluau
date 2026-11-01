@@ -309,46 +309,47 @@ static int containertostring(lua_State* L, LuauObject* container, uint32_t count
 // pair, triple and quad: `first` to `fourth`, public and const
 
 template<LuwuBuiltinClass Kind>
-static LuauObject* checktuple(lua_State* L, const char* method)
+static LuauObject* checkbundle(lua_State* L, const char* method)
 {
     return luaR_checknativeself(L, builtinclass(L, Kind), method);
 }
 
-// `__init` is only ever called by construction, with a new object of the class: it can't be read as a member
-static int tupleinit(lua_State* L)
+// `__init` is only ever called by construction, with a new object of the class: it can't be read as a member. Also
+// `err`'s, which fills its error and position fields in order.
+static int bundleinit(lua_State* L)
 {
-    LuauObject* tuple = objectvalue(L->base);
+    LuauObject* bundle = objectvalue(L->base);
     int nargs = lua_gettop(L) - 1;
-    for (uint32_t i = 0; i < tuple->numberofmembers && int(i) < nargs; i++)
-        setfield(L, tuple, i, L->base + 1 + i);
+    for (uint32_t i = 0; i < bundle->numberofmembers && int(i) < nargs; i++)
+        setfield(L, bundle, i, L->base + 1 + i);
     return 0;
 }
 
 template<LuwuBuiltinClass Kind>
-static int tupleeq(lua_State* L)
+static int bundleeq(lua_State* L)
 {
-    LuauObject* tuple = checktuple<Kind>(L, "__eq");
+    LuauObject* bundle = checkbundle<Kind>(L, "__eq");
     const TValue* other = L->base + 1;
-    bool equal = ttisobject(other) && objectvalue(other)->lclass == tuple->lclass;
-    for (uint32_t i = 0; equal && i < tuple->numberofmembers; i++)
-        equal = equalobj(L, &luaR_members(tuple)[i], &luaR_members(objectvalue(other))[i]);
+    bool equal = ttisobject(other) && objectvalue(other)->lclass == bundle->lclass;
+    for (uint32_t i = 0; equal && i < bundle->numberofmembers; i++)
+        equal = equalobj(L, &luaR_members(bundle)[i], &luaR_members(objectvalue(other))[i]);
     lua_pushboolean(L, equal);
     return 1;
 }
 
 template<LuwuBuiltinClass Kind>
-static int tupletostring(lua_State* L)
+static int bundletostring(lua_State* L)
 {
-    LuauObject* tuple = checktuple<Kind>(L, "__tostring");
+    LuauObject* bundle = checkbundle<Kind>(L, "__tostring");
     luaL_Strbuf b;
     luaL_buffinit(L, &b);
-    luaL_addstring(&b, getstr(tuple->lclass->name));
+    luaL_addstring(&b, getstr(bundle->lclass->name));
     luaL_addchar(&b, '(');
-    for (uint32_t i = 0; i < tuple->numberofmembers; i++)
+    for (uint32_t i = 0; i < bundle->numberofmembers; i++)
     {
         if (i > 0)
             luaL_addstring(&b, ", ");
-        luaA_pushvalue(L, &luaR_members(tuple)[i]);
+        luaA_pushvalue(L, &luaR_members(bundle)[i]);
         addshowntop(&b);
     }
     luaL_addchar(&b, ')');
@@ -356,13 +357,13 @@ static int tupletostring(lua_State* L)
     return 1;
 }
 
-// Every slot in order, `nil` included: a tuple's size is fixed. Starting a loop allocates nothing because `__iter` is
-// also the iterator it returns. The VM calls `__iter` with the tuple alone, and the iterator with the tuple and the
+// Every slot in order, `nil` included: a bundle's size is fixed. Starting a loop allocates nothing because `__iter` is
+// also the iterator it returns. The VM calls `__iter` with the bundle alone, and the iterator with the bundle and the
 // previous position.
 template<LuwuBuiltinClass Kind>
-static int tupleiter(lua_State* L)
+static int bundleiter(lua_State* L)
 {
-    LuauObject* tuple = checktuple<Kind>(L, "__iter");
+    LuauObject* bundle = checkbundle<Kind>(L, "__iter");
     if (lua_gettop(L) == 1)
     {
         luaA_pushvalue(L, L->ci->func);
@@ -373,42 +374,45 @@ static int tupleiter(lua_State* L)
 
     double position = lua_isnil(L, 2) ? 1 : luaL_checknumber(L, 2) + 1;
     int index = int(position);
-    if (index != position || index < 1 || uint32_t(index) > tuple->numberofmembers)
+    if (index != position || index < 1 || uint32_t(index) > bundle->numberofmembers)
         return 0;
 
     lua_pushnumber(L, position);
-    luaA_pushvalue(L, &luaR_members(tuple)[index - 1]);
+    luaA_pushvalue(L, &luaR_members(bundle)[index - 1]);
     return 2;
 }
 
-static const uint8_t kTupleField = LBC_CLASSMEMBER_CONST;
+// Luwu Destructuring (rfcs/destructuring.md): a pair's, triple's or quad's elements and an option's or result's payload are read by `.(a, b)`
+static const uint8_t kBundleField = LBC_CLASSMEMBER_CONST | LBC_CLASSMEMBER_POSITIONAL;
 static const uint8_t kPrivateField = LBC_CLASSMEMBER_PRIVATE;
+// An option's or result's payload, readable as `value` (`error` for `err`) like a bundle's elements
+static const uint8_t kPayloadField = LBC_CLASSMEMBER_CONST | LBC_CLASSMEMBER_POSITIONAL;
 
 static const luaR_NativeMember kPairMembers[] = {
-    {"first", NULL, kTupleField},
-    {"second", NULL, kTupleField},
-    {"__eq", tupleeq<LUWU_BUILTIN_PAIR>, 0},
-    {"__iter", tupleiter<LUWU_BUILTIN_PAIR>, 0},
-    {"__tostring", tupletostring<LUWU_BUILTIN_PAIR>, 0},
+    {"first", NULL, kBundleField},
+    {"second", NULL, kBundleField},
+    {"__eq", bundleeq<LUWU_BUILTIN_PAIR>, 0},
+    {"__iter", bundleiter<LUWU_BUILTIN_PAIR>, 0},
+    {"__tostring", bundletostring<LUWU_BUILTIN_PAIR>, 0},
 };
 
 static const luaR_NativeMember kTripleMembers[] = {
-    {"first", NULL, kTupleField},
-    {"second", NULL, kTupleField},
-    {"third", NULL, kTupleField},
-    {"__eq", tupleeq<LUWU_BUILTIN_TRIPLE>, 0},
-    {"__iter", tupleiter<LUWU_BUILTIN_TRIPLE>, 0},
-    {"__tostring", tupletostring<LUWU_BUILTIN_TRIPLE>, 0},
+    {"first", NULL, kBundleField},
+    {"second", NULL, kBundleField},
+    {"third", NULL, kBundleField},
+    {"__eq", bundleeq<LUWU_BUILTIN_TRIPLE>, 0},
+    {"__iter", bundleiter<LUWU_BUILTIN_TRIPLE>, 0},
+    {"__tostring", bundletostring<LUWU_BUILTIN_TRIPLE>, 0},
 };
 
 static const luaR_NativeMember kQuadMembers[] = {
-    {"first", NULL, kTupleField},
-    {"second", NULL, kTupleField},
-    {"third", NULL, kTupleField},
-    {"fourth", NULL, kTupleField},
-    {"__eq", tupleeq<LUWU_BUILTIN_QUAD>, 0},
-    {"__iter", tupleiter<LUWU_BUILTIN_QUAD>, 0},
-    {"__tostring", tupletostring<LUWU_BUILTIN_QUAD>, 0},
+    {"first", NULL, kBundleField},
+    {"second", NULL, kBundleField},
+    {"third", NULL, kBundleField},
+    {"fourth", NULL, kBundleField},
+    {"__eq", bundleeq<LUWU_BUILTIN_QUAD>, 0},
+    {"__iter", bundleiter<LUWU_BUILTIN_QUAD>, 0},
+    {"__tostring", bundletostring<LUWU_BUILTIN_QUAD>, 0},
 };
 
 // orderedmap: a map in an order the user decides. Every entry has an id that stays the same while it exists, the
@@ -933,7 +937,7 @@ static const luaR_NativeMember kOrderedMapMembers[] = {
     {"__iter", orderedmapiter, 0},
 };
 
-// vec and vecdeque keep their entries in a storage block (LuauStorage) from the first value on. Its capacity is a power
+// vec and vecdeque store their entries in a storage block (LuauStorage) from the first value on. Its capacity is a power
 // of two. The entry `i` places from the front (from 0) is in slot (head + i) & (capacity - 1) (luaR_storageentry): a
 // vecdeque's entries wrap around the block's end, and a vec's start at slot 0 with head 0.
 
@@ -985,7 +989,7 @@ static LuauStorage* newstorage(lua_State* L, LuauObject* container, int idx)
     return storage;
 }
 
-// Gives the block `capacity` slots, enough for every entry. The entries keep their positions: when the block grows,
+// Gives the block `capacity` slots, enough for every entry. The entries don't move: when the block grows,
 // the ones that wrapped around its old end move after it.
 static LuauStorage* resizestorage(lua_State* L, LuauObject* container, uint32_t capacity)
 {
@@ -1037,7 +1041,7 @@ static void storeentry(lua_State* L, LuauObject* container, TValue* slot, const 
     luaC_barrier(L, container, value);
 }
 
-// Empties `container`, keeping its element type, and shrinks a grown block back
+// Empties `container` without changing its element type, and shrinks a grown block back
 static void clearstorage(lua_State* L, LuauObject* container)
 {
     LuauStorage* storage = luaR_storage(container);
@@ -1464,10 +1468,15 @@ static const luaR_NativeMember kVecMembers[] = {
 // option and result. A full option is a `some` object and an empty one is the `none` primitive itself, so an empty
 // option allocates nothing. `none` gets `get` and `expect` through its type's metatable, whose `__index` only runs when
 // code indexes `none`, which is otherwise an error: nothing else `none` does gets slower. A result is an `ok` or an
-// `err` object. Each holds its value in its one field.
+// `err` object. Each holds its value in its first field. An `err` also has where its error was raised, which a `try`
+// expression fills in.
 
-// The one field of a `some`, `ok` or `err`
+// The first field of a `some`, `ok` or `err`
 static const int kPayload = 0;
+// `err`'s position fields, after its error
+static const int kErrModule = 1;
+static const int kErrLine = 2;
+static const int kErrTraceback = 3;
 
 template<LuwuBuiltinClass Kind>
 static LuauObject* checkpayload(lua_State* L, const char* method)
@@ -1475,11 +1484,16 @@ static LuauObject* checkpayload(lua_State* L, const char* method)
     return luaR_checknativeself(L, builtinclass(L, Kind), method);
 }
 
-// `__init` for `ok` and `err`, which hold any value
+// `__init` for `ok`, which holds any value
 static int payloadinit(lua_State* L)
 {
     setfield(L, objectvalue(L->base), kPayload, L->base + 1);
     return 0;
+}
+
+static void formatsomemissing(lua_State* L, char (&message)[LUA_BUFFERSIZE], int type)
+{
+    snprintf(message, sizeof(message), "option.some needs a value, but you passed %s", getstr(L->global->ttname[type]));
 }
 
 // `__init` runs under the class's C constructor, so its error is raised at the Lua code constructing
@@ -1488,18 +1502,51 @@ static int someinit(lua_State* L)
     if (lua_gettop(L) < 2 || isnovalue(L->base + 1))
     {
         char message[LUA_BUFFERSIZE];
-        int type = lua_gettop(L) < 2 ? LUA_TNIL : ttype(L->base + 1);
-        snprintf(message, sizeof(message), "option.some needs a value, but you passed %s", getstr(L->global->ttname[type]));
+        formatsomemissing(L, message, lua_gettop(L) < 2 ? LUA_TNIL : ttype(L->base + 1));
         luaG_runerroratlua(L, message);
     }
     return payloadinit(L);
 }
 
-// `get` and `expect` of a `some` or an `ok`: the value
+LuauObject* luaR_newpayload(lua_State* L, LuwuBuiltinClass kind, const TValue* value)
+{
+    LuauClass* classdef = builtinclass(L, kind);
+    if (!classdef)
+        luaG_runerror(L, "open the collections library before building an option or result");
+
+    if (kind == LUWU_BUILTIN_SOME && isnovalue(value))
+    {
+        char message[LUA_BUFFERSIZE];
+        formatsomemissing(L, message, ttype(value));
+        luaG_runerror(L, "%s", message);
+    }
+
+    // A new object is white, so storing into it needs no barrier
+    LuauObject* object = luaR_newobjectuninit(L, classdef);
+    TValue* members = luaR_members(object);
+    setobj(L, &members[kPayload], value);
+    for (int i = kPayload + 1; i < int(object->numberofmembers); i++)
+        setnilvalue(&members[i]);
+    return object;
+}
+
+const TValue* luaR_payload(lua_State* L, const TValue* value)
+{
+    if (!ttisobject(value))
+        return NULL;
+
+    LuauObject* object = objectvalue(value);
+    bool holdsPayload = object->lclass == builtinclass(L, LUWU_BUILTIN_SOME) || object->lclass == builtinclass(L, LUWU_BUILTIN_OK) ||
+                        object->lclass == builtinclass(L, LUWU_BUILTIN_ERR);
+    return holdsPayload ? &luaR_members(object)[kPayload] : NULL;
+}
+
+// `get` of a `some` and `ok` of an `ok`: the value
 template<LuwuBuiltinClass Kind>
 static int payloadget(lua_State* L)
 {
-    luaA_pushvalue(L, &luaR_members(checkpayload<Kind>(L, "get"))[kPayload]);
+    const char* method = Kind == LUWU_BUILTIN_SOME ? "get" : "ok";
+    luaA_pushvalue(L, &luaR_members(checkpayload<Kind>(L, method))[kPayload]);
     return 1;
 }
 
@@ -1523,7 +1570,8 @@ static int payloadeq(lua_State* L)
     return 1;
 }
 
-// `__tostring`: the constructor call, `option.some(1)`
+// `__tostring`: the constructor call, `option.some(1)`. An `err` adds where its error was raised when it knows, and
+// the traceback on the lines after.
 template<LuwuBuiltinClass Kind>
 static int payloadtostring(lua_State* L)
 {
@@ -1536,6 +1584,28 @@ static int payloadtostring(lua_State* L)
     luaA_pushvalue(L, &luaR_members(holder)[kPayload]);
     addshowntop(&b);
     luaL_addchar(&b, ')');
+
+    if (Kind == LUWU_BUILTIN_ERR)
+    {
+        const TValue* members = luaR_members(holder);
+        if (ttisstring(&members[kErrModule]))
+        {
+            luaL_addstring(&b, " at ");
+            luaL_addstring(&b, svalue(&members[kErrModule]));
+            if (ttisnumber(&members[kErrLine]))
+            {
+                char line[32];
+                snprintf(line, sizeof(line), ":%d", int(nvalue(&members[kErrLine])));
+                luaL_addstring(&b, line);
+            }
+        }
+        if (ttisstring(&members[kErrTraceback]))
+        {
+            luaL_addchar(&b, '\n');
+            luaL_addstring(&b, svalue(&members[kErrTraceback]));
+        }
+    }
+
     luaL_pushresult(&b);
     return 1;
 }
@@ -1548,10 +1618,10 @@ static int okerr(lua_State* L)
     return 1;
 }
 
-// `get` of an `err`: there's no value
-static int errget(lua_State* L)
+// `ok` of an `err`: there's no value
+static int errok(lua_State* L)
 {
-    checkpayload<LUWU_BUILTIN_ERR>(L, "get");
+    checkpayload<LUWU_BUILTIN_ERR>(L, "ok");
     lua_pushsymnone(L);
     return 1;
 }
@@ -1598,7 +1668,7 @@ static int nonefast(lua_State* L, LuauObject* holder, StkId res, StkId args, int
 }
 
 static const luaR_NativeMember kSomeMembers[] = {
-    {"value", NULL, kPrivateField},
+    {"value", NULL, kPayloadField},
     {"get", payloadget<LUWU_BUILTIN_SOME>, 0, payloadgetfast},
     {"expect", payloadexpect<LUWU_BUILTIN_SOME>, 0, payloadexpectfast},
     {"__eq", payloadeq<LUWU_BUILTIN_SOME>, 0},
@@ -1606,8 +1676,8 @@ static const luaR_NativeMember kSomeMembers[] = {
 };
 
 static const luaR_NativeMember kOkMembers[] = {
-    {"value", NULL, kPrivateField},
-    {"get", payloadget<LUWU_BUILTIN_OK>, 0, payloadgetfast},
+    {"value", NULL, kPayloadField},
+    {"ok", payloadget<LUWU_BUILTIN_OK>, 0, payloadgetfast},
     {"expect", payloadexpect<LUWU_BUILTIN_OK>, 0, payloadexpectfast},
     {"err", okerr, 0, nonefast},
     {"__eq", payloadeq<LUWU_BUILTIN_OK>, 0},
@@ -1615,8 +1685,11 @@ static const luaR_NativeMember kOkMembers[] = {
 };
 
 static const luaR_NativeMember kErrMembers[] = {
-    {"error", NULL, kPrivateField},
-    {"get", errget, 0, nonefast},
+    {"error", NULL, kPayloadField},
+    {"module", NULL, kPayloadField},
+    {"line", NULL, kPayloadField},
+    {"traceback", NULL, kPayloadField},
+    {"ok", errok, 0, nonefast},
     {"expect", errexpect, 0},
     {"err", errerr, 0, payloadgetfast},
     {"__eq", payloadeq<LUWU_BUILTIN_ERR>, 0},
@@ -1768,9 +1841,9 @@ static void addclass(
 int luaopen_collections(lua_State* L)
 {
     lua_createtable(L, 0, 8);
-    addclass(L, LUWU_BUILTIN_PAIR, "pair", kPairMembers, tupleinit);
-    addclass(L, LUWU_BUILTIN_TRIPLE, "triple", kTripleMembers, tupleinit);
-    addclass(L, LUWU_BUILTIN_QUAD, "quad", kQuadMembers, tupleinit);
+    addclass(L, LUWU_BUILTIN_PAIR, "pair", kPairMembers, bundleinit);
+    addclass(L, LUWU_BUILTIN_TRIPLE, "triple", kTripleMembers, bundleinit);
+    addclass(L, LUWU_BUILTIN_QUAD, "quad", kQuadMembers, bundleinit);
     addclass(L, LUWU_BUILTIN_ORDEREDMAP, "orderedmap", kOrderedMapMembers, orderedmapinit, OM_COUNT);
     addclass(L, LUWU_BUILTIN_VEC, "vec", kVecMembers, vecinit);
     addclass(L, LUWU_BUILTIN_VECDEQUE, "vecdeque", kVecDequeMembers, vecdequeinit);
@@ -1783,7 +1856,7 @@ int luaopen_collections(lua_State* L)
 
     lua_createtable(L, 0, 2);
     addclass(L, LUWU_BUILTIN_OK, "ok", kOkMembers, payloadinit);
-    addclass(L, LUWU_BUILTIN_ERR, "err", kErrMembers, payloadinit);
+    addclass(L, LUWU_BUILTIN_ERR, "err", kErrMembers, bundleinit);
     lua_setfield(L, -2, "result");
 
     setnonemetatable(L);

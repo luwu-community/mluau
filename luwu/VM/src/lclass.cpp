@@ -72,6 +72,8 @@ LuauClass* luaR_newclass(
     classdef->numoverriddenconsts = 0;
     classdef->traitdefaults = NULL;
     classdef->compiledtraitcopies = NULL;
+    classdef->positionalmembers = NULL;
+    classdef->numberofpositional = -1;
     classdef->lengthfield = LUAR_NO_LENGTH_FIELD;
     classdef->fastmethods = NULL;
 
@@ -174,7 +176,24 @@ void luaR_sealclassshape(lua_State* L, LuauClass* classdef)
         classdef->hasprivatemembers = true;
     }
 
+    for (int i = 0; i < classdef->numberofpositional; i++)
+        LUAU_ASSERT(classdef->positionalmembers[i] < classdef->numberofinstancemembers);
+
     classdef->memberstooffset->readonly = true;
+}
+
+void luaR_newpositionalmembers(lua_State* L, LuauClass* classdef, int count)
+{
+    LUAU_ASSERT(classdef->numberofpositional == -1 && count >= 0);
+
+    if (count > 0)
+    {
+        classdef->positionalmembers = luaM_newarray(L, count, uint32_t, classdef->memcat);
+        for (int i = 0; i < count; i++)
+            classdef->positionalmembers[i] = UINT32_MAX;
+    }
+
+    classdef->numberofpositional = count;
 }
 
 size_t luaR_classsize(const LuauClass* classdef)
@@ -192,6 +211,8 @@ size_t luaR_classsize(const LuauClass* classdef)
            // ... plus what it keeps about the traits it implements ...
            (classdef->numtraits * sizeof(LuauClass*)) + (classdef->numtraitinits * (sizeof(TValue) + 2 * sizeof(uint32_t))) +
            (classdef->numoverriddenconsts * sizeof(uint32_t)) +
+           // ... plus the offsets of its positional members ...
+           (classdef->positionalmembers ? classdef->numberofpositional * sizeof(uint32_t) : 0) +
            // ... plus a builtin class's fast methods.
            (classdef->fastmethods ? classdef->numberofallmembers * sizeof(luaR_FastMethod) : 0);
 }
@@ -957,6 +978,8 @@ void luaR_freeclass(lua_State* L, LuauClass* classdef, lua_Page* page)
         luaM_freearray(L, classdef->memberflags, classdef->numberofallmembers, uint8_t, classdef->memcat);
     if (classdef->memberdefaults)
         luaM_freearray(L, classdef->memberdefaults, classdef->numberofinstancemembers, TValue, classdef->memcat);
+    if (classdef->positionalmembers)
+        luaM_freearray(L, classdef->positionalmembers, classdef->numberofpositional, uint32_t, classdef->memcat);
     if (classdef->fastmethods)
         luaM_freearray(L, classdef->fastmethods, classdef->numberofallmembers, luaR_FastMethod, classdef->memcat);
     luaM_freegco(L, classdef, sizeof(LuauClass), classdef->memcat, page);
@@ -1538,7 +1561,7 @@ static bool luaR_traitneeds(lua_State* L, LuaTable* edges, LuaTable* visited, Lu
     return false;
 }
 
-// Of the traits in `providers` (an array, in the order the class attaches them) that all provide `name`, the one whose
+// Of the traits in `providers` (an array, in attachment order) that all provide `name`, the one whose
 // member the class gets: the one that needs every other. Raises when there is none, or when the override breaks what the
 // overridden trait promised: the member is `final`, a field where the override is a function (or the other way around),
 // or public where the override isn't; or a field's constness differs.
@@ -2036,7 +2059,7 @@ void luaR_implementtraits(lua_State* L, LuauClass* classdef, StkId listed, uint3
     for (uint32_t i = 0; i < newnstatic; i++)
         setnilvalue(&newstaticmembers[i]);
 
-    // The class's own members keep their order: its fields first, where the compiler put them, then its functions,
+    // The class's own members stay in order: its fields first, where the compiler put them, then its functions,
     // shifted past the trait fields.
     for (uint32_t off = 0; off < ownninst; off++)
     {
@@ -2500,6 +2523,24 @@ LuauClass* luaR_newnativeclass(lua_State* L, const char* name, const luaR_Native
     classdef->offsettomember[count] = initname;
     classdef->memberflags[count] = 0;
     setnvalue(luaH_setstr(L, classdef->memberstooffset, initname), double(count));
+
+    // Luwu Destructuring (rfcs/destructuring.md): fields flagged LBC_CLASSMEMBER_POSITIONAL are read by `.(a, b)`, in
+    // the order of their offsets
+    int numpositional = 0;
+    for (uint32_t idx = 0; idx < numfields; idx++)
+        numpositional += (members[idx].flags & LBC_CLASSMEMBER_POSITIONAL) != 0;
+
+    if (numpositional > 0)
+    {
+        luaR_newpositionalmembers(L, classdef, numpositional);
+
+        int position = 0;
+        for (uint32_t idx = 0; idx < numfields; idx++)
+        {
+            if (members[idx].flags & LBC_CLASSMEMBER_POSITIONAL)
+                classdef->positionalmembers[position++] = idx;
+        }
+    }
 
     luaR_sealclassshape(L, classdef);
 

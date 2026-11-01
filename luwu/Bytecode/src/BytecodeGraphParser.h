@@ -1045,6 +1045,29 @@ struct BytecodeGraphParser
                 addImmInput(node, static_cast<int32_t>(aux));
                 break;
 
+            case LOP_GETPOSITIONAL:
+                addVmRegInput(node, LUAU_INSN_B(insn));
+                addImmInput(node, static_cast<int32_t>(LUAU_INSN_C(insn)));
+                addProducer(LUAU_INSN_A(insn), nodeOp);
+                break;
+
+            case LOP_APPENDTABLE:
+                // Luwu Table Comprehensions (rfcs/table-comprehensions.md): reads the table and the value, and
+                // updates the count in C
+                addVmRegInput(node, LUAU_INSN_A(insn));
+                addVmRegInput(node, LUAU_INSN_B(insn));
+                addVmRegInput(node, LUAU_INSN_C(insn));
+                addProducer(LUAU_INSN_C(insn), nodeOp);
+                break;
+
+            case LOP_PRESIZETABLE:
+                // Luwu Table Comprehensions (rfcs/table-comprehensions.md): writes no register. The registers above B that
+                // the iterator and range forms also read belong to the loop that follows, which reads them too.
+                addVmRegInput(node, LUAU_INSN_A(insn));
+                addVmRegInput(node, LUAU_INSN_B(insn));
+                addImmInput(node, static_cast<int32_t>(LUAU_INSN_C(insn)));
+                break;
+
             case LOP_PUSH:
             {
                 // Luwu Push and Pop Operators (rfcs/push-pop-operators.md): reads the container and the values, writes
@@ -1064,23 +1087,6 @@ struct BytecodeGraphParser
                 // Luwu Push and Pop Operators (rfcs/push-pop-operators.md): reads the container, writes the target
                 addVmRegInput(node, LUAU_INSN_B(insn));
                 addProducer(LUAU_INSN_A(insn), nodeOp);
-                break;
-
-            case LOP_APPENDTABLE:
-                // Luwu Table Comprehensions (rfcs/table-comprehensions.md): reads the table and the value, and
-                // updates the count in C
-                addVmRegInput(node, LUAU_INSN_A(insn));
-                addVmRegInput(node, LUAU_INSN_B(insn));
-                addVmRegInput(node, LUAU_INSN_C(insn));
-                addProducer(LUAU_INSN_C(insn), nodeOp);
-                break;
-
-            case LOP_PRESIZETABLE:
-                // Luwu Table Comprehensions (rfcs/table-comprehensions.md): writes no register. The registers above B that
-                // the iterator and range forms also read belong to the loop that follows, which reads them too.
-                addVmRegInput(node, LUAU_INSN_A(insn));
-                addVmRegInput(node, LUAU_INSN_B(insn));
-                addImmInput(node, static_cast<int32_t>(LUAU_INSN_C(insn)));
                 break;
 
             case LOP_NEWOBJECT:
@@ -1122,6 +1128,12 @@ struct BytecodeGraphParser
                 addVmRegInput(node, LUAU_INSN_C(insn));
                 addVmConstInput(node, aux);
                 break;
+
+            case LOP_WRAPRESULT:
+            case LOP_RESULTGET:
+                // Luwu try expressions: a function with protected ranges isn't rebuilt, since the graph has nowhere to
+                // keep them
+                return false;
 
 
             case LOP__COUNT:

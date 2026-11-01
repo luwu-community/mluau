@@ -328,8 +328,8 @@ struct Printer
             writer.write(s);
     }
 
-    // Luwu Destructuring (rfcs/destructuring.md): `[name].{field: T, key as name: T, key as [name].{...}: T}: T`,
-    // from the source form the parser kept.
+    // Luwu Destructuring (rfcs/destructuring.md): `[name].{field: T, key as name: T, key as [name].{...}: T}: T` or
+    // `[name].(name: T, [name].{...}: T)`, from the source form the parser kept.
     void visualizeDestructuring(const AstDestructurePattern& pattern)
     {
         if (pattern.local->name != kDestructuredLocalName)
@@ -360,6 +360,23 @@ struct Printer
 
         advance(pattern.location->begin);
         writer.symbol(".");
+
+        if (pattern.positional)
+        {
+            writer.symbol("(");
+
+            CommaSeparatorInserter elementComma(writer, nullptr);
+            for (const AstDestructureField& element : pattern.fields)
+            {
+                elementComma();
+                visualizeDestructuring(element.target);
+            }
+
+            advanceBefore(pattern.location->end, 1);
+            writer.symbol(")");
+            return;
+        }
+
         writer.symbol("{");
 
         CommaSeparatorInserter comma(writer, nullptr);
@@ -629,7 +646,16 @@ struct Printer
         }
         else if (const auto& a = expr.as<AstExprCall>())
         {
-            visualize(*a->func);
+            // Luwu collections: the callee `.(a, b)` calls isn't in the source
+            if (a->fromDotPositional)
+            {
+                advance(a->location.begin);
+                writer.symbol(".");
+            }
+            else
+            {
+                visualize(*a->func);
+            }
 
             const auto cstNode = lookupCstNode<CstExprCall>(a);
 
@@ -1058,6 +1084,11 @@ struct Printer
             advance(endPos);
             writer.symbol("}");
             advance(expr.location.end);
+        }
+        else if (const auto& a = expr.as<AstExprTry>())
+        {
+            writer.keyword("try");
+            visualize(*a->expr);
         }
         else if (const auto& a = expr.as<AstExprInterpString>())
         {
@@ -1782,7 +1813,7 @@ struct Printer
                         [&](const AstClassMethod& method)
                         {
                             // A method's attributes may be written on either side of the access
-                            // specifier, so emit them in the order the source had them -- `advance`
+                            // specifier, so emit them in source order -- `advance`
                             // never moves backwards, and writing them in the wrong order would run
                             // them into the keyword.
                             auto visualizeMethodAttributes = [&]()
@@ -2051,7 +2082,7 @@ struct Printer
             advanceBefore(func.argLocation->end, 1);
         writer.symbol(")");
 
-        if (writeTypes && func.returnAnnotation != nullptr)
+        if (writeTypes && (func.returnAnnotation != nullptr || func.errorHint != nullptr))
         {
             if (cstNode)
                 maybeAdvanceAndWrite(cstNode->returnSpecifierPosition, ":");
@@ -2061,7 +2092,11 @@ struct Printer
             if (!cstNode)
                 writer.space();
 
-            visualizeTypePackAnnotation(*func.returnAnnotation, false, false, true);
+            if (func.returnAnnotation)
+                visualizeTypePackAnnotation(*func.returnAnnotation, false, false, true);
+
+            if (func.errorHint)
+                visualizeErrorHint(*func.errorHint, cstNode ? cstNode->errorHintPosition : Position::missing());
         }
 
         visualizeBlock(*func.body);
@@ -2391,6 +2426,19 @@ struct Printer
         }
     }
 
+    // Luwu try expressions: `! E` after a return type
+    void visualizeErrorHint(AstType& errorHint, const Position& bangPosition)
+    {
+        if (bangPosition.hasValue())
+            advance(bangPosition);
+        else
+            writer.space();
+        writer.symbol("!");
+        if (!bangPosition.hasValue())
+            writer.space();
+        visualizeTypeAnnotation(errorHint);
+    }
+
     void visualizeTypeAnnotation(AstType& typeAnnotation)
     {
         advance(typeAnnotation.location.begin);
@@ -2483,6 +2531,9 @@ struct Printer
             writer.symbol("->");
 
             visualizeTypePackAnnotation(*a->returnTypes, false, cstNode == nullptr);
+
+            if (a->errorHint)
+                visualizeErrorHint(*a->errorHint, cstNode ? cstNode->errorHintPosition : Position::missing());
         }
         else if (const auto& a = typeAnnotation.as<AstTypeTable>())
         {

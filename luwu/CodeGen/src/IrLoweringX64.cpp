@@ -3355,6 +3355,12 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
     case IrCmd::FALLBACK_INITTRAITS:
         emitFallback(regs, build, offsetof(NativeContext, executeINITTRAITS), uintOp(OP_A(inst)));
         break;
+    case IrCmd::FALLBACK_GETPOSITIONAL:
+        CODEGEN_ASSERT(OP_B(inst).kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(OP_C(inst).kind == IrOpKind::VmReg);
+
+        emitFallback(regs, build, offsetof(NativeContext, executeGETPOSITIONAL), uintOp(OP_A(inst)));
+        break;
     case IrCmd::FALLBACK_PRESIZETABLE:
         emitFallback(regs, build, offsetof(NativeContext, executePRESIZETABLE), uintOp(OP_A(inst)));
         break;

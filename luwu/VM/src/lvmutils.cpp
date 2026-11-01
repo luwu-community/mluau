@@ -184,6 +184,30 @@ void luaV_gettablefor(lua_State* L, const TValue* t, TValue* key, StkId val, con
     luaG_runerror(L, "'__index' chain too long; possible loop");
 }
 
+void luaV_getpositional(lua_State* L, const TValue* t, int position, StkId val)
+{
+    if (LUAU_UNLIKELY(FFlag::LuwuClasses && ttisobject(t)))
+    {
+        LuauObject* inst = objectvalue(t);
+        LuauClass* lco = inst->lclass;
+
+        // a class without a primary constructor has -1 positions
+        if (position >= lco->numberofpositional)
+            luaG_positionalerror(L, lco, position);
+
+        uint32_t offset = lco->positionalmembers[position];
+        TValue key;
+        setsvalue(L, &key, lco->offsettomember[offset]);
+        luaR_checkprivateaccessfast(L, &key, lco, isLua(L->ci) ? clvalue(L->ci->func) : nullptr, offset);
+        setobj2s(L, val, luaR_lookupmemberatoffset(inst, offset));
+        return;
+    }
+
+    TValue key;
+    setnvalue(&key, double(position + 1));
+    luaV_gettable(L, t, &key, val);
+}
+
 void luaV_settable(lua_State* L, const TValue* t, TValue* key, StkId val)
 {
     int loop;
@@ -865,7 +889,7 @@ void luaV_pop(lua_State* L, StkId ra, StkId container)
     const TValue* tm = luaT_gettmbyobj(L, container, TM_POP);
     if (!ttisnil(tm))
     {
-        // __pop(container), keeping its first result
+        // __pop(container), truncated to its first result
         ptrdiff_t raoffset = savestack(L, ra);
         ptrdiff_t containeroffset = savestack(L, container);
         luaD_checkstack(L, 2);

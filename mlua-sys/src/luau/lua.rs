@@ -72,6 +72,22 @@ pub const LUA_TCLASS: c_int = 13;
 #[cfg(feature = "luwu-classes")]
 pub const LUA_TOBJECT: c_int = 14;
 
+// lua_MemberAccess: what lua_getmemberaccess returns
+#[cfg(feature = "luwu-classes")]
+pub const LUA_MEMBERMISSING: c_int = 0;
+#[cfg(feature = "luwu-classes")]
+pub const LUA_MEMBERPUBLIC: c_int = 1;
+#[cfg(feature = "luwu-classes")]
+pub const LUA_MEMBERPRIVATE: c_int = 2;
+
+// lua_ClassDataShape: what lua_getclassdatashape returns
+#[cfg(feature = "luwu-classes")]
+pub const LUA_CLASSDATA_NONE: c_int = 0;
+#[cfg(feature = "luwu-classes")]
+pub const LUA_CLASSDATA_POSITIONAL: c_int = 1;
+#[cfg(feature = "luwu-classes")]
+pub const LUA_CLASSDATA_TABLE: c_int = 2;
+
 pub const LUA_BLUAU: c_int = 0;
 pub const LUA_BHOST_IMMUTABLE: c_int = 1;
 pub const LUA_BHOST_MUTABLE: c_int = 2;
@@ -267,6 +283,48 @@ unsafe extern "C-unwind" {
     ) -> *mut c_void;
     pub fn lua_getbuffermode(L: *mut lua_State, idx: c_int) -> c_int;
     pub fn lua_getbufferuserdata(L: *mut lua_State, idx: c_int) -> *mut c_void;
+
+    //
+    // Luwu classes and traits
+    //
+    #[cfg(feature = "luwu-classes")]
+    pub fn lua_newobject(L: *mut lua_State, idx: c_int);
+    #[cfg(feature = "luwu-classes")]
+    pub fn lua_istrait(L: *mut lua_State, idx: c_int) -> c_int;
+    #[cfg(feature = "luwu-classes")]
+    pub fn lua_getmemberaccess(L: *mut lua_State, idx: c_int, membername: *const c_char) -> c_int;
+    #[cfg(feature = "luwu-classes")]
+    pub fn lua_ismemberconst(L: *mut lua_State, idx: c_int, membername: *const c_char) -> c_int;
+    #[cfg(feature = "luwu-classes")]
+    pub fn lua_getclassname(L: *mut lua_State, idx: c_int) -> *const c_char;
+    #[cfg(feature = "luwu-classes")]
+    pub fn lua_classof(L: *mut lua_State, idx: c_int) -> c_int;
+    #[cfg(feature = "luwu-classes")]
+    pub fn lua_classis(L: *mut lua_State, idx: c_int, classidx: c_int) -> c_int;
+    #[cfg(feature = "luwu-classes")]
+    pub fn lua_classimplements(L: *mut lua_State, idx: c_int, traitidx: c_int) -> c_int;
+    #[cfg(feature = "luwu-classes")]
+    pub fn lua_ismemberfinal(L: *mut lua_State, idx: c_int, membername: *const c_char) -> c_int;
+    #[cfg(feature = "luwu-classes")]
+    pub fn lua_getclassdatashape(L: *mut lua_State, idx: c_int, hasmethods: *mut c_int) -> c_int;
+
+    //
+    // Luwu collections: options and results
+    //
+    #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+    pub fn lua_pushsome(L: *mut lua_State, idx: c_int);
+    #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+    pub fn lua_pushresultok(L: *mut lua_State, idx: c_int);
+    #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+    pub fn lua_pushresulterr(L: *mut lua_State, idx: c_int);
+    #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+    pub fn lua_issome(L: *mut lua_State, idx: c_int) -> c_int;
+    #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+    pub fn lua_isresultok(L: *mut lua_State, idx: c_int) -> c_int;
+    #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+    pub fn lua_isresulterr(L: *mut lua_State, idx: c_int) -> c_int;
+    #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+    pub fn lua_getpayload(L: *mut lua_State, idx: c_int) -> c_int;
 
     //
     // Get functions (Lua -> stack)

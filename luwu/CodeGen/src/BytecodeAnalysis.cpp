@@ -399,6 +399,15 @@ static void applyBuiltinCall(LuauBuiltinFunction bfid, BytecodeTypes& types)
         types.result = LBC_TYPE_BOOLEAN;
         types.b = LBC_TYPE_CLASS;
         break;
+    case LBF_COLLECTIONS_PAIR:
+    case LBF_COLLECTIONS_TRIPLE:
+    case LBF_COLLECTIONS_QUAD:
+    case LBF_COLLECTIONS_OPTION_SOME:
+    case LBF_COLLECTIONS_RESULT_OK:
+    case LBF_COLLECTIONS_RESULT_ERR:
+        // Luwu collections: an object when the builtin runs, but FASTCALL's fallback calls whatever `collections` holds
+        types.result = LBC_TYPE_ANY;
+        break;
     case LBF_TABLE_UNPACK:
         types.result = LBC_TYPE_ANY;
         types.a = LBC_TYPE_TABLE;
@@ -1616,6 +1625,18 @@ static void analyzeBytecodeTypesPass(
                 bcType.result = regTags[ra];
                 break;
             }
+            case LOP_GETPOSITIONAL:
+            {
+                // Luwu Destructuring (rfcs/destructuring.md): any element, like GETTABLEN's result
+                int ra = LUAU_INSN_A(*pc);
+                int rb = LUAU_INSN_B(*pc);
+
+                bcType.a = getRegTag(regTags, bcTypeInfo, rb, i);
+
+                regTags[ra] = LBC_TYPE_ANY;
+                bcType.result = regTags[ra];
+                break;
+            }
             case LOP_POP:
             {
                 // Luwu Push and Pop Operators (rfcs/push-pop-operators.md): any element, or whatever __pop returns
@@ -1716,6 +1737,7 @@ static void visitBytecodeRegWrites(const IrFunction& function, const std::vector
     case LOP_MINUS:
     case LOP_LENGTH:
     case LOP_GETOBJECTMEMBER:
+    case LOP_GETPOSITIONAL:
         visit(ra, function.bcTypes[pc].result);
         break;
     case LOP_NEWOBJECT:

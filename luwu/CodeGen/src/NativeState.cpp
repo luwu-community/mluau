@@ -109,6 +109,7 @@ void initFunctions(NativeContext& context)
     context.executeNEWOBJECT = executeNEWOBJECT;
     context.executeNEWCLASSMEMBER = executeNEWCLASSMEMBER;
     context.executeINITTRAITS = executeINITTRAITS;
+    context.executeGETPOSITIONAL = executeGETPOSITIONAL;
     context.executePRESIZETABLE = executePRESIZETABLE;
     context.executePUSH = executePUSH;
     context.executePOP = executePOP;

@@ -13,6 +13,10 @@ LUAU_FASTFLAGVARIABLE(LuwuClasses)
 // Luwu Traits (rfcs/classes/traits.md): enables `trait` declarations and `implements` (in progress). Needs LuwuClasses.
 LUAU_FASTFLAGVARIABLE(LuwuTraits)
 
+// Luwu Destructuring (rfcs/destructuring.md): `.{x, y}` and `.(x, y)` patterns. The parser gates the syntax, and while it
+// is on the compiler emits WIP bytecode (version 200), which positional patterns need for LOP_GETPOSITIONAL.
+LUAU_FASTFLAGVARIABLE(LuwuDestructuring)
+
 // Luwu Table Comprehensions (rfcs/table-comprehensions.md): `{ for ... in ... when ... give item }` (in progress). While it
 // is on, the compiler emits WIP bytecode (version 200), which has LOP_PRESIZETABLE.
 LUAU_FASTFLAGVARIABLE(LuwuTableComprehensions)
@@ -49,3 +53,8 @@ bool luauClassCompat()
 // and in Analysis's builtin definitions. A prototype whose API can still change. Needs LuwuClasses and
 // LuwuNonePrimitive (`none` is the empty option).
 LUAU_FASTFLAGVARIABLE(DebugLuwuCollections)
+
+// Luwu try expressions: `try expr` gives a `collections.result`. A Debug flag while it's in progress, and because it needs
+// DebugLuwuCollections, which a default-on flag can't depend on. The parser gates the syntax, and while it is on the
+// compiler emits WIP bytecode (version 200), which holds the protected ranges.
+LUAU_FASTFLAGVARIABLE(DebugLuwuTryExpressions)
