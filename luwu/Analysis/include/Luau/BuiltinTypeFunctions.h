@@ -1,0 +1,74 @@
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
+#pragma once
+
+#include "Luau/TypeFunction.h"
+
+namespace Luau
+{
+
+struct BuiltinTypeFunctions
+{
+    BuiltinTypeFunctions();
+    BuiltinTypeFunctions(const BuiltinTypeFunctions&) = delete;
+    void operator=(const BuiltinTypeFunctions&) = delete;
+
+    TypeFunction userFunc;
+
+    TypeFunction notFunc;
+    TypeFunction lenFunc;
+    TypeFunction unmFunc;
+    // Luwu Push and Pop Operators (rfcs/push-pop-operators.md): the type of `<-container`. Not bound to a type name.
+    TypeFunction popFunc;
+
+    TypeFunction addFunc;
+    TypeFunction subFunc;
+    TypeFunction mulFunc;
+    TypeFunction divFunc;
+    TypeFunction idivFunc;
+    TypeFunction powFunc;
+    TypeFunction modFunc;
+
+    TypeFunction concatFunc;
+
+    TypeFunction andFunc;
+    TypeFunction orFunc;
+
+    TypeFunction ltFunc;
+    TypeFunction leFunc;
+
+    TypeFunction refineFunc;
+    TypeFunction singletonFunc;
+    TypeFunction unionFunc;
+    TypeFunction intersectFunc;
+
+    TypeFunction keyofFunc;
+    TypeFunction rawkeyofFunc;
+    TypeFunction indexFunc;
+    TypeFunction rawgetFunc;
+
+    TypeFunction setmetatableFunc;
+    TypeFunction getmetatableFunc;
+
+    TypeFunction objectFunc;
+    TypeFunction classFunc;
+
+    TypeFunction weakoptionalFunc;
+    // Luwu: `unlessnever<refined, fallback, tests...>` is `refined`, or `fallback` when `refined` is uninhabited
+    // because tests on one property contradict each other (one of `tests` is uninhabited). See applyRefinements.
+    TypeFunction unlessneverFunc;
+    // Luwu try expressions: `raises<F>` is what calling F can raise: the error hints of F (each overload's, for an
+    // intersection) joined with weakunknown, or weakunknown alone. `try f()` types its error with it.
+    TypeFunction raisesFunc;
+
+    // Luwu: `oneof<A, B, ...>`, the union of its arguments where each table member has the others' fields as `nil`
+    TypeFunction oneofFunc;
+
+    void addToScope(NotNull<TypeArena> arena, NotNull<Scope> scope) const;
+};
+
+const BuiltinTypeFunctions& builtinTypeFunctions_DEPRECATED();
+
+// Luwu Classes (rfcs/classes): the object type of a class or trait value (what `object<C>` gives), or nullopt for any other type
+std::optional<TypeId> objectTypeOfClassValue(NotNull<BuiltinTypes> builtinTypes, TypeId classValue);
+
+} // namespace Luau

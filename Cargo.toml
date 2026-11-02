@@ -28,6 +28,8 @@ luau-vector4 = ["ffi/luau-vector4"]
 # Luwu's user-defined classes (luwu rfcs/classes.md), which diverge from upstream Luau's. Still
 # experimental (gated behind fastflags prefixed `Debug*`) and its shape may still change, so this is opt-in.
 luwu-classes = ["ffi/luwu-classes"]
+# Luwu's type checker and linter, through `mluau::ffi`'s luwu_analysis_* functions
+luwu-analysis = ["ffi/luwu-analysis"]
 # Custom `none` primitive in mluau/luau
 none-primitive = ["ffi/none-primitive"]
 

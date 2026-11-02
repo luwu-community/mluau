@@ -1,0 +1,477 @@
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
+#pragma once
+
+#include "Luau/Ast.h" // Used for some of the enumerations
+#include "Luau/DenseHash.h"
+#include "Luau/NotNull.h"
+#include "Luau/Variant.h"
+#include "Luau/TypeFwd.h"
+#include "Luau/TypeIds.h"
+#include "Luau/VisitType.h"
+
+#include <string>
+#include <memory>
+#include <vector>
+
+namespace Luau
+{
+
+enum class ValueContext;
+struct Scope;
+
+// if resultType is a freeType, assignmentType <: freeType <: resultType bounds
+struct EqualityConstraint
+{
+    TypeId resultType;
+    TypeId assignmentType;
+};
+
+// subType <: superType
+struct SubtypeConstraint
+{
+    TypeId subType;
+    TypeId superType;
+};
+
+// subPack <: superPack
+struct PackSubtypeConstraint
+{
+    TypePackId subPack;
+    TypePackId superPack;
+
+    // Luwu: set on a `return` of a function that has no return annotation and more than one `return`. Every such
+    // `return` widens the function's return type (ConstraintSolver::dispatchInferredReturn).
+    bool inferredReturn = false;
+};
+
+// generalizedType ~ gen sourceType
+struct GeneralizationConstraint
+{
+    TypeId generalizedType;
+    TypeId sourceType;
+
+    std::vector<TypeId> interiorTypes;
+    bool hasDeprecatedAttribute = false;
+    AstAttr::DeprecatedInfo deprecatedInfo;
+    // Luwu: `@nodiscard` (see FunctionType::isNodiscard)
+    bool hasNodiscardAttribute = false;
+    std::string nodiscardReason;
+
+    /// If true, never introduce generics.  Always replace free types by their
+    /// bounds or unknown. Presently used only to generalize the whole module.
+    bool noGenerics = false;
+
+    // Luwu Classes (rfcs/classes): a generic class's instance method read through the class value
+    // (`Box.get`). Bound, once the method is generalized, to its type quantified over the class's
+    // own generics too, which the class value doesn't instantiate.
+    std::optional<TypeId> classValueMethodType;
+    std::vector<TypeId> classGenerics;
+    std::vector<TypePackId> classGenericPacks;
+};
+
+// variables ~ iterate iterator
+// Unpack the iterator, figure out what types it iterates over, and bind those types to variables.
+struct IterableConstraint
+{
+    TypePackId iterator;
+    std::vector<TypeId> variables;
+
+    const AstNode* nextAstFragment;
+    DenseHashMap<const AstNode*, TypeId>* astForInNextTypes;
+};
+
+// name(namedType) = name
+struct NameConstraint
+{
+    TypeId namedType;
+    std::string name;
+    bool synthetic = false;
+    std::vector<TypeId> typeParameters;
+    std::vector<TypePackId> typePackParameters;
+};
+
+// target ~ inst target
+struct TypeAliasExpansionConstraint
+{
+    // Must be a PendingExpansionType.
+    TypeId target;
+};
+
+struct FunctionCallConstraint
+{
+    TypeId fn;
+    TypePackId argsPack;
+    TypePackId result;
+
+    // callSite can be nullptr in the case that this constraint was
+    // synthetically generated from some other constraint. eg
+    // IterableConstraint.
+    class AstExprCall* callSite = nullptr;
+    std::vector<std::optional<TypeId>> discriminantTypes;
+
+    std::vector<TypeId> typeArguments;
+    std::vector<TypePackId> typePackArguments;
+
+    // When we dispatch this constraint, we update the key at this map to record
+    // the overload that we selected.
+    DenseHashMap<const AstNode*, TypeId>* astOverloadResolvedTypes = nullptr;
+
+    // The type this call is expected to produce, if any (e.g. from a `local x: T = f(...)`
+    // annotation or a `return` in a function with a declared return type). Used to resolve
+    // generics that argument matching alone leaves unconstrained.
+    std::optional<TypeId> expectedType;
+
+    // Luwu user-defined refinements: parallel to `discriminantTypes`, each argument's refinement when the call is falsy
+    // (Proposition::negativeDiscriminantTy). Empty with the flag off.
+    std::vector<std::optional<TypeId>> negativeDiscriminantTypes;
+};
+
+// function_check fn argsPack
+//
+// If fn is a function type and argsPack is a partially solved
+// pack of arguments to be supplied to the function, propagate the argument
+// types of fn into the types of argsPack. This is used to implement
+// bidirectional inference of lambda arguments.
+struct FunctionCheckConstraint
+{
+    TypeId fn;
+    TypePackId argsPack;
+
+    class AstExprCall* callSite = nullptr;
+    NotNull<DenseHashMap<const AstExpr*, TypeId>> astTypes;
+    NotNull<DenseHashMap<const AstExpr*, TypeId>> astExpectedTypes;
+
+    // The type this call is expected to produce, if any. Used to solve the generics of a nominal
+    // the call constructs before its arguments are checked, so that a literal argument is checked
+    // against the expected type argument rather than widened. See FunctionCallConstraint's own
+    // `expectedType`, which resolves the same generics after the fact for a different purpose.
+    std::optional<TypeId> expectedType;
+};
+
+// prim FreeType ExpectedType PrimitiveType
+//
+// FreeType is bounded below by the singleton type and above by PrimitiveType
+// initially. When this constraint is resolved, it will check that the bounds
+// of the free type are well-formed by subtyping.
+//
+// If they are not well-formed, then FreeType is replaced by its lower bound
+//
+// If they are well-formed and ExpectedType is potentially a singleton (an
+// actual singleton or a union that contains a singleton),
+// then FreeType is replaced by its lower bound
+//
+// else FreeType is replaced by PrimitiveType
+//
+// Clip with LuauRemovePrimitiveTypeConstraint
+struct DEPRECATED_PrimitiveTypeConstraint
+{
+    TypeId freeType;
+
+    // potentially gets used to force the lower bound?
+    std::optional<TypeId> expectedType;
+
+    // the primitive type to check against
+    TypeId primitiveType;
+};
+
+// result ~ hasProp type "prop_name"
+//
+// If the subject is a table, bind the result to the named prop.  If the table
+// has an indexer, bind it to the index result type. If the subject is a union,
+// bind the result to the union of its constituents' properties.
+//
+// It would be nice to get rid of this constraint and someday replace it with
+//
+// T <: {p: X}
+//
+// Where {} describes an inexact shape type.
+struct HasPropConstraint
+{
+    TypeId resultType;
+    TypeId subjectType;
+    std::string prop;
+    ValueContext context;
+
+    // We want to track if this `HasPropConstraint` comes from a conditional.
+    // If it does, we're going to change the behavior of property look-up a bit.
+    // In particular, we're going to return `unknownType` for property lookups
+    // on `table` or inexact table types where the property is not present.
+    //
+    // This allows us to refine table types to have additional properties
+    // without reporting errors in typechecking on the property tests.
+    bool inConditional = false;
+
+    // HACK: We presently need types like true|false or string|"hello" when
+    // deciding whether a particular literal expression should have a singleton
+    // type.  This boolean is set to true when extracting the property type of a
+    // value that may be a union of tables.
+    //
+    // For example, in the following code fragment, we want the lookup of the
+    // success property to yield true|false when extracting an expectedType in
+    // this expression:
+    //
+    // type Result<T, E> = {success:true, result: T} | {success:false, error: E}
+    //
+    // local r: Result<number, string> = {success=true, result=9}
+    //
+    // If we naively simplify the expectedType to boolean, we will erroneously
+    // compute the type boolean for the success property of the table literal.
+    // This causes type checking to fail.
+    bool suppressSimplification = false;
+};
+
+// resultType ~ hasIndexer subjectType indexType
+//
+// If the subject type is a table or table-like thing that supports indexing,
+// populate the type result with the result type of such an index operation.
+//
+// If the subject is not indexable, resultType is bound to errorType.
+struct HasIndexerConstraint
+{
+    TypeId resultType;
+    TypeId subjectType;
+    TypeId indexType;
+    // Luwu Destructuring (rfcs/destructuring.md): an element of a positional pattern, 0 for the first. An object of a
+    // class gives the field its primary constructor takes there instead of an indexer's result.
+    std::optional<size_t> position;
+};
+
+// assignProp lhsType propName rhsType
+//
+// Assign a value of type rhsType into the named property of lhsType.
+
+struct AssignPropConstraint
+{
+    TypeId lhsType;
+    std::string propName;
+    TypeId rhsType;
+
+    /// If a new property is to be inserted into a table type, it will be
+    /// ascribed this location.
+    std::optional<Location> propLocation;
+
+    /// The canonical write type of the property.  It is _solely_ used to
+    /// populate astTypes during constraint resolution.  Nothing should ever
+    /// block on it.
+    TypeId propType;
+
+    // When we generate constraints, we increment the remaining prop count on
+    // the table if we are able. This flag informs the solver as to whether or
+    // not it should in turn decrement the prop count when this constraint is
+    // dispatched.
+    bool decrementPropCount = false;
+};
+
+struct AssignIndexConstraint
+{
+    TypeId lhsType;
+    TypeId indexType;
+    TypeId rhsType;
+
+    /// The canonical write type of the property.  It is _solely_ used to
+    /// populate astTypes during constraint resolution.  Nothing should ever
+    /// block on it.
+    TypeId propType;
+};
+
+// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): `container <+ values`. Once the container's type is known,
+// a plain table gets one AssignIndexConstraint per value at a number index, so `const t = {}; t <+ 1` grows `t` an
+// indexer like `t[1] = 1` would. Anything else is left to TypeChecker2, which checks it against its `__push`.
+struct PushConstraint
+{
+    TypeId containerType;
+    TypePackId valuesPack;
+};
+
+// resultTypes ~ unpack sourceTypePack
+//
+// Similar to PackSubtypeConstraint, but with one important difference: If the
+// sourcePack is blocked, this constraint blocks.
+struct UnpackConstraint
+{
+    std::vector<TypeId> resultPack;
+    TypePackId sourcePack;
+};
+
+// ty ~ reduce ty
+//
+// Try to reduce ty, if it is a TypeFunctionInstanceType. Otherwise, do nothing.
+struct ReduceConstraint
+{
+    TypeId ty;
+};
+
+// tp ~ reduce tp
+//
+// Analogous to ReduceConstraint, but for type packs.
+struct ReducePackConstraint
+{
+    TypePackId tp;
+};
+
+// simplify ty
+struct SimplifyConstraint
+{
+    TypeId ty;
+};
+
+// push_function_type_constraint expectedFunctionType => functionType
+//
+// Attempt to "push" the types of `expectedFunctionType` into `functionType`,
+// assuming that `expr` is a lambda who's un-generalized type is `functionType`.
+// Similar to `FunctionCheckConstraint`. For example:
+//
+//  local Foo = {} :: { bar : (number) -> () }
+//
+//  function Foo.bar(x) end
+//
+// This will force `x` to be inferred as `number`.
+struct PushFunctionTypeConstraint
+{
+    TypeId expectedFunctionType;
+    TypeId functionType;
+    NotNull<AstExprFunction> expr;
+    bool isSelf;
+};
+
+// Binds the function to a set of explicitly specified types,
+// for f<<T>>.
+struct TypeInstantiationConstraint
+{
+    TypeId functionType;
+    TypeId placeholderType;
+    std::vector<TypeId> typeArguments;
+    std::vector<TypePackId> typePackArguments;
+};
+
+// Luwu Generic Nominals (rfcs/generics-on-extern-types.md): fills in one member of a generic class instantiation (`Box<number>`) whose type
+// was not known yet when the instantiation was made.
+//
+// A generic class can be instantiated before its own members are solved. This always happens for a
+// reference to the class from inside its own body, and for a forward reference to a class declared
+// later in the file. At that point each member's type is still a BlockedType. Copying that BlockedType
+// into the instantiation would share it with the template. When it was bound later, the instantiation
+// would see the uninstantiated member, and `Box<number>:get()` would return `T`.
+//
+// Normally the expansion waits for these members. If it is force-dispatched first, the instantiation
+// gets a fresh BlockedType for each blocked member instead. This constraint binds that BlockedType to
+// the substituted member once the template's member is known (or to the error type, if it never is).
+struct InstantiateNominalPropConstraint
+{
+    // The member's type on the template class, blocked until the class body is solved.
+    TypeId templateProp;
+    // The BlockedType standing in for it on the instantiation, which this constraint binds.
+    TypeId target;
+
+    // The class being instantiated and the instantiation itself, so that a member mentioning the
+    // class (`self`, or a method returning `Box<T>`) lands on the instantiation rather than on a
+    // second copy of it.
+    TypeId templateType;
+    TypeId instantiatedType;
+
+    // The template's parameters paired positionally with the arguments the instantiation supplied.
+    std::vector<TypeId> typeParams;
+    std::vector<TypeId> typeArguments;
+    std::vector<TypePackId> typePackParams;
+    std::vector<TypePackId> typePackArguments;
+};
+
+struct PushTypeConstraint
+{
+    TypeId expectedType;
+    TypeId targetType;
+    NotNull<DenseHashMap<const AstExpr*, TypeId>> astTypes;
+    NotNull<DenseHashMap<const AstExpr*, TypeId>> astExpectedTypes;
+    NotNull<const AstExpr> expr;
+};
+
+using ConstraintV = Variant<
+    SubtypeConstraint,
+    PackSubtypeConstraint,
+    GeneralizationConstraint,
+    IterableConstraint,
+    NameConstraint,
+    TypeAliasExpansionConstraint,
+    FunctionCallConstraint,
+    FunctionCheckConstraint,
+    DEPRECATED_PrimitiveTypeConstraint,
+    HasPropConstraint,
+    HasIndexerConstraint,
+    AssignPropConstraint,
+    AssignIndexConstraint,
+    PushConstraint,
+    UnpackConstraint,
+    ReduceConstraint,
+    ReducePackConstraint,
+    EqualityConstraint,
+    SimplifyConstraint,
+    PushFunctionTypeConstraint,
+    PushTypeConstraint,
+    TypeInstantiationConstraint,
+    InstantiateNominalPropConstraint>;
+
+struct Constraint
+{
+    Constraint(NotNull<Scope> scope, const Location& location, ConstraintV&& c);
+
+    Constraint(const Constraint&) = delete;
+    Constraint& operator=(const Constraint&) = delete;
+
+    NotNull<Scope> scope;
+    Location location;
+    ConstraintV c;
+
+    /**
+     * Return the types and type packs that may be mutated by this constraint.
+     * Currently we do not do anything with type packs.
+     */
+    std::pair<TypeIds, TypePackIds> getMaybeMutatedTypes() const;
+};
+
+using ConstraintPtr = std::unique_ptr<Constraint>;
+
+bool isReferenceCountedType(TypePackId tp);
+bool isReferenceCountedType(const TypeId typ);
+
+inline Constraint& asMutable(const Constraint& c)
+{
+    return const_cast<Constraint&>(c);
+}
+
+template<typename T>
+T* getMutable(Constraint& c)
+{
+    return ::Luau::get_if<T>(&c.c);
+}
+
+template<typename T>
+const T* get(const Constraint& c)
+{
+    return getMutable<T>(asMutable(c));
+}
+
+struct ReferenceCountInitializer : TypeOnceVisitor
+{
+    NotNull<TypeIds> mutatedTypes;
+    TypePackIds* mutatedTypePacks;
+    bool traverseIntoTypeFunctions = true;
+
+    explicit ReferenceCountInitializer(NotNull<TypeIds> mutatedTypes, NotNull<TypePackIds> mutatedTypePacks);
+
+    bool visit(TypeId ty, const FreeType&) override;
+
+    bool visit(TypeId ty, const BlockedType&) override;
+
+    bool visit(TypeId ty, const PendingExpansionType&) override;
+
+    bool visit(TypeId ty, const TableType& tt) override;
+
+    bool visit(TypeId ty, const ExternType&) override;
+
+    bool visit(TypeId, const TypeFunctionInstanceType& tfit) override;
+
+    bool visit(TypePackId tp, const BlockedTypePack&) override;
+    bool visit(TypePackId tp, const FreeTypePack&) override;
+};
+
+} // namespace Luau

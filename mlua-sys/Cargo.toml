@@ -26,6 +26,8 @@ luau-vector4 = []
 # fastflags prefixed `Debug*`) and its shape may still change, so bindings for it
 # are opt-in.
 luwu-classes = []
+# Luwu's type checker and linter (luaanalysis.h). Analysis nearly doubles the C++ compiled, so it's opt-in.
+luwu-analysis = []
 none-primitive = []
 external = []
 module = []
@@ -33,7 +35,7 @@ module = []
 [dependencies]
 
 [build-dependencies]
-cc = "1.0"
+cc = { version = "1.0", features = ["parallel"] }
 cfg-if = "1.0"
 pkg-config = "0.3.17"
 

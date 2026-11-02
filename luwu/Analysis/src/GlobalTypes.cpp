@@ -1,0 +1,59 @@
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
+
+#include "Luau/GlobalTypes.h"
+
+#include "Luau/BuiltinDefinitions.h"
+
+LUAU_FASTFLAG(LuauIntegerType2)
+LUAU_FASTFLAG(LuwuClasses)
+LUAU_FASTFLAG(LuwuTraits)
+LUAU_FASTFLAG(LuauTruthyFalsy)
+
+namespace Luau
+{
+
+GlobalTypes::GlobalTypes(NotNull<BuiltinTypes> builtinTypes, SolverMode mode)
+    : builtinTypes(builtinTypes)
+    , mode(mode)
+{
+    globalScope = std::make_shared<Scope>(globalTypes.addTypePack(TypePackVar{FreeTypePack{TypeLevel{}}}));
+    globalTypeFunctionScope = std::make_shared<Scope>(globalTypes.addTypePack(TypePackVar{FreeTypePack{TypeLevel{}}}));
+
+    globalScope->addBuiltinTypeBinding("any", TypeFun{{}, builtinTypes->anyType});
+    globalScope->addBuiltinTypeBinding("nil", TypeFun{{}, builtinTypes->nilType});
+    globalScope->addBuiltinTypeBinding("number", TypeFun{{}, builtinTypes->numberType});
+    if (FFlag::LuauIntegerType2)
+        globalScope->addBuiltinTypeBinding("integer", TypeFun{{}, builtinTypes->integerType});
+    globalScope->addBuiltinTypeBinding("string", TypeFun{{}, builtinTypes->stringType});
+    globalScope->addBuiltinTypeBinding("boolean", TypeFun{{}, builtinTypes->booleanType});
+    globalScope->addBuiltinTypeBinding("thread", TypeFun{{}, builtinTypes->threadType});
+    globalScope->addBuiltinTypeBinding("buffer", TypeFun{{}, builtinTypes->bufferType});
+    globalScope->addBuiltinTypeBinding("none", TypeFun{{}, builtinTypes->noneType});
+    globalScope->addBuiltinTypeBinding("unknown", TypeFun{{}, builtinTypes->unknownType});
+    globalScope->addBuiltinTypeBinding("never", TypeFun{{}, builtinTypes->neverType});
+    if (FFlag::LuauTruthyFalsy)
+    {
+        globalScope->addBuiltinTypeBinding("truthy", TypeFun{{}, builtinTypes->truthyType});
+        globalScope->addBuiltinTypeBinding("falsy", TypeFun{{}, builtinTypes->falsyType});
+    }
+    globalScope->addBuiltinTypeBinding("userdata", TypeFun{{}, builtinTypes->externType});
+    globalScope->addBuiltinTypeBinding("vector", TypeFun{{}, builtinTypes->vectorType});
+    if (FFlag::LuwuClasses)
+    {
+        globalScope->addBuiltinTypeBinding("object", TypeFun{{}, builtinTypes->objectType});
+        globalScope->addBuiltinTypeBinding("class", TypeFun{{}, builtinTypes->classType});
+    }
+    if (FFlag::LuwuClasses && FFlag::LuwuTraits)
+        globalScope->addBuiltinTypeBinding("trait", TypeFun{{}, builtinTypes->traitType});
+
+    unfreeze(*builtinTypes->arena);
+    TypeId stringMetatableTy = makeStringMetatable(builtinTypes, mode);
+    asMutable(builtinTypes->stringType)->ty.emplace<PrimitiveType>(PrimitiveType::String, stringMetatableTy);
+    persist(stringMetatableTy);
+    makeVectorMetatable(builtinTypes);
+    if (collectionsLibraryEnabled())
+        makeNoneMetatable(builtinTypes);
+    freeze(*builtinTypes->arena);
+}
+
+} // namespace Luau

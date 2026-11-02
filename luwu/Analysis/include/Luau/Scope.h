@@ -1,0 +1,158 @@
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
+#pragma once
+
+#include "Luau/Def.h"
+#include "Luau/LValue.h"
+#include "Luau/Location.h"
+#include "Luau/NotNull.h"
+#include "Luau/Type.h"
+#include "Luau/DenseHash.h"
+#include "Luau/Symbol.h"
+#include "Luau/Unifiable.h"
+
+#include <unordered_map>
+#include <unordered_set>
+#include <optional>
+#include <memory>
+
+namespace Luau
+{
+
+struct Scope;
+
+using ScopePtr = std::shared_ptr<Scope>;
+
+struct Binding
+{
+    TypeId typeId;
+    Location location;
+    bool deprecated = false;
+    std::string deprecatedSuggestion;
+    std::optional<std::string> documentationSymbol;
+};
+
+struct Scope
+{
+    explicit Scope(TypePackId returnType);                    // root scope
+    explicit Scope(const ScopePtr& parent, int subLevel = 0); // child scope.  Parent must not be nullptr.
+
+    ScopePtr parent; // null for the root
+
+    // All the children of this scope.
+    std::vector<NotNull<Scope>> children;
+    std::unordered_map<Symbol, Binding> bindings;
+    TypePackId returnType = nullptr;
+    std::optional<TypePackId> varargPack;
+
+    TypeLevel level;
+
+    Location location; // the spanning location associated with this scope
+
+    std::unordered_map<Name, TypeFun> exportedTypeBindings;
+    std::unordered_map<Name, TypeFun> privateTypeBindings;
+    std::unordered_map<Name, Location> typeAliasLocations;
+    std::unordered_map<Name, Location> typeAliasNameLocations;
+    // Luwu doc references: the definitions file package (`@seal`) each type a definitions file exported came from; its
+    // TypeFun::definitionLocation is in that file
+    std::unordered_map<Name, ModuleName> definitionFileTypeModules;
+    std::unordered_map<Name, ModuleName> importedModules; // Mapping from the name in the require statement to the internal moduleName.
+    std::unordered_map<Name, std::unordered_map<Name, TypeFun>> importedTypeBindings;
+    // Luwu: locals bound to a `require` whose module couldn't be found or checked, so they have no importedTypeBindings
+    std::unordered_set<Name> unresolvedRequires;
+
+    DenseHashSet<Name> builtinTypeNames{""};
+    void addBuiltinTypeBinding(const Name& name, const TypeFun& tyFun);
+
+    std::optional<TypeId> lookup(Symbol sym) const;
+    std::optional<TypeId> lookupUnrefinedType(DefId def) const;
+
+    std::optional<TypeId> lookupRValueRefinementType(DefId def) const;
+    std::optional<TypeId> lookup(DefId def) const;
+    std::optional<std::pair<TypeId, Scope*>> lookupEx(DefId def);
+    std::optional<std::pair<Binding*, Scope*>> lookupEx(Symbol sym);
+
+    std::optional<TypeFun> lookupType(const Name& name) const;
+    std::optional<TypeFun> lookupImportedType(const Name& moduleAlias, const Name& name) const;
+    // Luwu Traits (rfcs/classes/traits.md): the type an `implements` or `needs` entry names (`Trait`, `mod.Trait`, or a local
+    // holding a trait value), which need not be a trait
+    std::optional<TypeFun> lookupTraitRef(const AstClassTraitRef& ref) const;
+
+    std::unordered_map<Name, TypePackId> privateTypePackBindings;
+    std::optional<TypePackId> lookupPack(const Name& name) const;
+
+    // WARNING: This function linearly scans for a string key of equal value!  It is thus O(n**2)
+    std::optional<Binding> linearSearchForBinding(const std::string& name, bool traverseScopeChain = true) const;
+    std::optional<std::pair<Symbol, Binding>> linearSearchForBindingPair(const std::string& name, bool traverseScopeChain) const;
+
+    RefinementMap refinements;
+
+    // This can be viewed as the "unrefined" type of each binding.
+    DenseHashMap<const Def*, TypeId> lvalueTypes{nullptr};
+
+    // Luau values are routinely refined more narrowly than their actual
+    // inferred type through control flow statements.  We retain those refined
+    // types here.
+    DenseHashMap<const Def*, TypeId> rvalueRefinements{nullptr};
+
+    // Luwu: what tests on properties (`not h.enc`) have refined so far, so that a test contradicting an earlier one can
+    // be told apart from a union running out of members (ConstraintGenerator::refineUnlessContradicted).
+    // `propertyTests` holds, for each def a test refined, the discriminants each property path below it was tested
+    // with on the way to this scope (`enc` for `h`, the empty path for `h.enc` itself). `propertyRefinementBases` holds
+    // the type each def had before the first of those tests refined it.
+    using PropertyTests = std::unordered_map<std::string, std::vector<TypeId>>;
+    DenseHashMap<const Def*, PropertyTests> propertyTests{nullptr};
+    DenseHashMap<const Def*, TypeId> propertyRefinementBases{nullptr};
+    const PropertyTests* lookupPropertyTests(DefId def) const;
+    std::optional<TypeId> lookupPropertyRefinementBase(DefId def) const;
+
+    void inheritAssignments(const ScopePtr& childScope);
+    void inheritRefinements(const ScopePtr& childScope);
+
+    // Track globals that should emit warnings during type checking.
+    DenseHashSet<std::string> globalsToWarn{""};
+    bool shouldWarnGlobal(std::string name) const;
+
+    // For mutually recursive type aliases, it's important that
+    // they use the same types for the same names.
+    // For instance, in `type Tree<T> { data: T, children: Forest<T> } type Forest<T> = {Tree<T>}`
+    // we need that the generic type `T` in both cases is the same, so we use a cache.
+    std::unordered_map<Name, TypeId> typeAliasTypeParameters;
+    std::unordered_map<Name, TypePackId> typeAliasTypePackParameters;
+
+    std::optional<std::vector<TypeId>> interiorFreeTypes;
+    std::optional<std::vector<TypePackId>> interiorFreeTypePacks;
+
+    // Currently, Luau has a very strict restriction on recursive uses of
+    // type aliases (see: https://github.com/luau-lang/luau/pull/68). We keep
+    // a mapping of type aliases that violate this restriction to the location
+    // that marked said trigger.
+    //
+    // CLI-183875: Surely this can be an AstName?
+    DenseHashMap<std::string, Location> invalidTypeAliases{{}};
+    std::optional<Location> isInvalidTypeAlias(const std::string& name) const;
+
+    NotNull<Scope> findNarrowestScopeContaining(Location);
+};
+
+// Returns true iff the left scope encloses the right scope.  A Scope* equal to
+// nullptr is considered to be the outermost-possible scope.
+bool subsumesStrict(Scope* left, Scope* right);
+
+// Returns true if the left scope encloses the right scope, or if they are the
+// same scope.  As in subsumesStrict(), nullptr is considered to be the
+// outermost-possible scope.
+bool subsumes(Scope* left, Scope* right);
+
+// Luwu Destructuring (rfcs/destructuring.md): for an alias desugared from `type .{List} = mod`, the type function
+// `mod.List` when it is generic. The alias stands for that type function whole, generics included.
+std::optional<TypeFun> importedGenericOfDestructuredAlias(const Scope& scope, const AstStatTypeAlias* alias);
+
+inline Scope* max(Scope* left, Scope* right)
+{
+    if (subsumes(left, right))
+        return right;
+    else
+        return left;
+}
+
+} // namespace Luau

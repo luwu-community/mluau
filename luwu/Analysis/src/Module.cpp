@@ -1,0 +1,632 @@
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
+#include "Luau/Module.h"
+
+#include "Luau/ApplyTypeFunction.h"
+#include "Luau/Clone.h"
+#include "Luau/Common.h"
+#include "Luau/ConstraintGenerator.h"
+#include "Luau/Normalize.h"
+#include "Luau/RecursionCounter.h"
+#include "Luau/Scope.h"
+#include "Luau/Type.h"
+#include "Luau/TypeInfer.h"
+#include "Luau/TypePack.h"
+#include "Luau/VisitType.h"
+
+#include <algorithm>
+
+LUAU_FASTFLAGVARIABLE(LuauDoNotExportBrokenTypeFunction)
+
+namespace Luau
+{
+
+static void defaultLogLuau(std::string_view context, std::string_view input)
+{
+    // The default is to do nothing because we don't want to mess with
+    // the xml parsing done by the dcr script.
+}
+
+Luau::LogLuauProc logLuau = &defaultLogLuau;
+
+void setLogLuau(LogLuauProc ll)
+{
+    logLuau = ll;
+}
+
+void resetLogLuauProc()
+{
+    logLuau = &defaultLogLuau;
+}
+
+static bool contains(Position pos, Comment comment)
+{
+    if (comment.location.contains(pos))
+        return true;
+    else if (comment.type == Lexeme::BrokenComment && comment.location.begin <= pos) // Broken comments are broken specifically because they don't
+                                                                                     // have an end
+        return true;
+    // comments actually span the whole line - in incremental mode, we could pass a cursor outside of the current parsed comment range span, but it
+    // would still be 'within' the comment So, the cursor must be on the same line and the comment itself must come strictly after the `begin`
+    else if (comment.type == Lexeme::Comment && comment.location.end.line == pos.line && comment.location.begin <= pos)
+        return true;
+    else
+        return false;
+}
+
+std::vector<SourceComment> readSourceComments(std::string_view source, const std::vector<Comment>& comments)
+{
+    std::vector<size_t> lineStarts{0};
+    for (size_t i = 0; i < source.size(); ++i)
+    {
+        if (source[i] == '\n')
+            lineStarts.push_back(i + 1);
+    }
+
+    auto offsetOf = [&](Position pos) -> size_t
+    {
+        if (pos.line >= lineStarts.size())
+            return source.size();
+        return std::min(lineStarts[pos.line] + pos.column, source.size());
+    };
+
+    auto trim = [](std::string_view text)
+    {
+        size_t first = text.find_first_not_of(" \t\r\n");
+        if (first == std::string_view::npos)
+            return std::string_view{};
+        size_t last = text.find_last_not_of(" \t\r\n");
+        return text.substr(first, last - first + 1);
+    };
+
+    std::vector<SourceComment> result;
+    for (const Comment& comment : comments)
+    {
+        if (comment.type != Lexeme::Comment && comment.type != Lexeme::BlockComment)
+            continue;
+
+        size_t begin = offsetOf(comment.location.begin);
+        std::string_view text = source.substr(begin, offsetOf(comment.location.end) - begin);
+        std::string_view lineBefore = source.substr(lineStarts[std::min<size_t>(comment.location.begin.line, lineStarts.size() - 1)]);
+        lineBefore = lineBefore.substr(0, std::min<size_t>(comment.location.begin.column, lineBefore.size()));
+
+        SourceComment sourceComment;
+        sourceComment.location = comment.location;
+        sourceComment.startsLine = trim(lineBefore).empty();
+
+        if (comment.type == Lexeme::BlockComment)
+        {
+            // `--[==[ message ]==]`: the opener up to its second `[`, and the closer has as many `=`
+            size_t open = text.find('[', 3);
+            size_t prefixLength = open == std::string_view::npos ? text.size() : open + 1;
+            size_t levels = prefixLength >= 4 ? prefixLength - 4 : 0;
+            size_t closeLength = std::min(levels + 2, text.size() - prefixLength);
+            sourceComment.prefix = std::string(text.substr(0, prefixLength));
+            std::string_view body = trim(text.substr(prefixLength, text.size() - prefixLength - closeLength));
+
+            // The lines after the first keep the indentation they had in the source, which the first (trimmed, or on the
+            // opener's line) doesn't: take the indentation they share off them, and blank the whitespace-only ones
+            std::vector<std::string_view> lines;
+            for (size_t at = 0;;)
+            {
+                size_t end = body.find('\n', at);
+                lines.push_back(body.substr(at, end == std::string_view::npos ? std::string_view::npos : end - at));
+                if (end == std::string_view::npos)
+                    break;
+                at = end + 1;
+            }
+            size_t indent = std::string_view::npos;
+            for (size_t i = 1; i < lines.size(); ++i)
+            {
+                size_t first = lines[i].find_first_not_of(" \t\r");
+                if (first != std::string_view::npos)
+                    indent = std::min(indent, first);
+            }
+            for (size_t i = 0; i < lines.size(); ++i)
+            {
+                std::string_view line = lines[i];
+                if (line.find_first_not_of(" \t\r") == std::string_view::npos)
+                    line = {};
+                else if (i > 0)
+                    line.remove_prefix(indent);
+                if (i > 0)
+                    sourceComment.message += '\n';
+                sourceComment.message += line;
+            }
+        }
+        else
+        {
+            size_t dashes = text.find_first_not_of('-');
+            if (dashes == std::string_view::npos)
+                dashes = text.size();
+
+            // a hot comment is a directive, not a comment
+            if (dashes == 2 && dashes < text.size() && text[dashes] == '!')
+                continue;
+
+            sourceComment.prefix = std::string(text.substr(0, dashes));
+            sourceComment.message = std::string(trim(text.substr(dashes)));
+        }
+
+        result.push_back(std::move(sourceComment));
+    }
+
+    return result;
+}
+
+bool isWithinComment(const std::vector<Comment>& commentLocations, Position pos)
+{
+    auto iter = std::lower_bound(
+        commentLocations.begin(),
+        commentLocations.end(),
+        Comment{Lexeme::Comment, Location{pos, pos}},
+        [](const Comment& a, const Comment& b)
+        {
+            if (a.type == Lexeme::Comment)
+                return a.location.end.line < b.location.end.line;
+            return a.location.end < b.location.end;
+        }
+    );
+
+    if (iter == commentLocations.end())
+        return false;
+
+    if (contains(pos, *iter))
+        return true;
+
+    // Due to the nature of std::lower_bound, it is possible that iter points at a comment that ends
+    // at pos.  We'll try the next comment, if it exists.
+    ++iter;
+    if (iter == commentLocations.end())
+        return false;
+
+    return contains(pos, *iter);
+}
+
+bool isWithinComment(const SourceModule& sourceModule, Position pos)
+{
+    return isWithinComment(sourceModule.commentLocations, pos);
+}
+
+bool isWithinComment(const ParseResult& result, Position pos)
+{
+    return isWithinComment(result.commentLocations, pos);
+}
+
+bool isWithinHotComment(const std::vector<HotComment>& hotComments, Position pos)
+{
+    return findHotComment(hotComments, pos) != nullptr;
+}
+
+const HotComment* findHotComment(const std::vector<HotComment>& hotComments, Position pos)
+{
+    for (const HotComment& hotComment : hotComments)
+    {
+        if (hotComment.location.containsClosed(pos))
+            return &hotComment;
+    }
+
+    return nullptr;
+}
+
+bool isWithinHotComment(const SourceModule& sourceModule, Position pos)
+{
+    return isWithinHotComment(sourceModule.hotcomments, pos);
+}
+
+bool isWithinHotComment(const ParseResult& result, Position pos)
+{
+    return isWithinHotComment(result.hotcomments, pos);
+}
+
+struct ClonePublicInterface : Substitution
+{
+    NotNull<BuiltinTypes> builtinTypes;
+    NotNull<Module> module;
+    SolverMode solverMode;
+    bool internalTypeEscaped = false;
+
+    ClonePublicInterface(const TxnLog* log, NotNull<BuiltinTypes> builtinTypes, Module* module, SolverMode solverMode)
+        : Substitution(log, &module->interfaceTypes)
+        , builtinTypes(builtinTypes)
+        , module(module)
+        , solverMode(solverMode)
+    {
+        LUAU_ASSERT(module);
+    }
+
+    bool isNewSolver() const
+    {
+        return solverMode == SolverMode::New;
+    }
+
+    bool isDirty(TypeId ty) override
+    {
+        bool dirty = [&]
+        {
+            if (ty->owningArena == module->internalTypes.get())
+                return true;
+
+            if (const FunctionType* ftv = get<FunctionType>(ty))
+                return ftv->level.level != 0;
+            if (const TableType* ttv = get<TableType>(ty))
+                return ttv->level.level != 0;
+            return false;
+        }();
+
+        return dirty;
+    }
+
+    bool isDirty(TypePackId tp) override
+    {
+        return tp->owningArena == module->internalTypes.get();
+    }
+
+    bool ignoreChildrenVisit(TypeId ty) override
+    {
+        return ty->owningArena != module->internalTypes.get();
+    }
+
+    // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): an exported instantiation needs its template and class
+    // value in the interface too, and builds its members for whichever importing module reads them first
+    bool substitutesGenericTemplates() const override
+    {
+        return true;
+    }
+
+    std::shared_ptr<SharedNominalArena> sharedNominalArena() override
+    {
+        if (!nominalArena)
+            nominalArena = std::make_shared<SharedNominalArena>();
+        return nominalArena;
+    }
+
+    std::shared_ptr<SharedNominalArena> nominalArena;
+
+    bool ignoreChildrenVisit(TypePackId tp) override
+    {
+        if (tp->owningArena != module->internalTypes.get())
+            return true;
+
+        return false;
+    }
+
+    TypeId clean(TypeId ty) override
+    {
+        TypeId result = clone(ty);
+
+        if (FunctionType* ftv = getMutable<FunctionType>(result))
+        {
+            if (ftv->generics.empty() && ftv->genericPacks.empty())
+            {
+                GenericTypeFinder marker;
+                marker.traverse(result);
+
+                if (!marker.found)
+                    ftv->hasNoFreeOrGenericTypes = true;
+            }
+
+            ftv->level = TypeLevel{0, 0};
+        }
+        else if (TableType* ttv = getMutable<TableType>(result))
+        {
+            ttv->level = TypeLevel{0, 0};
+            if (isNewSolver())
+            {
+                ttv->scope = nullptr;
+                ttv->state = TableState::Sealed;
+            }
+        }
+
+        if (isNewSolver())
+        {
+            if (is<FreeType, BlockedType, PendingExpansionType>(ty))
+            {
+                internalTypeEscaped = true;
+                result = builtinTypes->errorType;
+            }
+            else if (auto genericty = getMutable<GenericType>(result))
+            {
+                genericty->scope = nullptr;
+            }
+            else if (auto tfit = get<TypeFunctionInstanceType>(ty);
+                     FFlag::LuauDoNotExportBrokenTypeFunction && tfit && tfit->state != TypeFunctionInstanceState::Solved)
+            {
+                result = builtinTypes->errorType;
+            }
+        }
+
+        return result;
+    }
+
+    TypePackId clean(TypePackId tp) override
+    {
+        if (isNewSolver())
+        {
+            if (is<FreeTypePack, BlockedTypePack>(tp))
+            {
+                internalTypeEscaped = true;
+                return builtinTypes->errorTypePack;
+            }
+
+            auto clonedTp = clone(tp);
+            if (auto gtp = getMutable<GenericTypePack>(clonedTp))
+                gtp->scope = nullptr;
+            return clonedTp;
+        }
+        else
+        {
+            return clone(tp);
+        }
+    }
+
+    TypeId cloneType(TypeId ty)
+    {
+        std::optional<TypeId> result = substitute(ty);
+        if (result)
+        {
+            return *result;
+        }
+        else
+        {
+
+            module->errors.emplace_back(module->scopes[0].first, UnificationTooComplex{});
+            return builtinTypes->errorType;
+        }
+    }
+
+    TypePackId cloneTypePack(TypePackId tp)
+    {
+        std::optional<TypePackId> result = substitute(tp);
+        if (result)
+        {
+            return *result;
+        }
+        else
+        {
+            module->errors.emplace_back(module->scopes[0].first, UnificationTooComplex{});
+            return builtinTypes->errorTypePack;
+        }
+    }
+
+    TypeFun cloneTypeFun(const TypeFun& tf)
+    {
+        std::vector<GenericTypeDefinition> typeParams;
+        std::vector<GenericTypePackDefinition> typePackParams;
+
+        for (GenericTypeDefinition typeParam : tf.typeParams)
+        {
+            TypeId ty = cloneType(typeParam.ty);
+            std::optional<TypeId> defaultValue;
+
+            if (typeParam.defaultValue)
+                defaultValue = cloneType(*typeParam.defaultValue);
+
+            typeParams.push_back(GenericTypeDefinition{ty, defaultValue});
+        }
+
+        for (GenericTypePackDefinition typePackParam : tf.typePackParams)
+        {
+            TypePackId tp = cloneTypePack(typePackParam.tp);
+            std::optional<TypePackId> defaultValue;
+
+            if (typePackParam.defaultValue)
+                defaultValue = cloneTypePack(*typePackParam.defaultValue);
+
+            typePackParams.push_back(GenericTypePackDefinition{tp, defaultValue});
+        }
+
+        TypeId type = cloneType(tf.type);
+
+        TypeFun result{std::move(typeParams), std::move(typePackParams), type, tf.definitionLocation};
+        result.definitionModuleName = tf.definitionModuleName;
+        return result;
+    }
+};
+
+Module::~Module()
+{
+    unfreeze(interfaceTypes);
+    if (internalTypes)
+        unfreeze(*internalTypes);
+}
+
+void Module::clonePublicInterface(NotNull<BuiltinTypes> builtinTypes, InternalErrorReporter& ice, SolverMode mode)
+{
+    CloneState cloneState{builtinTypes};
+
+    ScopePtr moduleScope = getModuleScope();
+
+    TypePackId returnType = moduleScope->returnType;
+    std::optional<TypePackId> varargPack = mode == SolverMode::New ? std::nullopt : moduleScope->varargPack;
+
+    TxnLog log;
+    ClonePublicInterface clonePublicInterface{&log, builtinTypes, this, mode};
+
+    returnType = clonePublicInterface.cloneTypePack(returnType);
+
+    moduleScope->returnType = returnType;
+    if (varargPack)
+    {
+        varargPack = clonePublicInterface.cloneTypePack(*varargPack);
+        moduleScope->varargPack = varargPack;
+    }
+
+    for (auto& [name, tf] : moduleScope->exportedTypeBindings)
+    {
+        tf = clonePublicInterface.cloneTypeFun(tf);
+
+        // Luwu: an exported type names the module it's declared in, so a copy in another module (an import, a forwarded
+        // or destructured type) still says which file definitionLocation is in. Upstream doesn't record it.
+        if (!tf.definitionModuleName)
+            tf.definitionModuleName = this->name;
+    }
+
+    for (auto& [name, ty] : declaredGlobals)
+    {
+        ty = clonePublicInterface.cloneType(ty);
+    }
+
+    for (auto& tf : typeFunctionAliases)
+    {
+        *tf = clonePublicInterface.cloneTypeFun(*tf);
+    }
+
+    if (clonePublicInterface.internalTypeEscaped)
+    {
+        errors.emplace_back(
+            Location{}, // Not amazing but the best we can do.
+            name,
+            InternalError{"An internal type is escaping this module; please report this bug at "
+                          "https://github.com/luwu-community/luwu/issues"}
+        );
+    }
+
+    // Copy external stuff over to Module itself
+    this->returnType = moduleScope->returnType;
+    this->exportedTypeBindings = moduleScope->exportedTypeBindings;
+
+    // Luwu forwarded module types: these are already the required module's public interface, so they aren't cloned
+    for (const auto& [name, tf] : forwardedTypeBindings)
+        this->exportedTypeBindings.try_emplace(name, tf);
+}
+
+bool Module::hasModuleScope() const
+{
+    return !scopes.empty();
+}
+
+ScopePtr Module::getModuleScope() const
+{
+    LUAU_ASSERT(hasModuleScope());
+    return scopes.front().second;
+}
+
+void synthesizeExportReturn(NotNull<BuiltinTypes> builtinTypes, NotNull<Module> module)
+{
+    LUAU_ASSERT(module->root);
+
+    ScopePtr moduleScope = module->getModuleScope();
+    TableType::Props props;
+
+    auto lookupExportedBindingType = [&](AstLocal* local) -> TypeId
+    {
+        NotNull<Scope> scope = moduleScope->findNarrowestScopeContaining(local->location);
+
+        if (std::optional<std::pair<Binding*, Scope*>> binding = scope->lookupEx(Symbol{local}))
+            return follow(binding->first->typeId);
+
+        return builtinTypes->errorType;
+    };
+
+    auto lookupExprType = [&](AstExpr* expr) -> TypeId
+    {
+        if (TypeId* ty = module->astTypes.find(expr))
+            return follow(*ty);
+
+        // Luwu: a call's type is its pack's first value (`export t = require(...)`). Upstream exports an error type.
+        if (TypePackId* pack = module->astTypePacks.find(expr))
+        {
+            if (std::optional<TypeId> first = Luau::first(*pack))
+                return follow(*first);
+        }
+
+        return builtinTypes->errorType;
+    };
+
+    DenseHashSet<AstLocal*> exportedLocals{nullptr};
+
+    for (AstStat* statement : module->root->body)
+    {
+        if (AstStatLocal* localStat = statement->as<AstStatLocal>())
+        {
+            if (!localStat->isExported)
+                continue;
+
+            for (size_t i = 0; i < localStat->vars.size; ++i)
+            {
+                AstLocal* local = localStat->vars.data[i];
+                // Luwu Destructuring (rfcs/destructuring.md): an exported destructuring's hidden local isn't exported
+                if (!local->isExported)
+                    continue;
+
+                exportedLocals.insert(local);
+
+                if (localStat->vars.size != localStat->values.size || i >= localStat->values.size)
+                {
+                    props[local->name.value] = lookupExportedBindingType(local);
+                }
+                else
+                {
+                    props[local->name.value] = Property::readonly(lookupExprType(localStat->values.data[i]));
+                }
+
+                props[local->name.value].location = local->location;
+            }
+        }
+        else if (AstStatLocalFunction* localFunction = statement->as<AstStatLocalFunction>())
+        {
+            if (!localFunction->name->isExported)
+                continue;
+
+            props[localFunction->name->name.value] = Property::readonly(lookupExportedBindingType(localFunction->name));
+            props[localFunction->name->name.value].location = localFunction->name->location;
+        }
+        else if (AstStatAssign* assign = statement->as<AstStatAssign>())
+        {
+            for (size_t i = 0; i < assign->vars.size; ++i)
+            {
+                AstExprLocal* exprLocal = assign->vars.data[i]->as<AstExprLocal>();
+                if (!exprLocal || !exportedLocals.contains(exprLocal->local))
+                    continue;
+
+                if (assign->vars.size != assign->values.size || i >= assign->values.size)
+                {
+                    props[exprLocal->local->name.value] = lookupExportedBindingType(exprLocal->local);
+                }
+                else
+                {
+                    props[exprLocal->local->name.value] = Property::readonly(lookupExprType(assign->values.data[i]));
+                }
+
+                props[exprLocal->local->name.value].location = exprLocal->local->location;
+            }
+        }
+        else if (AstStatFunction* funcStat = statement->as<AstStatFunction>())
+        {
+            // Luwu Export Values (rfcs/export-values.md): `export function f` that fills a forward-declared `local f` is an
+            // AstStatFunction too, with the local marked exported
+            AstExprLocal* exprLocal = funcStat->name->as<AstExprLocal>();
+            bool exported = exprLocal && (exportedLocals.contains(exprLocal->local) || exprLocal->local->isExported);
+            if (exported)
+            {
+                props[exprLocal->local->name.value] = Property::readonly(lookupExprType(funcStat->func));
+                props[exprLocal->local->name.value].location = exprLocal->local->location;
+            }
+        }
+        else if (FFlag::LuwuClasses)
+        {
+            if (AstStatClass* classStat = statement->as<AstStatClass>())
+            {
+                if (!classStat->exported)
+                    continue;
+
+                TypeId ty = builtinTypes->errorType;
+                if (auto found = moduleScope->lookup(Symbol{classStat->name->name}))
+                    ty = follow(*found);
+
+                props[classStat->name->name.value] = Property::readonly(ty);
+                props[classStat->name->name.value].location = classStat->name->location;
+            }
+        }
+    }
+
+    if (props.empty())
+        return;
+
+    TableType tbl{props, std::nullopt, moduleScope->level, TableState::Sealed};
+    tbl.definitionModuleName = module->name;
+    TypeId exports = module->internalTypes->addType(std::move(tbl));
+    moduleScope->returnType = module->internalTypes->addTypePack({exports});
+}
+
+} // namespace Luau

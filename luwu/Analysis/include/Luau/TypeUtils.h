@@ -1,0 +1,576 @@
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
+#pragma once
+
+#include "Luau/Error.h"
+#include "Luau/Location.h"
+#include "Luau/Type.h"
+#include "Luau/TypeIds.h"
+#include "Luau/TypePack.h"
+#include "Luau/VisitType.h"
+
+#include <memory>
+#include <optional>
+
+namespace Luau
+{
+
+struct TxnLog;
+struct TypeArena;
+class Normalizer;
+
+enum class ValueContext
+{
+    LValue,
+    RValue
+};
+
+/// the current context of the type checker
+enum class TypeContext
+{
+    /// the default context
+    Default,
+    /// inside of a condition
+    Condition,
+};
+
+bool inConditional(const TypeContext& context);
+
+// sets the given type context to `Condition` and restores it to its original
+// value when the struct drops out of scope
+struct InConditionalContext
+{
+    TypeContext* typeContext;
+    TypeContext oldValue;
+
+    explicit InConditionalContext(TypeContext* c, TypeContext newValue = TypeContext::Condition)
+        : typeContext(c)
+        , oldValue(*c)
+    {
+        *typeContext = newValue;
+    }
+
+    ~InConditionalContext()
+    {
+        *typeContext = oldValue;
+    }
+};
+
+using ScopePtr = std::shared_ptr<struct Scope>;
+
+std::optional<TypeId> findMetatableEntry(
+    NotNull<BuiltinTypes> builtinTypes,
+    ErrorVec& errors,
+    TypeId type,
+    const std::string& entry,
+    Location location
+);
+std::optional<TypeId> findTablePropertyRespectingMeta(
+    NotNull<BuiltinTypes> builtinTypes,
+    ErrorVec& errors,
+    TypeId ty,
+    const std::string& name,
+    Location location,
+    bool useNewSolver
+);
+std::optional<TypeId> findTablePropertyRespectingMeta(
+    NotNull<BuiltinTypes> builtinTypes,
+    ErrorVec& errors,
+    TypeId ty,
+    const std::string& name,
+    ValueContext context,
+    Location location,
+    bool useNewSolver
+);
+
+bool occursCheck(TypeId needle, TypeId haystack);
+
+// NOTE: This uses a custom enum as it is replacing several bespoke
+// implementations of the same logic.
+enum class OccursCheckResult
+{
+    Pass,
+    Fail
+};
+
+OccursCheckResult occursCheck(TypePackId needle, TypePackId haystack);
+
+// Returns the minimum and maximum number of types the argument list can accept.
+std::pair<size_t, std::optional<size_t>> getParameterExtents(const TxnLog* log, TypePackId tp, bool includeHiddenVariadics = false);
+
+// Extend the provided pack to at least `length` types.
+// Returns a temporary TypePack that contains those types plus a tail.
+TypePack extendTypePack(
+    TypeArena& arena,
+    NotNull<BuiltinTypes> builtinTypes,
+    TypePackId pack,
+    size_t length,
+    std::vector<std::optional<TypeId>> overrides = {}
+);
+
+/**
+ * Reduces a union by decomposing to the any/error type if it appears in the
+ * type list, and by merging child unions. Also strips out duplicate (by pointer
+ * identity) types.
+ * @param types the input type list to reduce.
+ * @returns the reduced type list.
+ */
+std::vector<TypeId> reduceUnion(const std::vector<TypeId>& types);
+
+/**
+ * Tries to remove nil from a union type, if there's another option. T | nil
+ * reduces to T, but nil itself does not reduce.
+ * @param builtinTypes the singleton types to use
+ * @param arena the type arena to allocate the new type in, if necessary
+ * @param ty the type to remove nil from
+ * @returns a type with nil removed, or nil itself if that were the only option.
+ */
+TypeId stripNil(NotNull<BuiltinTypes> builtinTypes, TypeArena& arena, TypeId ty);
+
+// Luwu Traits (rfcs/classes/traits.md): through the trait, an optional expected function (`expect function f?(self)`)
+// reads as `F?`, since an implementing class may leave it out. This is its `F`, and `ty` itself for any other member.
+TypeId expectedTraitFunction(TypeId ty);
+
+// Luwu: `v:m(...)` where `v` is a union whose members each have their own `m`: one function that takes any of their
+// `self`s, arguments every `m` accepts (each parameter after `self` is the intersection of theirs), and returns any of
+// their results. Sound only for a method call, where each member's `m` only ever gets that member as `self`; `local f =
+// v.m; f(v)` could pair one member's `m` with another member. Nothing when the `m`s have generics, or different numbers of
+// parameters or returns.
+std::optional<TypeId> mergeUnionMethods(NotNull<BuiltinTypes> builtinTypes, NotNull<TypeArena> arena, TypeId fn);
+
+struct ErrorSuppression
+{
+    enum Value
+    {
+        Suppress,
+        DoNotSuppress,
+        NormalizationFailed,
+    };
+
+    ErrorSuppression() = default;
+    constexpr ErrorSuppression(Value enumValue)
+        : value(enumValue)
+    {
+    }
+
+    constexpr operator Value() const
+    {
+        return value;
+    }
+    explicit operator bool() const = delete;
+
+    ErrorSuppression orElse(const ErrorSuppression& other) const
+    {
+        switch (value)
+        {
+        case DoNotSuppress:
+            return other;
+        default:
+            return *this;
+        }
+    }
+
+private:
+    Value value;
+};
+
+/**
+ * Normalizes the given type using the normalizer to determine if the type
+ * should suppress any errors that would be reported involving it.
+ * @param normalizer the normalizer to use
+ * @param ty the type to check for error suppression
+ * @returns an enum indicating whether or not to suppress the error or to signal a normalization failure
+ */
+ErrorSuppression shouldSuppressErrors(NotNull<Normalizer> normalizer, TypeId ty);
+
+/**
+ * Flattens and normalizes the given typepack using the normalizer to determine if the type
+ * should suppress any errors that would be reported involving it.
+ * @param normalizer the normalizer to use
+ * @param tp the typepack to check for error suppression
+ * @returns an enum indicating whether or not to suppress the error or to signal a normalization failure
+ */
+ErrorSuppression shouldSuppressErrors(NotNull<Normalizer> normalizer, TypePackId tp);
+
+/**
+ * Normalizes the two given type using the normalizer to determine if either type
+ * should suppress any errors that would be reported involving it.
+ * @param normalizer the normalizer to use
+ * @param ty1 the first type to check for error suppression
+ * @param ty2 the second type to check for error suppression
+ * @returns an enum indicating whether or not to suppress the error or to signal a normalization failure
+ */
+ErrorSuppression shouldSuppressErrors(NotNull<Normalizer> normalizer, TypeId ty1, TypeId ty2);
+
+/**
+ * Flattens and normalizes the two given typepacks using the normalizer to determine if either type
+ * should suppress any errors that would be reported involving it.
+ * @param normalizer the normalizer to use
+ * @param tp1 the first typepack to check for error suppression
+ * @param tp2 the second typepack to check for error suppression
+ * @returns an enum indicating whether or not to suppress the error or to signal a normalization failure
+ */
+ErrorSuppression shouldSuppressErrors(NotNull<Normalizer> normalizer, TypePackId tp1, TypePackId tp2);
+
+// Similar to `std::optional<std::pair<A, B>>`, but whose `sizeof()` is the same as `std::pair<A, B>`
+// and cooperates with C++'s `if (auto p = ...)` syntax without the extra fatness of `std::optional`.
+template<typename A, typename B>
+struct TryPair
+{
+    A first;
+    B second;
+
+    explicit operator bool() const
+    {
+        return bool(first) && bool(second);
+    }
+};
+
+template<typename A, typename B, typename Ty>
+TryPair<const A*, const B*> get2(Ty one, Ty two)
+{
+    static_assert(std::is_pointer_v<Ty>, "argument must be a pointer type");
+
+    const A* a = get<A>(one);
+    const B* b = get<B>(two);
+    if (a && b)
+        return {a, b};
+    else
+        return {nullptr, nullptr};
+}
+
+template<typename T, typename Ty>
+const T* get(std::optional<Ty> ty)
+{
+    if (ty)
+        return get<T>(*ty);
+    else
+        return nullptr;
+}
+
+template<typename T, typename Ty>
+T* getMutable(std::optional<Ty> ty)
+{
+    if (ty)
+        return getMutable<T>(*ty);
+    else
+        return nullptr;
+}
+
+template<typename Ty>
+std::optional<Ty> follow(std::optional<Ty> ty)
+{
+    if (ty)
+        return follow(*ty);
+    else
+        return std::nullopt;
+}
+
+/**
+ * Returns whether or not expr is a literal expression, for example:
+ * - Scalar literals (numbers, booleans, strings, nil)
+ * - Table literals
+ * - Lambdas (a "function literal")
+ */
+bool isLiteral(const AstExpr* expr);
+
+// Clip with LuauRelaxConstraintOrderingForFunctionCheck
+/**
+ * Given a function call and a mapping from expression to type, determine
+ * whether the type of any argument in said call in depends on a blocked types.
+ * This is used as a precondition for bidirectional inference: be warned that
+ * the behavior of this algorithm is tightly coupled to that of bidirectional
+ * inference.
+ * @param expr Expression to search
+ * @param astTypes Mapping from AST node to TypeID
+ * @returns A vector of blocked types
+ */
+std::vector<TypeId> findBlockedArgTypesIn_DEPRECATED(AstExprCall* expr, NotNull<DenseHashMap<const AstExpr*, TypeId>> astTypes);
+
+/**
+ * Given a scope and a free type, find the closest parent that has a present
+ * `interiorFreeTypes` and append the given type to said list. This list will
+ * be generalized when the requisite `GeneralizationConstraint` is resolved.
+ * @param scope Initial scope this free type was attached to
+ * @param ty Free type to track.
+ */
+void trackInteriorFreeType(Scope* scope, TypeId ty);
+
+void trackInteriorFreeTypePack(Scope* scope, TypePackId tp);
+
+// A fast approximation of subTy <: superTy
+bool fastIsSubtype(TypeId subTy, TypeId superTy);
+
+/**
+ * @param tables A list of potential table parts of a union
+ * @param exprType Type of the expression to match
+ * @return An element of `tables` that best matches `exprType`.
+ */
+std::optional<TypeId> extractMatchingTableType_DEPRECATED(const UnionType* expectedUnion, TypeId exprType, NotNull<BuiltinTypes> builtinTypes);
+
+std::optional<TypeId> extractMatchingTableType(
+    const UnionType* expectedUnion,
+    TypeId exprType,
+    NotNull<BuiltinTypes> builtinTypes,
+    NotNull<TypeArena> arena
+);
+
+/**
+ * @param item A member of a table in an AST
+ * @return Whether the item is a key-value pair with a statically defined string key.
+ *
+ * ```
+ * {
+ *      ["foo"] = ..., -- is a record
+ *      bar = ..., -- is a record
+ *      ..., -- not a record: non-string key (number)
+ *      [true] = ..., -- not a record: non-string key (boolean)
+ *      [ foobar() ] = ..., -- not a record: unknown key value.
+ *      ["foo" .. "bar"] = ..., -- not a record (don't make us handle it).
+ * }
+ * ```
+ */
+bool isRecord(const AstExprTable::Item& item);
+
+/**
+ * Do a quick check for whether the type `ty` is exactly `false | nil`. This
+ * will *not* do any sort of semantic analysis, for example the type:
+ *
+ *      (boolean?) & (false | nil)
+ *
+ * ... will not be considered falsy, despite it being semantically equivalent
+ * to `false | nil`.
+ *
+ * @return Whether the input is approximately `false | nil`.
+ */
+bool isApproximatelyFalsyType(TypeId ty);
+
+/**
+ * Do a quick check for whether the type `ty` is exactly `~(false | nil)`.
+ * This will *not* do any sort of semantic analysis, for example the type:
+ *
+ *      unknown & ~(false | nil)
+ *
+ * ... will not be considered falsy, despite it being semantically equivalent
+ * to `~(false | nil)`.
+ *
+ * @return Whether the input is approximately `~(false | nil)`.
+ */
+bool isApproximatelyTruthyType(TypeId ty);
+
+// Unwraps any grouping expressions iteratively.
+AstExpr* unwrapGroup(AstExpr* expr);
+
+// Returns true if ty is optional, ie if it is a supertype of nil
+bool isOptionalType(TypeId ty, NotNull<BuiltinTypes> builtinTypes);
+
+// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): the element type `<+` stores into and `<-` removes from a
+// table raw: an array's element type, or `never` for a table with nothing in it (no indexer or properties). nullopt
+// for any other table.
+std::optional<TypeId> rawArrayElement(const TableType& table, NotNull<BuiltinTypes> builtinTypes);
+
+// These are magic types used in `TypeChecker2` and `NonStrictTypeChecker`
+//
+// `_luau_print` causes it's argument to be printed out, as in:
+//
+//      local x: _luau_print<number>
+//
+// ... will cause `number` to be printed.
+inline constexpr char kLuauPrint[] = "_luau_print";
+// `_luau_force_constraint_solving_incomplete` will cause us to _always_ emit
+// a constraint solving incomplete error to test semantics around that specific
+// error.
+inline constexpr char kLuauForceConstraintSolvingIncomplete[] = "_luau_force_constraint_solving_incomplete";
+// `_luau_blocked_type` will cause us to always mint a blocked type that does
+// not get emplaced by constraint solving.
+inline constexpr char kLuauBlockedType[] = "_luau_blocked_type";
+
+struct UnionBuilder
+{
+    UnionBuilder(NotNull<TypeArena> arena, NotNull<BuiltinTypes> builtinTypes);
+    void add(TypeId ty);
+    TypeId build();
+    size_t size() const;
+    void reserve(size_t size);
+
+private:
+    NotNull<TypeArena> arena;
+    NotNull<BuiltinTypes> builtinTypes;
+    TypeIds options;
+    bool isTop = false;
+};
+
+struct IntersectionBuilder
+{
+    IntersectionBuilder(NotNull<TypeArena> arena, NotNull<BuiltinTypes> builtinTypes);
+    void add(TypeId ty);
+    TypeId build();
+    size_t size() const;
+    void reserve(size_t size);
+
+private:
+    NotNull<TypeArena> arena;
+    NotNull<BuiltinTypes> builtinTypes;
+    TypeIds parts;
+    bool isBottom = false;
+};
+
+TypeId addIntersection(NotNull<TypeArena> arena, NotNull<BuiltinTypes> builtinTypes, std::initializer_list<TypeId> list);
+TypeId addUnion(NotNull<TypeArena> arena, NotNull<BuiltinTypes> builtinTypes, std::initializer_list<TypeId> list);
+
+// Clip with LuauInstantiateFunctionTypeBeforePush
+struct ContainsAnyGeneric_DEPRECATED final : public TypeOnceVisitor
+{
+    bool found = false;
+
+    explicit ContainsAnyGeneric_DEPRECATED();
+
+    bool visit(TypeId ty) override;
+    bool visit(TypePackId ty) override;
+
+    bool visit(TypeId ty, const ExternType&) override;
+
+    /**
+     * @returns if there is _any_ generic in `ty`
+     */
+    static bool hasAnyGeneric(TypeId ty);
+    static bool hasAnyGeneric(TypePackId tp);
+};
+
+/**
+ * @returns if `ty` contains a generic in the set `generics`.
+ */
+bool containsGeneric(TypeId ty, NotNull<DenseHashSet<const void*>> generics);
+bool containsGeneric(TypePackId ty, NotNull<DenseHashSet<const void*>> generics);
+
+/**
+ * @return Whether `ty` is a type that cannot be unified with another type,
+ *         such as a blocked type, pending expansion type, or an unsolved
+ *         type function.
+ */
+bool isBlocked(TypeId ty);
+
+
+/**
+ * **YOU SHOULD PROBABLY NOT USE THIS FUNCTION.**
+ *
+ * This function is a stop-gap while we rework function call inference and
+ * eager generalization.
+ *
+ * @return An approximate return type of `ty`, assuming `ty` is a function or
+ *         union of functions.
+ */
+std::optional<TypePackId> getApproximateReturnTypeForFunctionCall(TypeId ty);
+
+/**
+ * Names the operands of an operator that could be `nil`, for an error message: "one or both operands
+ * could be `nil`", "the left operand could be `nil`", "the operand could be `nil`".
+ *
+ * `nil` never carries a metamethod, so an optional operand is always a reason the operator could not
+ * be applied -- and, unlike a missing metamethod on a type the reader did not think they were using,
+ * it is the reason they can act on.
+ *
+ * Pass nullopt for `right` for a unary operator. Returns nullopt when no operand could be `nil`.
+ * Deliberately narrower than `isOptional`, which also answers true for `any` and `unknown`.
+ */
+std::optional<std::string> describeOptionalOperands(TypeId left, std::optional<TypeId> right);
+
+/**
+ * Luwu Classes (rfcs/classes): whether `location`, a position in module `moduleName`, lies inside
+ * `cls`'s class declaration (for `private` members and private constructors). A class's location
+ * belongs to the module that declares it, so a location in any other module is outside, whatever
+ * its line and column.
+ */
+bool isInsideClassDeclaration(const ExternType* cls, const ModuleName& moduleName, const Location& location);
+
+/**
+ * Luwu Classes (rfcs/classes): "object", "class" or "trait" when `ty` is an object, a class value or a trait value
+ * (or one of those roots itself), and nullptr for anything else. These are the words `type` and `typeof` answer at
+ * runtime. A union answers only when every member has the same kind.
+ */
+const char* luwuNominalKind(TypeId ty);
+
+/**
+ * Luwu Classes (rfcs/classes): `ty` described for an error message: "an object of class 'Cat'", "an object implementing
+ * 'Named'" (a value typed by a trait), "class 'Cat'", "trait 'Named'", or the quoted type for anything else.
+ */
+std::string describeLuwuNominalValue(TypeId ty);
+
+/**
+ * Luwu Classes (rfcs/classes): the check to use instead of comparing with a class or trait (`obj == Cat`,
+ * `typeof(obj) == "Cat"`): `class.isinstance(value, Cat)`, or `class.implements(value, Named)` for a trait.
+ */
+std::string luwuNominalCheckSuggestion(const std::string& declarationName, bool isTrait);
+
+/**
+ * Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): marks `prop` deprecated when the
+ * field it was declared from carries `@deprecated`, with the attribute's `use` as its suggestion. Leaves `prop`
+ * alone otherwise.
+ */
+void applyDeprecatedAttribute(Property& prop, const AstArray<AstAttr*>& attributes);
+
+/**
+ * Luwu Classes (rfcs/classes): the class value type of a generic class named without type arguments, as `List` is in
+ * `class<List>`, or nothing when `argument` is anything else.
+ */
+std::optional<TypeId> genericClassValueType(const Scope& scope, const AstType* argument);
+
+/**
+ * Luwu Classes (rfcs/classes): what calling the class or trait value `ty` calls -- the class's constructor, or a trait's
+ * `__create` -- as its `__call` metamethod, taking the value itself first. Nothing for any other type.
+ */
+std::optional<TypeId> classValueCallType(NotNull<BuiltinTypes> builtinTypes, TypeId ty);
+
+/**
+ * Luwu Classes (rfcs/classes): the function type `fnTy` without its first parameter (a method's `self`, or the class value
+ * a constructor's `__call` takes), or `fnTy` itself when it isn't a function taking one.
+ */
+TypeId withoutFirstParameter(TypeArena& arena, TypeId fnTy);
+
+/**
+ * Luwu Traits (rfcs/classes/traits.md): whether an error type appears anywhere in `ty`, e.g. from a generic type named
+ * without its arguments in an annotation, whose error was already reported where it is written.
+ */
+bool containsErrorType(TypeId ty);
+
+// Luwu literal types: whether `ref` is `literal<B>`, i.e. not a type the code itself named `literal`
+bool isLiteralTypeReference(const Scope& scope, const class AstTypeReference* ref);
+
+// Luwu literal types: the singleton a literal's still-undecided type (`"a"` until it widens to `string`) would keep, for
+// binding it there so it doesn't widen
+std::optional<TypeId> undecidedLiteral(TypeId ty);
+
+// Luwu literal types: the literal parameter an argument at `paramIndex` (counting `self`) is passed to, if any
+const FunctionType::LiteralParameter* findLiteralParameter(const FunctionType& fty, size_t paramIndex);
+
+// Luwu (helpful subtyping errors): gives a member a value for the lifetime of the guard and restores the one it
+// had on every exit, including a `TimeLimitError` or `UserCancelError` thrown through it.
+template<typename T>
+struct ScopedMemberValue
+{
+    ScopedMemberValue(T& target, T value)
+        : member(target)
+        , previous(std::move(target))
+    {
+        member = std::move(value);
+    }
+
+    ~ScopedMemberValue()
+    {
+        member = std::move(previous);
+    }
+
+    ScopedMemberValue(const ScopedMemberValue&) = delete;
+    ScopedMemberValue& operator=(const ScopedMemberValue&) = delete;
+
+private:
+    T& member;
+    T previous;
+};
+
+/**
+ * Luwu Classes (rfcs/classes): what Analysis knows about a class beyond its props, when `ty` is the type of its
+ * objects. Null for any other type, extern types included.
+ */
+const ClassFieldUserData* getClassFieldUserData(TypeId ty);
+
+} // namespace Luau

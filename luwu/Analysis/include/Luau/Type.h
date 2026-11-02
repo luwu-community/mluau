@@ -1,0 +1,1717 @@
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
+#pragma once
+
+#include "Luau/TypeFwd.h"
+
+#include "Luau/Ast.h"
+#include "Luau/Common.h"
+#include "Luau/DenseHash.h"
+#include "Luau/NotNull.h"
+#include "Luau/Polarity.h"
+#include "Luau/Predicate.h"
+#include "Luau/Refinement.h"
+#include "Luau/Unifiable.h"
+#include "Luau/Variant.h"
+#include "Luau/VecDeque.h"
+
+#include <array>
+#include <atomic>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <string>
+#include <vector>
+
+LUAU_FASTINT(LuauTableTypeMaximumStringifierLength)
+LUAU_FASTINT(LuauTypeMaximumStringifierLength)
+
+namespace Luau
+{
+
+struct TypeArena;
+struct Scope;
+using ScopePtr = std::shared_ptr<Scope>;
+struct Module;
+
+struct TypeFunction;
+struct TypeFun;
+struct Constraint;
+struct Subtyping;
+struct TypeChecker2;
+struct BuiltinTypeFunctions;
+
+enum struct SolverMode
+{
+    Old,
+    New
+};
+
+/**
+ * There are three kinds of type variables:
+ * - `Free` variables are metavariables, which stand for unconstrained types.
+ * - `Bound` variables are metavariables that have an equality constraint.
+ * - `Generic` variables are type variables that are bound by generic functions.
+ *
+ * For example, consider the program:
+ * ```
+ * function(x, y) x.f = y end
+ * ```
+ * To typecheck this, we first introduce free metavariables for the types of `x` and `y`:
+ * ```
+ * function(x: X, y: Y) x.f = y end
+ * ```
+ * Type inference for the function body then produces the constraint:
+ * ```
+ * X = { f: Y }
+ * ```
+ * so `X` is now a bound metavariable. We can then quantify the metavariables,
+ * which replaces any bound metavariables by their binding, and free metavariables
+ * by bound generic variables:
+ * ```
+ * function<a>(x: { f: a }, y: a) x.f = y end
+ * ```
+ */
+
+using Name = std::string;
+
+// A free type is one whose exact shape has yet to be fully determined.
+struct FreeType
+{
+    // New constructors
+    explicit FreeType(TypeLevel level, TypeId lowerBound, TypeId upperBound);
+    // This one got promoted to explicit
+    explicit FreeType(Scope* scope, TypeId lowerBound, TypeId upperBound, Polarity polarity = Polarity::Unknown);
+    explicit FreeType(Scope* scope, TypeLevel level, TypeId lowerBound, TypeId upperBound);
+
+    int index;
+    TypeLevel level;
+    Scope* scope = nullptr;
+
+    // True if this free type variable is part of a mutually
+    // recursive type alias whose definitions haven't been
+    // resolved yet.
+    bool forwardedTypeAlias = false;
+
+    // Only used under local type inference
+    TypeId lowerBound = nullptr;
+    TypeId upperBound = nullptr;
+
+    Polarity polarity = Polarity::Unknown;
+
+    // If set, this free type was created for a primitive literal (string or boolean).
+    // When generalized, it will be resolved to its lower-bound singleton if the upper
+    // bound was narrowed, or to this primitive type otherwise.
+    std::optional<TypeId> primitiveType;
+};
+
+struct GenericType
+{
+    // By default, generics are global, with a synthetic name
+    GenericType();
+
+    explicit GenericType(TypeLevel level);
+    explicit GenericType(const Name& name, Polarity polarity);
+    explicit GenericType(Scope* scope, Polarity polarity);
+
+    GenericType(TypeLevel level, const Name& name);
+    GenericType(Scope* scope, const Name& name);
+
+    GenericType(Scope* scope, Name name, Polarity polarity);
+
+    int index;
+    TypeLevel level;
+    Scope* scope = nullptr;
+    Name name;
+    bool explicitName = false;
+
+    Polarity polarity = Polarity::Unknown;
+
+    // Luwu Traits (rfcs/classes/traits.md): the `Self` a trait function is generic over. Printed as `Self`, without the
+    // `<Self>` the function would otherwise list it in, and `Self & Trait` (its `self`) as just `Self`.
+    bool traitSelf = false;
+
+    // Luwu literal types: set on the generic `literal<B>` stands for in a validator (`V<literal<B>>`) or an alias of one, to
+    // `B`. A parameter annotated with such an alias is a literal parameter.
+    TypeId literalBase = nullptr;
+};
+
+// When an equality constraint is found, it is then "bound" to that type,
+// indicating that the two types are actually the same type.
+using BoundType = Unifiable::Bound<TypeId>;
+
+using Tags = std::vector<std::string>;
+
+using ModuleName = std::string;
+
+/** A Type that cannot be computed.
+ *
+ * BlockedTypes essentially serve as a way to encode partial ordering on the
+ * constraint graph. Until a BlockedType is unblocked by its owning
+ * constraint, nothing at all can be said about it. Constraints that need to
+ * process a BlockedType cannot be dispatched.
+ *
+ * Whenever a BlockedType is added to the graph, we also record a constraint
+ * that will eventually unblock it.
+ */
+struct BlockedType
+{
+    BlockedType();
+    int index;
+
+    const Constraint* getOwner() const;
+    void setOwner(const Constraint* newOwner);
+    void replaceOwner(const Constraint* newOwner);
+
+private:
+    // The constraint that is intended to unblock this type. Other constraints
+    // should block on this constraint if present.
+    const Constraint* owner = nullptr;
+};
+
+struct PrimitiveType
+{
+    enum Type
+    {
+        NilType, // ObjC #defines Nil :(
+        Boolean,
+        Number,
+        Integer,
+        String,
+        Thread,
+        Function,
+        Table,
+        Buffer,
+        NoneType,
+    };
+
+    Type type;
+    std::optional<TypeId> metatable; // string has a metatable
+
+    explicit PrimitiveType(Type type)
+        : type(type)
+    {
+    }
+
+    explicit PrimitiveType(Type type, TypeId metatable)
+        : type(type)
+        , metatable(metatable)
+    {
+    }
+};
+
+// Singleton types https://github.com/luau-lang/rfcs/blob/master/docs/syntax-singleton-types.md
+// Types for true and false
+struct BooleanSingleton
+{
+    bool value;
+
+    bool operator==(const BooleanSingleton& rhs) const
+    {
+        return value == rhs.value;
+    }
+
+    bool operator!=(const BooleanSingleton& rhs) const
+    {
+        return !(*this == rhs);
+    }
+};
+
+// Types for "foo", "bar" etc.
+struct StringSingleton
+{
+    std::string value;
+
+    bool operator==(const StringSingleton& rhs) const
+    {
+        return value == rhs.value;
+    }
+
+    bool operator!=(const StringSingleton& rhs) const
+    {
+        return !(*this == rhs);
+    }
+};
+
+// No type for float singletons, partly because === isn't any equivalence on floats
+// (NaN != NaN).
+
+using SingletonVariant = Luau::Variant<BooleanSingleton, StringSingleton>;
+
+struct SingletonType
+{
+    explicit SingletonType(const SingletonVariant& variant)
+        : variant(variant)
+    {
+    }
+
+    explicit SingletonType(SingletonVariant&& variant)
+        : variant(std::move(variant))
+    {
+    }
+
+    // Default operator== is C++20.
+    bool operator==(const SingletonType& rhs) const
+    {
+        return variant == rhs.variant;
+    }
+
+    bool operator!=(const SingletonType& rhs) const
+    {
+        return !(*this == rhs);
+    }
+
+    SingletonVariant variant;
+};
+
+template<typename T>
+const T* get(const SingletonType* stv)
+{
+    if (stv)
+        return get_if<T>(&stv->variant);
+    else
+        return nullptr;
+}
+
+struct FunctionArgument
+{
+    Name name;
+    Location location;
+};
+
+struct FunctionDefinition
+{
+    std::optional<ModuleName> definitionModuleName;
+    Location definitionLocation;
+    std::optional<Location> varargLocation;
+    Location originalNameLocation;
+};
+
+// TODO: Come up with a better name.
+// TODO: Do we actually need this? We'll find out later if we can delete this.
+// Does not exactly belong in Type.h, but this is the only way to appease the compiler.
+template<typename T>
+struct WithPredicate
+{
+    T type;
+    PredicateVec predicates;
+
+    WithPredicate() = default;
+    explicit WithPredicate(T type)
+        : type(type)
+    {
+    }
+
+    WithPredicate(T type, PredicateVec predicates)
+        : type(type)
+        , predicates(std::move(predicates))
+    {
+    }
+};
+
+struct MagicFunctionCallContext
+{
+    NotNull<struct ConstraintSolver> solver;
+    NotNull<const Constraint> constraint;
+    NotNull<const AstExprCall> callSite;
+    TypePackId arguments;
+    TypePackId result;
+};
+
+struct MagicRefinementContext
+{
+    NotNull<Scope> scope;
+    const class AstExprCall* callSite;
+    std::vector<std::optional<TypeId>> discriminantTypes;
+
+    // Luwu: upstream's context has only the three above. A refinement that depends on another argument's type
+    // (`class.isinstance(x, C)` refines `x` by `C`) needs the arguments, and the solver for its builtin types.
+    NotNull<struct ConstraintSolver> solver;
+    TypePackId arguments;
+};
+
+struct MagicFunctionTypeCheckContext
+{
+    NotNull<TypeChecker2> typechecker;
+    NotNull<BuiltinTypes> builtinTypes;
+    const class AstExprCall* callSite;
+    TypePackId arguments;
+    NotNull<Scope> checkScope;
+};
+
+struct MagicFunction
+{
+    virtual std::optional<WithPredicate<TypePackId>> handleOldSolver(
+        struct TypeChecker&,
+        const std::shared_ptr<struct Scope>&,
+        const class AstExprCall&,
+        WithPredicate<TypePackId>
+    ) = 0;
+
+    // Callback to allow custom typechecking of builtin function calls whose argument types
+    // will only be resolved after constraint solving. For example, the arguments to string.format
+    // have types that can only be decided after parsing the format string and unifying
+    // with the passed in values, but the correctness of the call can only be decided after
+    // all the types have been finalized.
+    virtual bool infer(const MagicFunctionCallContext&) = 0;
+    virtual void refine(const MagicRefinementContext&) {}
+
+    // If a magic function needs to do its own special typechecking, do it here.
+    // Returns true if magic typechecking was performed.  Return false if the
+    // default typechecking logic should run.
+    virtual bool typeCheck(const MagicFunctionTypeCheckContext&)
+    {
+        return false;
+    }
+
+    virtual ~MagicFunction() {}
+};
+
+// Luwu literal types: what a value given for `literal<B>`, `V<literal<B>>` or an alias of either must be (a parameter's
+// argument, a local's value, a table field's value). It must be a literal of type `B` (`"-f"`, not a `string`). For
+// `V<literal<B>>`, it is also checked against `validator` with `placeholder` replaced by its literal type, so a user type
+// function can accept or reject the value itself.
+struct LiteralCheck
+{
+    TypeId base = nullptr;
+    // Both null for a bare `literal<B>`. Otherwise `placeholder` is the GenericType `literal<B>` resolved to inside
+    // `validator`.
+    TypeId validator = nullptr;
+    TypeId placeholder = nullptr;
+    // The rest of a union the check is one member of (`nil` for `literal<B>?`, `Token | number` for
+    // `V<literal<B>> | Token | number`): a value that fits it isn't checked. Null when there is none.
+    TypeId alternatives = nullptr;
+
+    // Calls `f` on each type held, for the walks that copy or visit types. A copy that skips them (a module's public
+    // interface is one) leaves them pointing into the arena it copied from.
+    template<typename F>
+    void forEachType(F&& f)
+    {
+        forEachTypeOf(*this, f);
+    }
+
+    template<typename F>
+    void forEachType(F&& f) const
+    {
+        forEachTypeOf(*this, f);
+    }
+
+private:
+    template<typename Check, typename F>
+    static void forEachTypeOf(Check& check, F& f)
+    {
+        f(check.base);
+        if (check.validator)
+        {
+            f(check.validator);
+            f(check.placeholder);
+        }
+        if (check.alternatives)
+            f(check.alternatives);
+    }
+};
+
+struct FunctionType
+{
+    // Global monomorphic function
+    FunctionType(TypePackId argTypes, TypePackId retTypes, std::optional<FunctionDefinition> defn = {}, bool hasSelf = false);
+
+    // Global polymorphic function
+    FunctionType(
+        std::vector<TypeId> generics,
+        std::vector<TypePackId> genericPacks,
+        TypePackId argTypes,
+        TypePackId retTypes,
+        std::optional<FunctionDefinition> defn = {},
+        bool hasSelf = false
+    );
+
+    // Local monomorphic function
+    FunctionType(TypeLevel level, TypePackId argTypes, TypePackId retTypes, std::optional<FunctionDefinition> defn = {}, bool hasSelf = false);
+
+    // Local polymorphic function
+    FunctionType(
+        TypeLevel level,
+        std::vector<TypeId> generics,
+        std::vector<TypePackId> genericPacks,
+        TypePackId argTypes,
+        TypePackId retTypes,
+        std::optional<FunctionDefinition> defn = {},
+        bool hasSelf = false
+    );
+
+    std::optional<FunctionDefinition> definition;
+    /// These should all be generic
+    std::vector<TypeId> generics;
+    std::vector<TypePackId> genericPacks;
+    std::vector<std::optional<FunctionArgument>> argNames;
+    Tags tags;
+    TypeLevel level;
+    TypePackId argTypes;
+    TypePackId retTypes;
+    std::shared_ptr<MagicFunction> magic = nullptr;
+
+    bool hasSelf;
+    // `hasNoFreeOrGenericTypes` should be true if and only if the type does not have any free or generic types present inside it.
+    // this flag is used as an optimization to exit early from procedures that manipulate free or generic types.
+    bool hasNoFreeOrGenericTypes = false;
+    bool isCheckedFunction = false;
+    bool isDeprecatedFunction = false;
+    std::shared_ptr<AstAttr::DeprecatedInfo> deprecatedInfo;
+
+    // Luwu: from `@nodiscard` / `@[nodiscard("reason")]`. A call whose result isn't used is reported (the DiscardedResult
+    // lint), with the reason when there is one.
+    bool isNodiscard = false;
+    std::string nodiscardReason;
+
+    // Luwu user-defined refinements: from `@[truthy(param, Type)]`. A call that returns a truthy value refines its
+    // argument for parameter `argIndex` (counting `self`) to `type`.
+    struct TruthyRefinement
+    {
+        size_t argIndex;
+        TypeId type;
+    };
+    std::optional<TruthyRefinement> truthyRefinement;
+
+    // Luwu literal types: a parameter annotated `literal<B>` or `V<literal<B>>` has type `B` in the function's argument
+    // pack, which is what its body sees. Its argument at each call is checked as LiteralCheck says.
+    struct LiteralParameter : LiteralCheck
+    {
+        // Counting `self`. For the variadic parameter, the first argument it covers.
+        size_t argIndex = 0;
+        bool variadic = false;
+    };
+    std::vector<LiteralParameter> literalParameters;
+
+    // Luwu try expressions: the errors the function says it raises (`! E`), joined with the ones inferred from its body.
+    // A hint types a `try` around a call; nothing checks it against what the function really raises.
+    std::optional<TypeId> errorHint;
+
+    // Set when this function type is the target of a `type X = (...) -> ...` alias. See TableType::name/syntheticName.
+    std::optional<std::string> name;
+    std::optional<std::string> syntheticName;
+};
+
+enum class TableState
+{
+    // Sealed tables have an exact, known shape
+    Sealed,
+
+    // An unsealed table can have extra properties added to it
+    Unsealed,
+
+    // Tables which are not yet fully understood.  We are still in the process of learning its shape.
+    Free,
+
+    // A table which is a generic parameter to a function.  We know that certain properties are required,
+    // but we don't care about the full shape.
+    Generic,
+};
+
+struct TableIndexer
+{
+    TableIndexer(TypeId indexType, TypeId indexResultType, bool isReadOnly = false)
+        : indexType(indexType)
+        , indexResultType(indexResultType)
+        , isReadOnly(isReadOnly)
+    {
+    }
+
+    TypeId indexType;
+    TypeId indexResultType;
+    bool isReadOnly = false;
+};
+
+struct TypeMetadataTable;
+
+struct Property
+{
+    static Property readonly(TypeId ty);
+    static Property writeonly(TypeId ty);
+    static Property rw(TypeId ty);                 // Shared read-write type.
+    static Property rw(TypeId read, TypeId write); // Separate read-write type.
+
+    // Invariant: at least one of the two optionals are not nullopt!
+    // If the read type is not nullopt, but the write type is, then the property is readonly.
+    // If the read type is nullopt, but the write type is not, then the property is writeonly.
+    // If the read and write types are not nullopt, then the property is read and write.
+    // Otherwise, an assertion where read and write types are both nullopt will be tripped.
+    static Property create(std::optional<TypeId> read, std::optional<TypeId> write);
+
+    bool deprecated = false;
+    std::string deprecatedSuggestion;
+
+    // Luwu Classes (rfcs/classes): true if this property was declared `private` on a class.
+    // Private members may only be accessed from within the class's own definition block.
+    bool isPrivate = false;
+
+    // Luwu Classes (rfcs/classes): true if this property was declared `const` on a class.
+    // Const members may only be assigned to from within the class's own `__init` constructor.
+    bool isConst = false;
+
+    // Luwu Traits (rfcs/classes/traits.md): a trait's `final` field, which is also const. Only the trait sets it, from its
+    // default, so not even an implementing class's `__init` may assign it.
+    bool isFinal = false;
+
+    // If this property was inferred from an expression, this field will be
+    // populated with the source location of the corresponding table property.
+    std::optional<Location> location = std::nullopt;
+
+    // If this property was built from an explicit type annotation, this field
+    // will be populated with the source location of that table property.
+    std::optional<Location> typeLocation = std::nullopt;
+
+    Tags tags;
+    std::optional<std::string> documentationSymbol;
+
+    // Luwu doc references: the property's own doc comments (`comments`, like a type's metadata): the ones around a field
+    // in a table type, or what a type function set (`setpropertycomments`). A field's type can be shared (`number`), so
+    // they can't live on it.
+    std::shared_ptr<const TypeMetadataTable> metadata;
+
+    // DEPRECATED
+    // TODO: Kill all constructors in favor of `Property::rw(TypeId read, TypeId write)` and friends.
+    Property();
+    Property(
+        TypeId readTy,
+        bool deprecated = false,
+        const std::string& deprecatedSuggestion = "",
+        std::optional<Location> location = std::nullopt,
+        const Tags& tags = {},
+        const std::optional<std::string>& documentationSymbol = std::nullopt,
+        std::optional<Location> typeLocation = std::nullopt
+    );
+
+    // DEPRECATED: This should be removed with `LuauTypeSolverV2` clean up
+    TypeId type_DEPRECATED() const;
+    void setType(TypeId ty);
+
+    // If this property has a present `writeTy`, set it equal to the `readTy`.
+    // This is to ensure that if we normalize a property that has divergent
+    // read and write types, we make them converge (for now).
+    void makeShared();
+
+    bool isShared() const;
+    bool isReadOnly() const;
+    bool isWriteOnly() const;
+    bool isReadWrite() const;
+
+    std::optional<TypeId> readTy;
+    std::optional<TypeId> writeTy;
+};
+
+struct TableType
+{
+    // We choose std::map over unordered_map here just because we have unit tests that compare
+    // textual outputs.  I don't want to spend the effort making them resilient in the case where
+    // random events cause the iteration order of the map elements to change.
+    // If this shows up in a profile, we can revisit it.
+    using Props = std::map<Name, Property>;
+
+    TableType() = default;
+    explicit TableType(TableState state, TypeLevel level, Scope* scope = nullptr);
+    TableType(const Props& props, const std::optional<TableIndexer>& indexer, TypeLevel level, TableState state);
+    TableType(const Props& props, const std::optional<TableIndexer>& indexer, TypeLevel level, Scope* scope, TableState state);
+
+    Props props;
+    std::optional<TableIndexer> indexer;
+
+    TableState state = TableState::Unsealed;
+    TypeLevel level;
+    Scope* scope = nullptr;
+    std::optional<std::string> name;
+
+    // Sometimes we throw a type on a name to make for nicer error messages, but without creating any entry in the type namespace
+    // We need to know which is which when we stringify types.
+    std::optional<std::string> syntheticName;
+
+    std::vector<TypeId> instantiatedTypeParams;
+    std::vector<TypePackId> instantiatedTypePackParams;
+    ModuleName definitionModuleName;
+    Location definitionLocation;
+
+    std::optional<TypeId> boundTo;
+    Tags tags;
+
+    // We track the number of as-yet-unadded properties to unsealed tables.
+    // Some constraints will use this information to decide whether or not they
+    // are able to dispatch.
+    size_t remainingProps = 0;
+
+    // Luwu literal types: the fields annotated `literal<B>`, `V<literal<B>>` or an alias of either. The property's type is
+    // `B` (or `B?`); a value given for the field is checked as LiteralCheck says, wherever it flows in.
+    std::vector<std::pair<Name, LiteralCheck>> literalFields;
+};
+
+// Represents a metatable attached to a table type. Somewhat analogous to a bound type.
+struct MetatableType
+{
+    // Should always be a TableType.
+    TypeId table;
+    // Should almost always either be a TableType or another MetatableType,
+    // though it is possible for other types (like AnyType and ErrorType) to
+    // find their way here sometimes.
+    TypeId metatable;
+
+    std::optional<std::string> syntheticName;
+};
+
+// Custom userdata of a class type
+struct ClassUserData
+{
+    virtual ~ClassUserData() {}
+};
+
+// Luwu Classes (rfcs/classes): attached to a class's instance ExternType.
+// It lists which of the type's `props` are fields rather than methods.
+// Fields and non-metamethod instance methods share the same `props` map, and a Property alone can't
+// tell them apart: a method's `readTy` only resolves to a FunctionType once constraint solving
+// finishes. A consumer may need to know earlier, e.g. the `class.fields` magic function in
+// BuiltinDefinitions.cpp. Populated by ConstraintGenerator's class handling.
+struct ClassFieldUserData final : ClassUserData
+{
+    std::set<Name> fieldNames;
+    // Luwu Destructuring (rfcs/destructuring.md): the fields a positional pattern `.(a, b)` reads, the primary
+    // constructor's parameters in order. Unset when the class has no primary constructor.
+    std::optional<std::vector<Name>> positionalFields;
+};
+
+struct Obj
+{
+    TypeId ty;
+};
+
+// Luwu: the identity of a class or trait made by `types.newclass` or `types.newtrait`. `key` spells out its kind, name,
+// members, and the traits it implements or needs. Two generated types with equal keys are the same type. A generated
+// type used in another's members adds only its hash to that key, which keeps keys small.
+struct GeneratedNominalKey
+{
+    std::string key;
+    size_t hash = 0;
+
+    bool operator==(const GeneratedNominalKey& rhs) const
+    {
+        return hash == rhs.hash && key == rhs.key;
+    }
+};
+
+struct Klass
+{
+    TypeId ty;
+};
+
+using NominalRelation = Variant<Obj, Klass>;
+
+struct SharedNominalArena;
+
+// Luwu Generic Nominals (rfcs/generics-on-extern-types.md): what an instantiation of a generic class (`List<number>`) needs to build its members
+// from its template. Set while the members haven't been built. See ExternType::props.
+struct LazyNominalMembers
+{
+    // The instantiation the members belong to; the template maps onto it, so `self: List<T>` becomes `List<number>`
+    TypeId instantiation = nullptr;
+    // Where the members are allocated: the module's own arena while it is checked, or for an instantiation it exports,
+    // an arena all of them share, which the modules that import them build into from their own threads
+    TypeArena* arena = nullptr;
+    std::shared_ptr<SharedNominalArena> sharedArena;
+    // The members built so far. One the solver hasn't finished in the template is built on a later read.
+    std::set<Name> builtNames;
+    // Set after the first build, which puts every member in, pending ones as the template's
+    bool attempted = false;
+    // Set once every member is built, after which they never change. Modules that import an instantiation read it from
+    // different threads: the members are written under `mutex` and published by this.
+    std::atomic<bool> built{false};
+    std::mutex mutex;
+};
+
+// Luwu Generic Nominals (rfcs/generics-on-extern-types.md): builds the members of an instantiation of a generic class (see ExternType::props)
+void buildNominalMembers(const ExternType& etv);
+
+/** The type of an external userdata exposed to Luau.
+ *
+ * Extern types behave like tables in many ways, but there are some important differences:
+ *
+ * The properties of a class are always exactly known.
+ * Extern types optionally have a parent type.
+ * Two different extern types that share the same properties are nevertheless distinct and mutually incompatible.
+ */
+struct ExternType
+{
+    using Props = TableType::Props;
+
+    Name name;
+
+    // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): the members. An instantiation of a generic class (`List<number>`) is its template and
+    // its type arguments; its members are substituted from the template's on first read and kept. Every `List<U>` in a
+    // signature (`map<U>(...): List<U>`) is an instantiation, so building them eagerly would copy all of List's members
+    // once per generic method: n instantiations of n members each, almost none of them ever read.
+    Props& props();
+    const Props& props() const;
+    // The members without building them: empty for an instantiation nothing has read yet. For code that walks types
+    // (visitors, substitution), which reach an instantiation's contents through its type arguments instead.
+    const Props& builtProps() const
+    {
+        return memberStorage;
+    }
+
+    // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): set on an instantiation of a generic class, to the class's template
+    std::optional<TypeId> genericTemplate;
+
+    // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): whether the members still have to be built (see props)
+    bool hasUnbuiltMembers() const
+    {
+        return lazyMembers && !lazyMembers->built.load(std::memory_order_acquire);
+    }
+
+    // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): the template of a generic class or extern type (`Box`, written `Box<T>` in its own
+    // members), whose type arguments are its own generics
+    bool isGenericTemplate() const
+    {
+        return !genericTemplate && (!instantiatedTypeParams.empty() || !instantiatedTypePackParams.empty());
+    }
+
+    // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): an instantiation or a template, either of which changes
+    // through its type arguments when substituted into
+    bool isGenericNominal() const
+    {
+        return genericTemplate || isGenericTemplate();
+    }
+    // Written only while the instantiation is made or copied, before anything else can read it
+    std::shared_ptr<LazyNominalMembers> lazyMembers;
+    mutable Props memberStorage;
+
+    std::optional<TypeId> parent;
+
+    // The root of this type's nominal hierarchy: `userdata` for an embedder
+    // extern type, `class`/`object` for a user class value/instance. `nullopt`
+    // means this type *is* a root (a built-in top type: `userdata`, `object`,
+    // `class`, `vector`) -- i.e. a "primitive" modeled as an ExternType.
+    //
+    // Derived from `parent` at construction (a child inherits its parent's
+    // root; a parentless type is its own root), so it can't drift. This is the
+    // single source of truth for "which hierarchy is this / is this a root",
+    // replacing the ~20 ad-hoc `parent`/`relation` derivations upstream had.
+    std::optional<TypeId> root;
+
+    std::optional<TypeId> metatable; // metaclass?
+    Tags tags;
+    std::shared_ptr<ClassUserData> userData;
+    ModuleName definitionModuleName;
+    std::optional<Location> definitionLocation;
+
+    /*
+        If this ExternType is a class, contains the location of the class's `__init` method
+        body, if the class defines one.
+        
+        Luwu Classes (rfcs/classes): used to check that `const` properties are only assigned within
+        their `__init` constructor.
+    */
+    std::optional<Location> initLocation;
+    std::optional<TableIndexer> indexer;
+
+    /*  
+        This field represents a bidirectional relationship between classes and object types
+        Given a Class, this relation should be a Obj in the variant, representing an instantiation of the class
+        Given a Object, this relation should be a Klass in the variant, representing the class prototype
+        Other sources of Extern Types will not have this relation set - this is for the classes fixture so that
+        we can go between class and object easily, given just the extern type
+     */
+    std::optional<NominalRelation> relation;
+
+    // Luwu Traits (rfcs/classes/traits.md): the object types of the traits a class implements (listed, and implied through
+    // `needs`), or of the traits a trait's `needs` list names. An object whose class implements a trait is a subtype
+    // of it (isSubclass follows these), which is what lets a trait's function take `self` of every implementing class.
+    std::vector<TypeId> implementedTraits;
+
+    // Luwu: set on classes and traits made by `types.newclass` or `types.newtrait` (see GeneratedNominalKey).
+    // isNominalSubclass compares it, because the type function making them runs again in every module that uses it.
+    std::shared_ptr<const GeneratedNominalKey> generatedKey;
+
+    // Luwu Traits (rfcs/classes/traits.md): set on the object type of a trait. A trait is modeled as a class whose object
+    // type implementing classes are subtypes of.
+    struct TraitInfo
+    {
+        // The members the trait expects implementing classes to declare, and whether each is an optional function.
+        std::map<Name, bool> expectations;
+        // Whether the trait takes parameters, which keeps `needs` from implying it.
+        bool hasParameters = false;
+        // Whether the trait's members are written with `public`/`private` (all or none of them are), so a message showing
+        // one of them as a class would write it says which.
+        bool hasAccessSpecifiers = false;
+        // The trait's parameters in order, and whether each has a default. Each is also a field of the trait, whose
+        // type is what an `implements` argument for it is checked against.
+        struct Parameter
+        {
+            Name name;
+            bool hasDefault = false;
+        };
+        std::vector<Parameter> parameters;
+        // The trait's `final` functions, which implementing classes can't define.
+        std::set<Name> finals;
+        // The members `props` has from the traits this one needs (directly or not): every implementing class implements
+        // those too, so a trait-typed value has their members. They stay those traits' members everywhere else.
+        std::set<Name> fromNeeds;
+        // The type arguments each `needs` entry gives its trait (`needs Base<T>`), written in this trait's own generics.
+        // A class implementing this trait with type arguments substitutes them in, to get the instantiation it implements.
+        std::vector<std::pair<TypeId, std::vector<TypeId>>> neededTypeArguments;
+        // `class<Trait>`: the class value of any class implementing the trait. Callable when the trait expects `__init`,
+        // and carrying the trait's functions, expected ones included. Implementing classes' values are subtypes of it.
+        std::optional<TypeId> implementorClass;
+        // `Self` in the trait's fields. The fields themselves (props) read `Self` as the trait. `selfFieldTemplates` has
+        // each field that names `Self` with `selfMarker` in its place, which an implementing class replaces with itself.
+        std::optional<TypeId> selfMarker;
+        std::map<Name, TypeId> selfFieldTemplates;
+        // The trait's functions that are generic over `Self`: that generic and their `self`'s type (`Self & Trait`). An
+        // implementing class's copy has the class for both, so it isn't generic. A function without `self` that names
+        // `Self`, like `__create(p: Self)`, has no `selfType`.
+        struct SelfFunction
+        {
+            TypeId generic;
+            TypeId selfType = nullptr;
+        };
+        std::map<Name, SelfFunction> selfFunctions;
+    };
+    std::optional<TraitInfo> traitInfo;
+
+    // Luwu Traits (rfcs/classes/traits.md): set on the type the normalizer makes for an intersection of traits (`A & B`), to its traits. One class
+    // can implement several traits, so unlike two unrelated classes, two traits intersect to something inhabited: the
+    // objects of classes implementing all of them. Such a type is a subtype of each trait (it lists them in
+    // `implementedTraits`), has all their members, and a type is a subtype of it when it is a subtype of every one.
+    std::vector<TypeId> traitIntersection;
+
+    // True if this ExternType is a generic nominal type instantiation (see LuwuGenericNominals)
+    // that still contains an unresolved generic somewhere inside it. Substitution visitors use
+    // this to decide whether to descend into it looking for further generics to replace.
+    bool hasUnresolvedGenerics = false;
+
+    // The type arguments this ExternType was instantiated with (see LuwuGenericNominals), used
+    // to display instantiations like `Box<number>` when stringifying the type.
+    std::vector<TypeId> instantiatedTypeParams;
+    std::vector<TypePackId> instantiatedTypePackParams;
+
+    // `root` is derived from `parent` (see the field comment); these are defined
+    // out-of-line in Type.cpp because that derivation needs `get<ExternType>`.
+    ExternType(
+        Name name,
+        Props props,
+        std::optional<TypeId> parent,
+        std::optional<TypeId> metatable,
+        Tags tags,
+        std::shared_ptr<ClassUserData> userData,
+        ModuleName definitionModuleName,
+        std::optional<Location> definitionLocation
+    );
+
+    ExternType(
+        Name name,
+        Props props,
+        std::optional<TypeId> parent,
+        std::optional<TypeId> metatable,
+        Tags tags,
+        std::shared_ptr<ClassUserData> userData,
+        ModuleName definitionModuleName,
+        std::optional<Location> definitionLocation,
+        std::optional<TableIndexer> indexer
+    );
+};
+
+// Luwu Classes (rfcs/classes): "class" or "trait" when `etv` is the type of a class or trait value (written `class<Name>`
+// or `trait<Name>`), and nullptr for anything else, including the objects' type
+const char* nominalValueKind(const ExternType& etv);
+
+// Data required to initialize a user-defined function and its environment
+struct UserDefinedFunctionData
+{
+    // Store a weak module reference to ensure the lifetime requirements are preserved
+    std::weak_ptr<Module> owner;
+
+    // References to AST elements are owned by the Module allocator which also stores this type
+    AstStatTypeFunction* definition = nullptr;
+
+    DenseHashMap<Name, std::pair<AstStatTypeFunction*, size_t>> environmentFunction{""};
+    DenseHashMap<Name, std::pair<TypeFun*, size_t>> environmentAlias{""};
+};
+
+enum struct TypeFunctionInstanceState
+{
+    // Indicates that further reduction might be possible.
+    Unsolved,
+
+    // Further reduction is not possible because one of the parameters is generic.
+    Solved,
+
+    // Further reduction is not possible because the application is undefined.
+    // This always indicates an error in the code.
+    //
+    // eg add<nil, nil>
+    Stuck,
+};
+
+/**
+ * An instance of a type function that has not yet been reduced to a more concrete
+ * type. The constraint solver receives a constraint to reduce each
+ * TypeFunctionInstanceType to a concrete type. A design detail is important to
+ * note here: the parameters for this instantiation of the type function are
+ * contained within this type, so that they can be substituted.
+ */
+struct TypeFunctionInstanceType
+{
+    NotNull<const TypeFunction> function;
+
+    std::vector<TypeId> typeArguments;
+    std::vector<TypePackId> packArguments;
+
+    std::optional<AstName> userFuncName; // Name of the user-defined type function; only available for UDTFs
+    UserDefinedFunctionData userFuncData;
+
+    TypeFunctionInstanceState state = TypeFunctionInstanceState::Unsolved;
+
+    TypeFunctionInstanceType(
+        NotNull<const TypeFunction> function,
+        std::vector<TypeId> typeArguments,
+        std::vector<TypePackId> packArguments,
+        std::optional<AstName> userFuncName,
+        UserDefinedFunctionData userFuncData
+    )
+        : function(function)
+        , typeArguments(std::move(typeArguments))
+        , packArguments(std::move(packArguments))
+        , userFuncName(userFuncName)
+        , userFuncData(std::move(userFuncData))
+    {
+    }
+
+    TypeFunctionInstanceType(const TypeFunction& function, std::vector<TypeId> typeArguments)
+        : function{&function}
+        , typeArguments(std::move(typeArguments))
+        , packArguments{}
+    {
+    }
+
+    TypeFunctionInstanceType(const TypeFunction& function, std::vector<TypeId> typeArguments, std::vector<TypePackId> packArguments)
+        : function{&function}
+        , typeArguments(std::move(typeArguments))
+        , packArguments(std::move(packArguments))
+    {
+    }
+
+    TypeFunctionInstanceType(NotNull<const TypeFunction> function, std::vector<TypeId> typeArguments, std::vector<TypePackId> packArguments)
+        : function{function}
+        , typeArguments(std::move(typeArguments))
+        , packArguments(std::move(packArguments))
+    {
+    }
+};
+
+/** Represents a pending type alias instantiation.
+ *
+ * In order to afford (co)recursive type aliases, we need to reason about a
+ * partially-complete instantiation. This requires encoding more information in
+ * a type variable than a BlockedType affords, hence this. Each
+ * PendingExpansionType has a corresponding TypeAliasExpansionConstraint
+ * enqueued in the solver to convert it to an actual instantiated type
+ */
+struct PendingExpansionType
+{
+    PendingExpansionType(std::optional<AstName> prefix, AstName name, std::vector<TypeId> typeArguments, std::vector<TypePackId> packArguments);
+    std::optional<AstName> prefix;
+    AstName name;
+    std::vector<TypeId> typeArguments;
+    std::vector<TypePackId> packArguments;
+    size_t index;
+
+    static size_t nextIndex;
+};
+
+// Anything!  All static checking is off.
+struct AnyType
+{
+};
+
+// A special, trivial type for the refinement system that is always eliminated from intersections.
+struct NoRefineType
+{
+};
+
+// `T | U`
+struct UnionType
+{
+    std::vector<TypeId> options;
+
+    // Set when this union type is the target of a `type X = ... | ...` alias. See TableType::name/syntheticName.
+    std::optional<std::string> name;
+    std::optional<std::string> syntheticName;
+};
+
+// `T & U`
+struct IntersectionType
+{
+    std::vector<TypeId> parts;
+
+    // Set when this intersection type is the target of a `type X = ... & ...` alias. See TableType::name/syntheticName.
+    std::optional<std::string> name;
+    std::optional<std::string> syntheticName;
+};
+
+struct LazyType
+{
+    LazyType() = default;
+    LazyType(std::function<void(LazyType&)> unwrap)
+        : unwrap(std::move(unwrap))
+    {
+    }
+
+    // std::atomic is sad and requires a manual copy
+    LazyType(const LazyType& rhs)
+        : unwrap(rhs.unwrap)
+        , unwrapped(rhs.unwrapped.load())
+    {
+    }
+
+    LazyType(LazyType&& rhs) noexcept
+        : unwrap(std::move(rhs.unwrap))
+        , unwrapped(rhs.unwrapped.load())
+    {
+    }
+
+    LazyType& operator=(const LazyType& rhs)
+    {
+        unwrap = rhs.unwrap;
+        unwrapped = rhs.unwrapped.load();
+
+        return *this;
+    }
+
+    LazyType& operator=(LazyType&& rhs) noexcept
+    {
+        unwrap = std::move(rhs.unwrap);
+        unwrapped = rhs.unwrapped.load();
+
+        return *this;
+    }
+
+    std::function<void(LazyType&)> unwrap;
+    std::atomic<TypeId> unwrapped = nullptr;
+};
+
+struct UnknownType
+{
+};
+
+struct NeverType
+{
+};
+
+// `~T`
+struct NegationType
+{
+    TypeId ty;
+};
+
+using ErrorType = Unifiable::Error<TypeId>;
+
+using TypeVariant = Unifiable::Variant<
+    TypeId,
+    FreeType,
+    GenericType,
+    PrimitiveType,
+    SingletonType,
+    BlockedType,
+    PendingExpansionType,
+    FunctionType,
+    TableType,
+    MetatableType,
+    ExternType,
+    AnyType,
+    UnionType,
+    IntersectionType,
+    LazyType,
+    UnknownType,
+    NeverType,
+    NegationType,
+    NoRefineType,
+    TypeFunctionInstanceType>;
+
+// Luwu: what a type function can attach to a type with `type:setmetadata`, plus the `comments` the checker attaches to a
+// declared type (`attachDeclarationComments`). A Lua table's contents, minus what can't outlive a type function run:
+// booleans, numbers, strings, types and tables of those. Types share it when they're copied.
+struct TypeMetadataTable;
+using TypeMetadataValue = Variant<bool, double, std::string, TypeId, std::shared_ptr<const TypeMetadataTable>>;
+
+// Luwu doc references: where the doc comments in a type's metadata were written, so references in them
+// (`[fs.file.read]`) resolve where their author could see those names.
+struct MetadataDocContext
+{
+    ModuleName module;
+    // the declaration the comments were above, or the type function call that set them
+    Location location;
+    // set by a type function rather than read from the source; the source's own doc comments are checked as such
+    bool generated = false;
+};
+
+struct TypeMetadataTable
+{
+    std::vector<std::pair<TypeMetadataValue, TypeMetadataValue>> entries;
+    // Luwu doc references: only on a type's top-level metadata. A type function can't see or set it.
+    std::optional<MetadataDocContext> docContext;
+};
+
+// Luwu: whether `metadata` holds any types. They belong to the arena the metadata was made in, so anything that copies a
+// type or property into another arena (Clone, Substitution) has to copy them along with it.
+bool metadataHasTypes(const TypeMetadataTable& metadata);
+
+// Luwu: calls `f` on every type in `metadata`, nested tables included
+template<typename F>
+void forEachMetadataType(const TypeMetadataTable& metadata, F&& f)
+{
+    auto visitValue = [&](const TypeMetadataValue& value)
+    {
+        if (const TypeId* ty = get_if<TypeId>(&value))
+            f(*ty);
+        else if (const auto* table = get_if<std::shared_ptr<const TypeMetadataTable>>(&value); table && *table)
+            forEachMetadataType(**table, f);
+    };
+
+    for (const auto& [key, value] : metadata.entries)
+    {
+        visitValue(key);
+        visitValue(value);
+    }
+}
+
+// Luwu: a copy of `metadata` with each type in it replaced by `f(type)`. Metadata without types is shared, not copied.
+template<typename F>
+std::shared_ptr<const TypeMetadataTable> mapMetadataTypes(const std::shared_ptr<const TypeMetadataTable>& metadata, F&& f)
+{
+    if (!metadata || !metadataHasTypes(*metadata))
+        return metadata;
+
+    auto mapValue = [&](const TypeMetadataValue& value) -> TypeMetadataValue
+    {
+        if (const TypeId* ty = get_if<TypeId>(&value))
+            return f(*ty);
+        if (const auto* table = get_if<std::shared_ptr<const TypeMetadataTable>>(&value))
+            return mapMetadataTypes(*table, f);
+        return value;
+    };
+
+    auto mapped = std::make_shared<TypeMetadataTable>();
+    mapped->entries.reserve(metadata->entries.size());
+    for (const auto& [key, value] : metadata->entries)
+        mapped->entries.emplace_back(mapValue(key), mapValue(value));
+    mapped->docContext = metadata->docContext;
+
+    return mapped;
+}
+
+struct Type final
+{
+    explicit Type(const TypeVariant& ty)
+        : ty(ty)
+    {
+    }
+
+    explicit Type(TypeVariant&& ty)
+        : ty(std::move(ty))
+    {
+    }
+
+    Type(TypeVariant ty, bool persistent)
+        : ty(std::move(ty))
+        , persistent(persistent)
+    {
+    }
+
+    // Re-assigns the content of the type, but doesn't change the owning arena and can't make type persistent.
+    void reassign(const Type& rhs)
+    {
+        ty = rhs.ty;
+        documentationSymbol = rhs.documentationSymbol;
+        metadata = rhs.metadata;
+    }
+
+    TypeVariant ty;
+
+    // Kludge: A persistent Type is one that belongs to the global scope.
+    // Global type bindings are immutable but are reused many times.
+    // Persistent Types do not get cloned.
+    bool persistent = false;
+
+    std::optional<std::string> documentationSymbol;
+
+    // Luwu: see TypeMetadataTable
+    std::shared_ptr<const TypeMetadataTable> metadata;
+
+    // Pointer to the type arena that allocated this type.
+    TypeArena* owningArena = nullptr;
+
+    bool operator==(const Type& rhs) const;
+    bool operator!=(const Type& rhs) const;
+
+    Type& operator=(const TypeVariant& rhs);
+    Type& operator=(TypeVariant&& rhs);
+
+    Type(Type&&) = default;
+    Type& operator=(Type&&) = default;
+
+    Type clone() const;
+
+private:
+    Type(const Type&) = default;
+    Type& operator=(const Type& rhs);
+};
+
+struct GenericTypeDefinition
+{
+    TypeId ty;
+    std::optional<TypeId> defaultValue;
+
+    bool operator==(const GenericTypeDefinition& rhs) const;
+};
+
+struct GenericTypePackDefinition
+{
+    TypePackId tp;
+    std::optional<TypePackId> defaultValue;
+
+    bool operator==(const GenericTypePackDefinition& rhs) const;
+};
+
+struct TypeFun
+{
+    // These should all be generic
+    std::vector<GenericTypeDefinition> typeParams;
+    std::vector<GenericTypePackDefinition> typePackParams;
+
+    /** The underlying type.
+     *
+     * WARNING!  This is not safe to use as a type if typeParams is not empty!!
+     * You must first use TypeChecker::instantiateTypeFun to turn it into a real type.
+     */
+    TypeId type;
+
+    // The location of where this TypeFun was defined, if available
+    std::optional<Location> definitionLocation;
+
+    // Luwu: the module that declares this type, which definitionLocation is in. Set on a module's exported types,
+    // so copies in other modules keep it. Unset, it's the module whose scope holds this TypeFun.
+    std::optional<ModuleName> definitionModuleName;
+
+    TypeFun() = default;
+
+    explicit TypeFun(TypeId ty)
+        : type(ty)
+    {
+    }
+
+    TypeFun(std::vector<GenericTypeDefinition> typeParams, TypeId type, std::optional<Location> definitionLocation = std::nullopt)
+        : typeParams(std::move(typeParams))
+        , type(type)
+        , definitionLocation(definitionLocation)
+    {
+    }
+
+    TypeFun(
+        std::vector<GenericTypeDefinition> typeParams,
+        std::vector<GenericTypePackDefinition> typePackParams,
+        TypeId type,
+        std::optional<Location> definitionLocation = std::nullopt
+    )
+        : typeParams(std::move(typeParams))
+        , typePackParams(std::move(typePackParams))
+        , type(type)
+        , definitionLocation(definitionLocation)
+    {
+    }
+
+    bool operator==(const TypeFun& rhs) const;
+};
+
+enum class FollowOption
+{
+    Normal,
+    DisableLazyTypeThunks,
+};
+
+// Follow BoundTypes until we get to something real
+TypeId follow(TypeId t);
+TypeId follow(TypeId t, FollowOption followOption);
+TypeId follow(TypeId t, const void* context, TypeId (*mapper)(const void*, TypeId));
+TypeId follow(TypeId t, FollowOption followOption, const void* context, TypeId (*mapper)(const void*, TypeId));
+
+std::vector<TypeId> flattenIntersection(TypeId ty);
+
+bool isPrim(TypeId ty, PrimitiveType::Type primType);
+bool isNil(TypeId ty);
+bool isBoolean(TypeId ty);
+bool isNumber(TypeId ty);
+bool isInteger(TypeId ty);
+bool isString(TypeId ty);
+bool isThread(TypeId ty);
+bool isBuffer(TypeId ty);
+bool isNone(TypeId ty);
+bool isOptional(TypeId ty);
+bool isTableIntersection(TypeId ty);
+bool isTableUnion(TypeId ty);
+bool isOverloadedFunction(TypeId ty);
+
+// True when string is a subtype of ty
+bool maybeString(TypeId ty);
+
+std::optional<TypeId> getMetatable(TypeId type, NotNull<struct BuiltinTypes> builtinTypes);
+TableType* getMutableTableType(TypeId type);
+const TableType* getTableType(TypeId type);
+
+// If the type has a name, return that.  Else if it has a synthetic name, return that.
+// Returns nullptr if the type has no name.
+const std::string* getName(TypeId type);
+
+// Returns name of the module where type was defined if type has that information
+std::optional<ModuleName> getDefinitionModuleName(TypeId type);
+
+// Checks whether a union contains all types of another union.
+bool isSubset(const UnionType& super, const UnionType& sub);
+
+// Checks if a type contains generic type binders
+bool isGeneric(const TypeId ty);
+
+// Checks if a type may be instantiated to one containing generic type binders
+bool maybeGeneric(const TypeId ty);
+
+// Checks if a type is of the form T1|...|Tn where one of the Ti is a singleton
+bool maybeSingleton(TypeId ty);
+
+// Checks if the length operator can be applied on the value of type
+bool hasLength(TypeId ty, DenseHashSet<TypeId>& seen, int* recursionCount);
+
+struct BuiltinTypes
+{
+    BuiltinTypes();
+    ~BuiltinTypes();
+    BuiltinTypes(const BuiltinTypes&) = delete;
+    void operator=(const BuiltinTypes&) = delete;
+
+    TypeId errorRecoveryType(TypeId guess) const;
+    TypePackId errorRecoveryTypePack(TypePackId guess) const;
+
+    // Every nominal-type root, for logic that reasons about the whole extern
+    // lattice rather than one type (e.g. the normalizer's top/unknown checks).
+    // These are the parentless extern-type tops: userdata/class/object/vector, and trait with traits enabled.
+    struct NominalRoots
+    {
+        std::array<TypeId, 5> roots;
+        size_t count;
+
+        const TypeId* begin() const
+        {
+            return roots.data();
+        }
+        const TypeId* end() const
+        {
+            return roots.data() + count;
+        }
+        size_t size() const
+        {
+            return count;
+        }
+    };
+    NominalRoots nominalRoots() const;
+
+    friend TypeId makeStringMetatable(NotNull<BuiltinTypes> builtinTypes, SolverMode mode);
+    friend void makeVectorMetatable(NotNull<BuiltinTypes> builtinTypes);
+    friend void makeNoneMetatable(NotNull<BuiltinTypes> builtinTypes);
+    friend struct GlobalTypes;
+
+private:
+    std::unique_ptr<struct TypeArena> arena;
+    bool debugFreezeArena = false;
+
+public:
+    std::unique_ptr<BuiltinTypeFunctions> typeFunctions;
+    const TypeId nilType;
+    const TypeId numberType;
+    const TypeId integerType;
+    const TypeId stringType;
+    const TypeId booleanType;
+    const TypeId threadType;
+    const TypeId bufferType;
+    const TypeId noneType;
+    const TypeId functionType;
+    const TypeId externType;
+    const TypeId objectType;
+    const TypeId classType;
+    // Luwu Traits (rfcs/classes/traits.md): the top of trait values (`trait Name` binds one). It is its own root, not a
+    // `class`: a trait can't be constructed or passed to `class.isinstance`.
+    const TypeId traitType;
+    // `vector` is a language primitive that reuses the ExternType representation (fields x/y/z + a
+    // metatable). It is its own nominal root (parent/root nullopt); its props/metatable are filled
+    // in by makeVectorMetatable during global setup.
+    const TypeId vectorType;
+    const TypeId tableType;
+    const TypeId emptyTableType;
+    const TypeId trueType;
+    const TypeId falseType;
+    const TypeId anyType;
+    const TypeId unknownType;
+    // Luwu try expressions: `unknown` that doesn't absorb the rest of a union, printed as `unknown`. `FileIoError |
+    // weakunknown` keeps FileIoError's members for autocomplete and indexing. An annotation `X | unknown` means this.
+    const TypeId weakUnknownType;
+    const TypeId neverType;
+    const TypeId errorType;
+    const TypeId noRefineType;
+    const TypeId falsyType;
+    const TypeId truthyType;
+    const TypeId notNilType;
+
+    const TypeId optionalNumberType;
+    const TypeId optionalStringType;
+
+    const TypePackId emptyTypePack;
+    const TypePackId anyTypePack;
+    const TypePackId unknownTypePack;
+    const TypePackId neverTypePack;
+    const TypePackId uninhabitableTypePack;
+    const TypePackId errorTypePack;
+};
+
+void persist(TypeId ty);
+void persist(TypePackId tp);
+
+const TypeLevel* getLevel(TypeId ty);
+TypeLevel* getMutableLevel(TypeId ty);
+
+std::optional<TypeLevel> getLevel(TypePackId tp);
+
+const Property* lookupExternTypeProp(const ExternType* cls, const Name& name);
+
+// Whether `cls` is a subclass of `parent`
+bool isSubclass(const ExternType* cls, const ExternType* parent);
+
+// Luwu Traits (rfcs/classes/traits.md): a trait, or an intersection of traits. Two of these may share instances even when neither is a subtype
+// of the other, unlike two classes, which are final.
+bool isTraitLike(const ExternType* ty);
+
+// Luwu Traits (rfcs/classes/traits.md): a member of a class or trait type: a field or function on the type itself, or a
+// function in its metatable
+const Property* findNominalMember(const ExternType* type, const Name& name);
+
+Type* asMutable(TypeId ty);
+
+template<typename... Ts, typename T>
+bool is(T&& tv)
+{
+    if (!tv)
+        return false;
+
+    if constexpr (std::is_same_v<TypeId, T> && !(std::is_same_v<BoundType, Ts> || ...))
+        LUAU_ASSERT(get_if<BoundType>(&tv->ty) == nullptr);
+
+    return (get<Ts>(tv) || ...);
+}
+
+template<typename T>
+const T* get(TypeId tv)
+{
+    LUAU_ASSERT(tv);
+
+    if constexpr (!std::is_same_v<T, BoundType>)
+        LUAU_ASSERT(get_if<BoundType>(&tv->ty) == nullptr);
+
+    return get_if<T>(&tv->ty);
+}
+
+
+template<typename T>
+T* getMutable(TypeId tv)
+{
+    LUAU_ASSERT(tv);
+
+    if constexpr (!std::is_same_v<T, BoundType>)
+        LUAU_ASSERT(get_if<BoundType>(&tv->ty) == nullptr);
+
+    return get_if<T>(&asMutable(tv)->ty);
+}
+
+const std::vector<TypeId>& getTypes(const UnionType* utv);
+const std::vector<TypeId>& getTypes(const IntersectionType* itv);
+
+template<typename T>
+struct TypeIterator;
+
+using UnionTypeIterator = TypeIterator<UnionType>;
+UnionTypeIterator begin(const UnionType* utv);
+UnionTypeIterator end(const UnionType* utv);
+
+using IntersectionTypeIterator = TypeIterator<IntersectionType>;
+IntersectionTypeIterator begin(const IntersectionType* itv);
+IntersectionTypeIterator end(const IntersectionType* itv);
+
+/* Traverses the type T yielding each TypeId.
+ * If the iterator encounters a nested type T, it will instead yield each TypeId within.
+ */
+template<typename T>
+struct TypeIterator
+{
+    using value_type = Luau::TypeId;
+    using pointer = value_type*;
+    using reference = value_type&;
+    using difference_type = size_t;
+    using iterator_category = std::input_iterator_tag;
+
+    explicit TypeIterator(const T* t)
+    {
+        LUAU_ASSERT(t);
+
+        const std::vector<TypeId>& types = getTypes(t);
+        if (!types.empty())
+            stack.push_front({t, 0});
+
+        seen.insert(t);
+        descend();
+    }
+
+    TypeIterator<T>& operator++()
+    {
+        advance();
+        descend();
+        return *this;
+    }
+
+    TypeIterator<T> operator++(int)
+    {
+        TypeIterator<T> copy = *this;
+        ++*this;
+        return copy;
+    }
+
+    bool operator==(const TypeIterator<T>& rhs) const
+    {
+        if (!stack.empty() && !rhs.stack.empty())
+            return stack.front() == rhs.stack.front();
+
+        return stack.empty() && rhs.stack.empty();
+    }
+
+    bool operator!=(const TypeIterator<T>& rhs) const
+    {
+        return !(*this == rhs);
+    }
+
+    TypeId operator*()
+    {
+        descend();
+
+        LUAU_ASSERT(!stack.empty());
+
+        auto [t, currentIndex] = stack.front();
+        LUAU_ASSERT(t);
+
+        const std::vector<TypeId>& types = getTypes(t);
+        LUAU_ASSERT(currentIndex < types.size());
+
+        TypeId ty = follow(types[currentIndex]);
+        LUAU_ASSERT(!get<T>(ty));
+
+        return ty;
+    }
+
+    // Normally, we'd have `begin` and `end` be a template but there's too much trouble
+    // with templates portability in this area, so not worth it. Thanks MSVC.
+    friend UnionTypeIterator end(const UnionType*);
+    friend IntersectionTypeIterator end(const IntersectionType*);
+
+private:
+    TypeIterator() = default;
+
+    // (T* t, size_t currentIndex)
+    using SavedIterInfo = std::pair<const T*, size_t>;
+
+    VecDeque<SavedIterInfo> stack;
+    DenseHashSet<const T*> seen{nullptr}; // Only needed to protect the iterator from hanging the thread.
+
+    void advance()
+    {
+        while (!stack.empty())
+        {
+            auto& [t, currentIndex] = stack.front();
+            ++currentIndex;
+
+            const std::vector<TypeId>& types = getTypes(t);
+            if (currentIndex >= types.size())
+                stack.pop_front();
+            else
+                break;
+        }
+    }
+
+    void descend()
+    {
+        while (!stack.empty())
+        {
+            auto [current, currentIndex] = stack.front();
+            const std::vector<TypeId>& types = getTypes(current);
+            if (auto inner = get<T>(follow(types[currentIndex])))
+            {
+                // If we're about to descend into a cyclic type, we should skip over this.
+                // Ideally this should never happen, but alas it does from time to time. :(
+                if (seen.contains(inner))
+                    advance();
+                else
+                {
+                    seen.insert(inner);
+                    stack.push_front({inner, 0});
+                }
+
+                continue;
+            }
+
+            break;
+        }
+    }
+};
+
+TypeId freshType(NotNull<TypeArena> arena, NotNull<BuiltinTypes> builtinTypes, Scope* scope, Polarity polarity = Polarity::Unknown);
+
+using TypeIdPredicate = std::function<std::optional<TypeId>(TypeId)>;
+std::vector<TypeId> filterMap(TypeId type, TypeIdPredicate predicate);
+
+// A tag to mark a type which doesn't derive directly from the root type as overriding the return of `typeof`.
+// Any classes which derive from this type will have typeof return this type.
+inline constexpr char kTypeofRootTag[] = "typeofRoot";
+
+void attachTag(TypeId ty, const std::string& tagName);
+void attachTag(Property& prop, const std::string& tagName);
+
+bool hasTag(TypeId ty, const std::string& tagName);
+bool hasTag(const Property& prop, const std::string& tagName);
+bool hasTag(const Tags& tags, const std::string& tagName); // Do not use in new work.
+
+template<typename T>
+bool hasTypeInIntersection(TypeId ty)
+{
+    TypeId tf = follow(ty);
+    if (get<T>(tf))
+        return true;
+    for (auto t : flattenIntersection(tf))
+        if (get<T>(follow(t)))
+            return true;
+    return false;
+}
+
+bool hasPrimitiveTypeInIntersection(TypeId ty, PrimitiveType::Type primTy);
+/*
+ * Use this to change the kind of a particular type.
+ *
+ * LUAU_NOINLINE so that the calling frame doesn't have to pay the stack storage for the new variant.
+ */
+template<typename T, typename... Args>
+LUAU_NOINLINE T* emplaceType(Type* ty, Args&&... args)
+{
+    return &ty->ty.emplace<T>(std::forward<Args>(args)...);
+}
+
+template<>
+LUAU_NOINLINE Unifiable::Bound<TypeId>* emplaceType<BoundType>(Type* ty, TypeId& tyArg);
+
+} // namespace Luau

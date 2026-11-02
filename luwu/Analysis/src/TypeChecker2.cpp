@@ -1,0 +1,9653 @@
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
+#include "Luau/TypeChecker2.h"
+#include "Luau/LuwuFlags.h"
+#include "Luau/UnreachableProof.h"
+
+#include "Luau/ApplyTypeFunction.h"
+#include "Luau/Ast.h"
+#include "Luau/AstUtils.h"
+#include "Luau/AstQuery.h"
+#include "Luau/BuiltinDefinitions.h"
+#include "Luau/Common.h"
+#include "Luau/DcrLogger.h"
+#include "Luau/DenseHash.h"
+#include "Luau/Error.h"
+#include "Luau/Instantiation.h"
+#include "Luau/Instantiation2.h"
+#include "Luau/MismatchExplanation.h"
+#include "Luau/RepeatedTypeNames.h"
+#include "Luau/Metamethods.h"
+#include "Luau/Normalize.h"
+#include "Luau/BuiltinTypeFunctions.h"
+#include "Luau/OverloadResolver.h"
+#include "Luau/Subtyping.h"
+#include "Luau/TimeTrace.h"
+#include "Luau/ToString.h"
+#include "Luau/TxnLog.h"
+#include "Luau/Type.h"
+#include "Luau/TypeFunction.h"
+#include "Luau/TypeFunctionReductionGuesser.h"
+#include "Luau/TypeFwd.h"
+#include "Luau/TypePack.h"
+#include "Luau/TypePath.h"
+#include "Luau/TypeInfer.h"
+#include "Luau/TypeUtils.h"
+#include "Luau/Typos.h"
+#include "Luau/TypeOrPack.h"
+#include "Luau/VisitType.h"
+
+#include <algorithm>
+#include <sstream>
+#include <unordered_map>
+#include <unordered_set>
+
+#include "Luau/Simplify.h"
+
+LUAU_FASTFLAG(DebugLuauMagicTypes)
+
+LUAU_FASTFLAGVARIABLE(LuauCheckFunctionStatementTypes)
+LUAU_FASTFLAGVARIABLE(LuauPropertyModifierMismatchErrors)
+LUAU_FASTFLAG(LuauTweakAccessViolationReporting)
+LUAU_FASTFLAG(LuauReadOnlyIndexers)
+LUAU_FASTFLAGVARIABLE(LuauIndexerModifierMismatchErrors)
+LUAU_FASTFLAG(LuauImproveUniqueTableWidthSubtyping)
+LUAU_FASTFLAG(LuauBidirectionalInferenceSimplifyTables)
+LUAU_FASTFLAGVARIABLE(LuauBetterPackAndVariadicMismatchErrors)
+// Luwu (helpful subtyping errors): explain a failed subtyping test with a structural diff: one rooted path per
+// place the two types disagree, how close they are, and which union member was meant
+// (`MismatchExplanation.cpp`).
+//
+// Deliberately not gated by this flag, because each fixes a message upstream ships that readers can't act on:
+// the read/write (variance) explanations and their `read` help, the contravariant-argument and nil-widening
+// explanations, `explainReturnCountMismatch`, the second "not all code paths return" error pointing at the
+// path that escapes, printing only the parameter or return types after "Expected this function to take/return"
+// (`Reasonings::contextWantedDisplay`), the variadic argument tail error in `OverloadResolver::reportErrors` (an
+// error upstream drops), the "the function takes/returns" subject in `TypePath::toStringHuman`, and types
+// indented with four spaces instead of a tab. Also unflagged, and not wording: `ExpectedTypeVisitor` expects
+// each field of a table literal that matches no member of a union to be whatever some member allows for it,
+// so autocomplete offers the tags (upstream skips that under the new solver, CLI-116814).
+LUAU_FASTFLAGVARIABLE(LuwuHelpfulSubtypingErrors)
+
+LUAU_FASTFLAG(LuwuClasses)
+LUAU_FASTFLAG(LuwuDefaultArguments)
+
+namespace Luau
+{
+
+// Luwu literal types: `validator` with the argument's literal type in place of `literal<B>`, unreduced
+static std::optional<TypeId> applyLiteralValidator(
+    TypeArena& arena,
+    const LiteralCheck& literal,
+    TypeId validator,
+    TypeId literalTy
+)
+{
+    DenseHashMap<TypeId, TypeId> replacements{nullptr};
+    DenseHashMap<TypePackId, TypePackId> packReplacements{nullptr};
+    replacements[literal.placeholder] = literalTy;
+    Replacer replacer{NotNull{&arena}, NotNull{&replacements}, NotNull{&packReplacements}};
+    return replacer.substitute(validator);
+}
+
+// Luwu literal types: whether `literal<B>` can be given a literal of type `B`. Luau has literal types for strings and
+// booleans only.
+static bool hasLiterals(TypeId base)
+{
+    base = follow(base);
+    if (const PrimitiveType* primitive = get<PrimitiveType>(base))
+        return primitive->type == PrimitiveType::String || primitive->type == PrimitiveType::Boolean;
+
+    if (const UnionType* options = get<UnionType>(base))
+    {
+        for (TypeId option : options)
+        {
+            if (!hasLiterals(option))
+                return false;
+        }
+        return true;
+    }
+
+    // A generic (`literal<S>`) becomes the argument's literal; an error was reported already
+    return get<SingletonType>(base) || get<GenericType>(base) || get<ErrorType>(base) || get<AnyType>(base);
+}
+
+static std::string noLiteralsMessage(TypeId base)
+{
+    return format("there are no literals of type %s", toString(base).c_str());
+}
+
+// Luwu literal types: whether a value of type `ty` is a literal, i.e. its type is a singleton or a union of them
+static bool isLiteralValue(TypeId ty)
+{
+    ty = follow(ty);
+    if (const UnionType* options = get<UnionType>(ty))
+    {
+        for (TypeId option : options)
+        {
+            if (!get<SingletonType>(follow(option)))
+                return false;
+        }
+        return true;
+    }
+
+    // An error was reported already, and `never` is never there to be passed
+    return get<SingletonType>(ty) || get<ErrorType>(ty) || get<AnyType>(ty) || get<NeverType>(ty);
+}
+
+// Luwu literal types: whether a value given for `literal<base>` is wrong for not being a literal. A base without literals
+// was reported where it is written.
+static bool isMissingLiteral(TypeId base, TypeId given)
+{
+    return hasLiterals(base) && !isLiteralValue(given);
+}
+
+// Luwu literal types: the type function a validator applies (`NoDashes` of `NoDashes<literal<string>>`), if any
+static std::optional<std::string> validatorName(TypeId validator)
+{
+    if (!validator)
+        return std::nullopt;
+
+    validator = follow(validator);
+    if (const TypeFunctionInstanceType* instance = get<TypeFunctionInstanceType>(validator))
+    {
+        if (instance->userFuncName)
+            return std::string(instance->userFuncName->value);
+        return instance->function->name;
+    }
+    if (const PendingExpansionType* pending = get<PendingExpansionType>(validator))
+        return std::string(pending->name.value);
+    return std::nullopt;
+}
+
+static std::string forwardedLiteralMessage(const std::string& name, TypeId checkedBy, TypeId wanted)
+{
+    std::string wants = validatorName(wanted).value_or("this parameter's validator");
+    std::string fix = format("annotate '%s' with '%s' (or an alias of it), or pass a literal here", name.c_str(), wants.c_str());
+
+    if (std::optional<std::string> checked = validatorName(checkedBy))
+        return format("'%s' was checked by '%s', not '%s'; %s", name.c_str(), checked->c_str(), wants.c_str(), fix.c_str());
+    return format("'%s' isn't checked by '%s'; %s", name.c_str(), wants.c_str(), fix.c_str());
+}
+
+// Luwu literal types: a table given for a type with literal fields that wasn't checked against them
+static std::string uncheckedTableMessage(AstExpr* value, const std::string& field)
+{
+    AstExprLocal* local = value->as<AstExprLocal>();
+    if (!local)
+        return format("this table wasn't checked against '%s'; pass a table literal here", field.c_str());
+
+    const char* name = local->local->name.value;
+    return format(
+        "'%s' wasn't checked against '%s'; pass a table literal here, or annotate '%s' with a type that has that field",
+        name,
+        field.c_str(),
+        name
+    );
+}
+
+static std::string notALiteralMessage(TypeId base, TypeId given)
+{
+    return format("expected a literal of type %s, but got %s", toString(base).c_str(), toString(given).c_str());
+}
+
+// Luwu literal types: the type of `value`, given for a `literal<B>`, as written: `"-f"` is the singleton `"-f"` even where
+// it was inferred as `string` (a callee the solver couldn't see, like an overload set)
+static TypeId writtenLiteralType(TypeArena& arena, NotNull<BuiltinTypes> builtinTypes, AstExpr* value, TypeId inferred)
+{
+    if (isLiteralValue(inferred))
+        return inferred;
+
+    AstExpr* written = unwrapGroup(value);
+
+    if (AstExprConstantString* str = written->as<AstExprConstantString>())
+        return arena.addType(SingletonType{StringSingleton{std::string(str->value.data, str->value.size)}});
+    if (AstExprConstantBool* boolean = written->as<AstExprConstantBool>())
+        return boolean->value ? builtinTypes->trueType : builtinTypes->falseType;
+    return inferred;
+}
+
+// Luwu literal types: the table type `ty` is, or the one table type among its union's members (`Style | StyleInput`, a
+// class and a record). A union of several table types gives none: which one a table literal is meant for isn't known.
+static const TableType* tableTypeOf(TypeId ty)
+{
+    ty = follow(ty);
+    const UnionType* options = get<UnionType>(ty);
+    if (!options)
+        return get<TableType>(ty);
+
+    const TableType* table = nullptr;
+    for (TypeId option : options)
+    {
+        const TableType* member = get<TableType>(follow(option));
+        if (!member)
+            continue;
+        if (table)
+            return nullptr;
+        table = member;
+    }
+    return table;
+}
+
+// Luwu literal types: the check on field `name` of `table`, if it has one
+static const LiteralCheck* findLiteralField(const TableType* table, const std::string& name)
+{
+    if (!table)
+        return nullptr;
+    for (const auto& [field, check] : table->literalFields)
+    {
+        if (field == name)
+            return &check;
+    }
+    return nullptr;
+}
+
+// Luwu literal types: what a field's annotation asked for, as written (`padding: Length<literal<string>>?`)
+static std::string literalFieldDisplay(const std::string& name, const LiteralCheck& check)
+{
+    std::string annotation = check.validator ? toString(check.validator) : "literal<" + toString(check.base) + ">";
+    if (!check.alternatives)
+        return name + ": " + annotation;
+    if (isNil(check.alternatives))
+        return name + ": " + annotation + "?";
+    return name + ": " + annotation + " | " + toString(check.alternatives);
+}
+
+struct TypeChecker2::DeclarationIndex
+{
+    // Keyed by where a function starts; its `FunctionDefinition::definitionLocation` is checked in full on lookup.
+    std::unordered_map<uint64_t, AstExprFunction*> functions;
+
+    // nullptr for a name declared more than once: picking the wrong one would point the reader at a type
+    // they aren't using.
+    std::unordered_map<AstName, AstStatTypeAlias*> aliases;
+
+    // Where a local gets its type: the declaring statement (a parameter's annotation), and the value given to it
+    struct LocalSource
+    {
+        Location range;
+        AstExpr* value = nullptr;
+    };
+    std::unordered_map<const AstLocal*, LocalSource> locals;
+
+    // A `local function`'s return annotation
+    std::unordered_map<const AstLocal*, AstTypePack*> returnAnnotations;
+
+    static uint64_t key(const Position& position)
+    {
+        return (uint64_t(position.line) << 32) | position.column;
+    }
+
+    AstExprFunction* functionAt(const Location& location) const
+    {
+        auto it = functions.find(key(location.begin));
+        return it != functions.end() && it->second->location == location ? it->second : nullptr;
+    }
+
+    AstStatTypeAlias* aliasNamed(AstName name) const
+    {
+        auto it = aliases.find(name);
+        return it != aliases.end() ? it->second : nullptr;
+    }
+};
+
+namespace
+{
+
+struct DeclarationCollector : AstVisitor
+{
+    TypeChecker2::DeclarationIndex& index;
+
+    explicit DeclarationCollector(TypeChecker2::DeclarationIndex& index)
+        : index(index)
+    {
+    }
+
+    bool visit(AstExprFunction* fn) override
+    {
+        index.functions.emplace(TypeChecker2::DeclarationIndex::key(fn->location.begin), fn);
+        for (AstLocal* arg : fn->args)
+            index.locals[arg] = {arg->annotation ? arg->annotation->location : arg->location, nullptr};
+        return true;
+    }
+
+    bool visit(AstStatLocalFunction* function) override
+    {
+        if (function->func->returnAnnotation)
+            index.returnAnnotations[function->name] = function->func->returnAnnotation;
+        return true;
+    }
+
+    bool visit(AstStatLocal* local) override
+    {
+        for (size_t i = 0; i < local->vars.size; ++i)
+            index.locals[local->vars.data[i]] = {local->location, i < local->values.size ? local->values.data[i] : nullptr};
+        return true;
+    }
+
+    bool visit(AstStatForIn* forIn) override
+    {
+        if (forIn->values.size != 0)
+        {
+            Location values{forIn->values.data[0]->location, forIn->values.data[forIn->values.size - 1]->location};
+            for (AstLocal* var : forIn->vars)
+                index.locals[var] = {values, nullptr};
+        }
+        return true;
+    }
+
+    bool visit(AstStatTypeAlias* alias) override
+    {
+        auto [it, inserted] = index.aliases.emplace(alias->name, alias);
+        if (!inserted)
+            it->second = nullptr;
+        return true;
+    }
+};
+
+} // namespace
+
+const TypeChecker2::DeclarationIndex& TypeChecker2::getDeclarationIndex()
+{
+    if (!declarationIndex)
+    {
+        declarationIndex = std::make_shared<DeclarationIndex>();
+        if (sourceModule->root)
+        {
+            DeclarationCollector collector{*declarationIndex};
+            sourceModule->root->visit(&collector);
+        }
+    }
+
+    return *declarationIndex;
+}
+
+// TypeInfer.h
+// TODO move these
+using PrintLineProc = void (*)(const std::string&);
+extern PrintLineProc luauPrintLine;
+
+// Pushes a function expression onto TypeChecker2::enclosingFunctions for the lifetime of the instance.
+struct EnclosingFunctionPusher
+{
+    std::vector<const AstExprFunction*>& stack;
+
+    EnclosingFunctionPusher(std::vector<const AstExprFunction*>& stack, const AstExprFunction* fn)
+        : stack(stack)
+    {
+        stack.push_back(fn);
+    }
+
+    ~EnclosingFunctionPusher()
+    {
+        stack.pop_back();
+    }
+
+    EnclosingFunctionPusher(const EnclosingFunctionPusher&) = delete;
+    EnclosingFunctionPusher& operator=(const EnclosingFunctionPusher&) = delete;
+};
+
+/* Push a scope onto the end of a stack for the lifetime of the StackPusher instance.
+ * TypeChecker2 uses this to maintain knowledge about which scope encloses every
+ * given AstNode.
+ */
+struct StackPusher
+{
+    std::vector<NotNull<Scope>>* stack;
+    NotNull<Scope> scope;
+
+    explicit StackPusher(std::vector<NotNull<Scope>>& stack, Scope* scope)
+        : stack(&stack)
+        , scope(scope)
+    {
+        stack.push_back(NotNull{scope});
+    }
+
+    ~StackPusher()
+    {
+        if (stack)
+        {
+            LUAU_ASSERT(stack->back() == scope);
+            stack->pop_back();
+        }
+    }
+
+    StackPusher(const StackPusher&) = delete;
+    StackPusher&& operator=(const StackPusher&) = delete;
+
+    StackPusher(StackPusher&& other)
+        : stack(std::exchange(other.stack, nullptr))
+        , scope(other.scope)
+    {
+    }
+};
+
+struct PropertyTypes
+{
+    // a vector of all the typeArguments assigned to the given property.
+    std::vector<TypeId> typesOfProp;
+
+    // a vector of all the typeArguments that are missing the given property.
+    std::vector<TypeId> missingProp;
+
+    bool foundOneProp() const
+    {
+        return !typesOfProp.empty();
+    }
+
+    bool noneMissingProp() const
+    {
+        return missingProp.empty();
+    }
+
+    bool foundMissingProp() const
+    {
+        return !missingProp.empty();
+    }
+};
+
+struct PropertyType
+{
+    NormalizationResult present;
+    std::optional<TypeId> result;
+};
+
+
+static std::optional<std::string> getIdentifierOfBaseVar(AstExpr* node)
+{
+    if (AstExprGlobal* expr = node->as<AstExprGlobal>())
+        return expr->name.value;
+
+    if (AstExprLocal* expr = node->as<AstExprLocal>())
+        return expr->local->name.value;
+
+    if (AstExprIndexExpr* expr = node->as<AstExprIndexExpr>())
+        return getIdentifierOfBaseVar(expr->expr);
+
+    if (AstExprIndexName* expr = node->as<AstExprIndexName>())
+        return getIdentifierOfBaseVar(expr->expr);
+
+    return std::nullopt;
+}
+
+template<typename T>
+bool areEquivalent(const T& a, const T& b)
+{
+    if (a.function != b.function)
+        return false;
+
+    if (a.typeArguments.size() != b.typeArguments.size() || a.packArguments.size() != b.packArguments.size())
+        return false;
+
+    for (size_t i = 0; i < a.typeArguments.size(); ++i)
+    {
+        if (follow(a.typeArguments[i]) != follow(b.typeArguments[i]))
+            return false;
+    }
+
+    for (size_t i = 0; i < a.packArguments.size(); ++i)
+    {
+        if (follow(a.packArguments[i]) != follow(b.packArguments[i]))
+            return false;
+    }
+
+    return true;
+}
+
+struct TypeFunctionFinder : TypeOnceVisitor
+{
+    DenseHashSet<TypeId> mentionedFunctions{nullptr};
+    DenseHashSet<TypePackId> mentionedFunctionPacks{nullptr};
+
+    TypeFunctionFinder()
+        : TypeOnceVisitor("TypeFunctionFinder", /* skipBoundTypes */ true)
+    {
+    }
+
+    bool visit(TypeId ty, const TypeFunctionInstanceType&) override
+    {
+        mentionedFunctions.insert(ty);
+        return true;
+    }
+
+    bool visit(TypePackId tp, const TypeFunctionInstanceTypePack&) override
+    {
+        mentionedFunctionPacks.insert(tp);
+        return true;
+    }
+};
+
+struct InternalTypeFunctionFinder : TypeOnceVisitor
+{
+    DenseHashSet<TypeId> internalFunctions{nullptr};
+    DenseHashSet<TypePackId> internalPackFunctions{nullptr};
+    DenseHashSet<TypeId> mentionedFunctions{nullptr};
+    DenseHashSet<TypePackId> mentionedFunctionPacks{nullptr};
+
+    explicit InternalTypeFunctionFinder(std::vector<TypeId>& declStack)
+        : TypeOnceVisitor("InternalTypeFunctionFinder", /* skipBoundTypes */ true)
+    {
+        TypeFunctionFinder f;
+        for (TypeId fn : declStack)
+            f.traverse(fn);
+
+        mentionedFunctions = std::move(f.mentionedFunctions);
+        mentionedFunctionPacks = std::move(f.mentionedFunctionPacks);
+    }
+
+    bool visit(TypeId ty, const TypeFunctionInstanceType& tfit) override
+    {
+        bool hasGeneric = false;
+
+        for (TypeId p : tfit.typeArguments)
+        {
+            if (get<GenericType>(follow(p)))
+            {
+                hasGeneric = true;
+                break;
+            }
+        }
+
+        for (TypePackId p : tfit.packArguments)
+        {
+            if (get<GenericTypePack>(follow(p)))
+            {
+                hasGeneric = true;
+                break;
+            }
+        }
+
+        if (hasGeneric)
+        {
+            for (TypeId mentioned : mentionedFunctions)
+            {
+                const TypeFunctionInstanceType* mentionedTfit = get<TypeFunctionInstanceType>(mentioned);
+                LUAU_ASSERT(mentionedTfit);
+                if (areEquivalent(tfit, *mentionedTfit))
+                {
+                    return true;
+                }
+            }
+
+            internalFunctions.insert(ty);
+        }
+
+        return true;
+    }
+
+    bool visit(TypePackId tp, const TypeFunctionInstanceTypePack& tfitp) override
+    {
+        bool hasGeneric = false;
+
+        for (TypeId p : tfitp.typeArguments)
+        {
+            if (get<GenericType>(follow(p)))
+            {
+                hasGeneric = true;
+                break;
+            }
+        }
+
+        for (TypePackId p : tfitp.packArguments)
+        {
+            if (get<GenericTypePack>(follow(p)))
+            {
+                hasGeneric = true;
+                break;
+            }
+        }
+
+        if (hasGeneric)
+        {
+            for (TypePackId mentioned : mentionedFunctionPacks)
+            {
+                const TypeFunctionInstanceTypePack* mentionedTfitp = get<TypeFunctionInstanceTypePack>(mentioned);
+                LUAU_ASSERT(mentionedTfitp);
+                if (areEquivalent(tfitp, *mentionedTfitp))
+                {
+                    return true;
+                }
+            }
+
+            internalPackFunctions.insert(tp);
+        }
+
+        return true;
+    }
+};
+
+void check(
+    NotNull<BuiltinTypes> builtinTypes,
+    NotNull<TypeFunctionRuntime> typeFunctionRuntime,
+    NotNull<UnifierSharedState> unifierState,
+    NotNull<TypeCheckLimits> limits,
+    DcrLogger* logger,
+    const SourceModule& sourceModule,
+    Module* module,
+    Helpifier helpifier
+)
+{
+    LUAU_TIMETRACE_SCOPE("check", "Typechecking");
+
+    TypeChecker2 typeChecker{builtinTypes, typeFunctionRuntime, unifierState, limits, logger, &sourceModule, module};
+    typeChecker.helpifier = helpifier;
+
+    typeChecker.visit(sourceModule.root);
+    typeChecker.reportNoTypeNotes();
+
+    unfreeze(module->interfaceTypes);
+    copyErrors(module->errors, module->interfaceTypes, builtinTypes);
+    freeze(module->interfaceTypes);
+}
+
+TypeChecker2::TypeChecker2(
+    NotNull<BuiltinTypes> builtinTypes,
+    NotNull<TypeFunctionRuntime> typeFunctionRuntime,
+    NotNull<UnifierSharedState> unifierState,
+    NotNull<TypeCheckLimits> limits,
+    DcrLogger* logger,
+    const SourceModule* sourceModule,
+    Module* module
+)
+    : builtinTypes(builtinTypes)
+    , typeFunctionRuntime(typeFunctionRuntime)
+    , logger(logger)
+    , limits(limits)
+    , ice(unifierState->iceHandler)
+    , sourceModule(sourceModule)
+    , module(module)
+    , normalizer{module->internalTypes.get(), builtinTypes, unifierState, SolverMode::New, /* cacheInhabitance */ true}
+    , _subtyping{builtinTypes, NotNull{module->internalTypes.get()}, NotNull{&normalizer}, typeFunctionRuntime, NotNull{unifierState->iceHandler}}
+    , subtyping(&_subtyping)
+{
+}
+
+bool TypeChecker2::allowsNoReturnValues(const TypePackId tp)
+{
+    for (TypeId ty : tp)
+    {
+        if (!get<ErrorType>(follow(ty)))
+            return false;
+    }
+
+    return true;
+}
+
+Location TypeChecker2::getEndLocation(const AstExprFunction* function)
+{
+    Location loc = function->location;
+    if (loc.begin.line != loc.end.line)
+    {
+        Position begin = loc.end;
+        begin.column = std::max(0u, begin.column - 3);
+        loc = Location(begin, 3);
+    }
+
+    return loc;
+}
+
+bool TypeChecker2::isErrorCall(const AstExprCall* call)
+{
+    const AstExprGlobal* global = call->func->as<AstExprGlobal>();
+    if (!global)
+        return false;
+
+    if (global->name == "error")
+        return true;
+    else if (global->name == "assert")
+    {
+        // assert() will error because it is missing the first argument
+        if (call->args.size == 0)
+            return true;
+
+        if (AstExprConstantBool* expr = call->args.data[0]->as<AstExprConstantBool>())
+            if (!expr->value)
+                return true;
+    }
+
+    return false;
+}
+
+bool TypeChecker2::hasBreak(AstStat* node)
+{
+    if (AstStatBlock* stat = node->as<AstStatBlock>())
+    {
+        for (size_t i = 0; i < stat->body.size; ++i)
+        {
+            if (hasBreak(stat->body.data[i]))
+                return true;
+        }
+
+        return false;
+    }
+
+    if (node->is<AstStatBreak>())
+        return true;
+
+    if (AstStatIf* stat = node->as<AstStatIf>())
+    {
+        if (hasBreak(stat->thenbody))
+            return true;
+
+        if (stat->elsebody && hasBreak(stat->elsebody))
+            return true;
+
+        return false;
+    }
+
+    return false;
+}
+
+const AstStat* TypeChecker2::getFallthrough(const AstStat* node)
+{
+    if (const AstStatBlock* stat = node->as<AstStatBlock>())
+    {
+        if (stat->body.size == 0)
+            return stat;
+
+        for (size_t i = 0; i < stat->body.size - 1; ++i)
+        {
+            if (getFallthrough(stat->body.data[i]) == nullptr)
+                return nullptr;
+        }
+
+        return getFallthrough(stat->body.data[stat->body.size - 1]);
+    }
+
+    // Luwu Do Expressions (rfcs/do-expressions.md): `if (do return x) then` returns before the branch
+    if (findDoEndingStatement(node))
+        return nullptr;
+
+    if (const AstStatIf* stat = node->as<AstStatIf>())
+    {
+        // Luwu Do Expressions (rfcs/do-expressions.md): a then-branch that never runs doesn't fall through
+        if (const AstStat* thenf = findDoBlockingThenBranch(stat) ? nullptr : getFallthrough(stat->thenbody))
+            return thenf;
+
+        if (stat->elsebody)
+        {
+            if (const AstStat* elsef = getFallthrough(stat->elsebody))
+                return elsef;
+
+            return nullptr;
+        }
+        else
+            return stat;
+    }
+
+    if (node->is<AstStatReturn>())
+        return nullptr;
+
+    if (const AstStatExpr* stat = node->as<AstStatExpr>())
+    {
+        if (AstExprCall* call = stat->expr->as<AstExprCall>(); call && isErrorCall(call))
+            return nullptr;
+
+        return stat;
+    }
+
+    if (const AstStatWhile* stat = node->as<AstStatWhile>())
+    {
+        if (AstExprConstantBool* expr = stat->clauses.size == 0 ? stat->condition->as<AstExprConstantBool>() : nullptr)
+        {
+            if (expr->value && !hasBreak(stat->body))
+                return nullptr;
+        }
+
+        return node;
+    }
+
+    if (const AstStatRepeat* stat = node->as<AstStatRepeat>())
+    {
+        if (AstExprConstantBool* expr = stat->condition->as<AstExprConstantBool>())
+        {
+            if (!expr->value && !hasBreak(stat->body))
+                return nullptr;
+        }
+
+        if (getFallthrough(stat->body) == nullptr)
+            return nullptr;
+
+        return node;
+    }
+
+    return node;
+}
+
+std::optional<StackPusher> TypeChecker2::pushStack(AstNode* node)
+{
+    if (Scope** scope = module->astScopes.find(node))
+        return StackPusher{stack, *scope};
+    else
+        return std::nullopt;
+}
+
+void TypeChecker2::checkForInternalTypeFunction(TypeId ty, Location location)
+{
+    InternalTypeFunctionFinder finder(functionDeclStack);
+    finder.traverse(ty);
+
+    for (TypeId internal : finder.internalFunctions)
+        reportError(WhereClauseNeeded{internal}, location);
+
+    for (TypePackId internal : finder.internalPackFunctions)
+        reportError(PackWhereClauseNeeded{internal}, location);
+}
+
+TypeId TypeChecker2::checkForTypeFunctionInhabitance(TypeId instance, Location location)
+{
+    if (seenTypeFunctionInstances.find(instance))
+        return instance;
+    seenTypeFunctionInstances.insert(instance);
+
+    TypeFunctionContext context{
+        NotNull{module->internalTypes.get()}, builtinTypes, stack.back(), NotNull{&normalizer}, typeFunctionRuntime, ice, limits, subtyping
+    };
+    context.reportedApplications = &reportedTypeFunctionApplications;
+
+    ErrorVec errors = reduceTypeFunctions(instance, location, NotNull{&context}, true).errors;
+    if (!isErrorSuppressing(location, instance))
+        reportErrors(std::move(errors));
+    return instance;
+}
+
+TypePackId TypeChecker2::lookupPack(AstExpr* expr) const
+{
+    // If a type isn't in the type graph, it probably means that a recursion limit was exceeded.
+    // We'll just return anyType in these cases.  Typechecking against any is very fast and this
+    // allows us not to think about this very much in the actual typechecking logic.
+    TypePackId* tp = module->astTypePacks.find(expr);
+    if (tp)
+        return follow(*tp);
+    else
+        return builtinTypes->anyTypePack;
+}
+
+TypeId TypeChecker2::lookupType(AstExpr* expr)
+{
+    // If a type isn't in the type graph, it probably means that a recursion limit was exceeded.
+    // We'll just return anyType in these cases.  Typechecking against any is very fast and this
+    // allows us not to think about this very much in the actual typechecking logic.
+    TypeId* ty = module->astTypes.find(expr);
+    if (ty)
+        return checkForTypeFunctionInhabitance(follow(*ty), expr->location);
+
+    TypePackId* tp = module->astTypePacks.find(expr);
+    if (tp)
+        return checkForTypeFunctionInhabitance(flattenPack(*tp), expr->location);
+
+    return builtinTypes->anyType;
+}
+
+TypeId TypeChecker2::lookupAnnotation(AstType* annotation)
+{
+    if (FFlag::DebugLuauMagicTypes)
+    {
+        if (auto ref = annotation->as<AstTypeReference>(); ref && ref->name == kLuauPrint && ref->parameters.size > 0)
+        {
+            if (auto ann = ref->parameters.data[0].type)
+            {
+                TypeId argTy = lookupAnnotation(ann);
+                luauPrintLine(
+                    format("_luau_print (%d, %d): %s\n", annotation->location.begin.line, annotation->location.begin.column, toString(argTy).c_str())
+                );
+                return follow(argTy);
+            }
+        }
+        else if (auto ref = annotation->as<AstTypeReference>(); ref && ref->name == kLuauForceConstraintSolvingIncomplete)
+        {
+            reportError(ConstraintSolvingIncompleteError{}, ref->location);
+            return builtinTypes->anyType;
+        }
+    }
+
+    TypeId* ty = module->astResolvedTypes.find(annotation);
+
+    if (module->constraintGenerationDidNotComplete && !ty)
+        return builtinTypes->anyType;
+
+    LUAU_ASSERT(ty);
+    return checkForTypeFunctionInhabitance(follow(*ty), annotation->location);
+}
+
+std::optional<TypePackId> TypeChecker2::lookupPackAnnotation(AstTypePack* annotation) const
+{
+    TypePackId* tp = module->astResolvedTypePacks.find(annotation);
+    if (tp != nullptr)
+        return {follow(*tp)};
+    return {};
+}
+
+TypeId TypeChecker2::lookupExpectedType(AstExpr* expr) const
+{
+    if (TypeId* ty = module->astExpectedTypes.find(expr))
+        return follow(*ty);
+
+    return builtinTypes->anyType;
+}
+
+TypePackId TypeChecker2::lookupExpectedPack(AstExpr* expr, TypeArena& arena) const
+{
+    if (TypeId* ty = module->astExpectedTypes.find(expr))
+        return arena.addTypePack(TypePack{{follow(*ty)}, std::nullopt});
+
+    return builtinTypes->anyTypePack;
+}
+
+TypePackId TypeChecker2::reconstructPack(AstArray<AstExpr*> exprs, TypeArena& arena)
+{
+    if (exprs.size == 0)
+        return arena.addTypePack(TypePack{{}, std::nullopt});
+
+    std::vector<TypeId> head;
+
+    for (size_t i = 0; i < exprs.size - 1; ++i)
+    {
+        head.push_back(lookupType(exprs.data[i]));
+    }
+
+    TypePackId tail = lookupPack(exprs.data[exprs.size - 1]);
+    return arena.addTypePack(TypePack{std::move(head), tail});
+}
+
+Scope* TypeChecker2::findInnermostScope(Location location) const
+{
+    return module->getModuleScope()->findNarrowestScopeContaining(location).get();
+}
+
+void TypeChecker2::visit(AstStat* stat)
+{
+    auto pusher = pushStack(stat);
+
+    if (auto s = stat->as<AstStatBlock>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatIf>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatWhile>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatRepeat>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatBreak>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatContinue>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatReturn>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatGive>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatComprehensionItem>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatExpr>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatLocal>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatFor>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatForIn>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatAssign>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatCompoundAssign>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatPush>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatFunction>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatLocalFunction>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatTypeAlias>())
+        return visit(s);
+    else if (auto f = stat->as<AstStatTypeFunction>())
+        return visit(f);
+    else if (auto s = stat->as<AstStatDeclareFunction>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatDeclareGlobal>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatDeclareExternType>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatDeclareClass>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatClass>())
+        return visit(s);
+    else if (auto s = stat->as<AstStatError>())
+        return visit(s);
+    else
+        LUAU_ASSERT(!"TypeChecker2 encountered an unknown node type");
+}
+
+void TypeChecker2::visit(AstStatBlock* block)
+{
+    auto StackPusher = pushStack(block);
+
+    for (AstStat* statement : block->body)
+        visit(statement);
+}
+
+// Luwu If Local (rfcs/if-local.md): a `when` chain's declarations are checked like any `local`, and its plain
+// conditions like the condition of an ordinary `if`.
+void TypeChecker2::visitIfCondition(AstExpr* condition, const AstArray<AstIfClause>& clauses)
+{
+    if (clauses.size == 0)
+    {
+        InConditionalContext flipper{&typeContext};
+        visit(condition, ValueContext::RValue);
+        return;
+    }
+
+    for (const AstIfClause& clause : clauses)
+    {
+        if (clause.declaration)
+        {
+            visit(clause.declaration);
+        }
+        else
+        {
+            InConditionalContext flipper{&typeContext};
+            visit(clause.expr, ValueContext::RValue);
+        }
+    }
+}
+
+void TypeChecker2::visit(AstStatIf* ifStatement)
+{
+    visitIfCondition(ifStatement->condition, ifStatement->clauses);
+
+    visit(ifStatement->thenbody);
+    if (ifStatement->elsebody)
+        visit(ifStatement->elsebody);
+}
+
+void TypeChecker2::visit(AstStatWhile* whileStatement)
+{
+    if (whileStatement->clauses.size != 0)
+        visitIfCondition(whileStatement->condition, whileStatement->clauses);
+    else
+        visit(whileStatement->condition, ValueContext::RValue);
+    visit(whileStatement->body);
+}
+
+void TypeChecker2::visit(AstStatRepeat* repeatStatement)
+{
+    visit(repeatStatement->body);
+    visit(repeatStatement->condition, ValueContext::RValue);
+}
+
+void TypeChecker2::visit(AstStatBreak*) {}
+
+void TypeChecker2::visit(AstStatContinue*) {}
+
+// Luwu (helpful subtyping errors): the kind of statement `getFallthrough` hands back, which is the code path
+// that forgot to return. An `if` with no `else` fails because of a branch that isn't written down, and a
+// loop because it may not run at all; anything else is just the code path.
+enum class FallthroughKind
+{
+    IfWithoutElse,
+    Loop,
+    CodePath,
+};
+
+struct FallthroughSite
+{
+    FallthroughKind kind;
+
+    // Where the squiggle goes. Highlighting a whole `if` or loop paints the branch that *does* return, so
+    // those get their keyword alone and the message names what is missing.
+    Location location;
+};
+
+static FallthroughSite classifyFallthrough(const AstStat* fallthrough)
+{
+    constexpr unsigned whileKeywordLength = 5;
+    constexpr unsigned repeatKeywordLength = 6;
+
+    if (const AstStatIf* ifStat = fallthrough->as<AstStatIf>(); ifStat && !ifStat->elsebody)
+        return {FallthroughKind::IfWithoutElse, ifStat->ifLocation};
+
+    auto keyword = [](const Location& statement, unsigned length)
+    {
+        return Location{statement.begin, Position{statement.begin.line, statement.begin.column + length}};
+    };
+
+    if (fallthrough->is<AstStatWhile>())
+        return {FallthroughKind::Loop, keyword(fallthrough->location, whileKeywordLength)};
+
+    if (fallthrough->is<AstStatRepeat>())
+        return {FallthroughKind::Loop, keyword(fallthrough->location, repeatKeywordLength)};
+
+    return {FallthroughKind::CodePath, fallthrough->location};
+}
+
+static std::string describeFallthrough(FallthroughKind kind, TypePackId expectedReturnType)
+{
+    const std::string returns = "return '" + toString(expectedReturnType) + "'.";
+
+    switch (kind)
+    {
+    case FallthroughKind::IfWithoutElse:
+        return "This 'if' has no 'else', so the code path that skips it doesn't " + returns;
+    case FallthroughKind::Loop:
+        return "This loop may not run, so the code path that skips it doesn't " + returns;
+    case FallthroughKind::CodePath:
+        break;
+    }
+
+    return "This code path doesn't " + returns;
+}
+
+// Luwu (helpful subtyping errors): does this function body contain a `return` at all? "Not all codepaths" is
+// the right thing to say about a function that returns on some paths and falls off the end on others,
+// and the wrong thing to say about one that never returns anything -- there is only the one codepath.
+struct ReturnStatementFinder : public AstVisitor
+{
+    bool found = false;
+
+    bool visit(AstStatReturn*) override
+    {
+        found = true;
+        return false;
+    }
+
+    // A nested function's returns are its own.
+    bool visit(AstExprFunction*) override
+    {
+        return false;
+    }
+
+    bool visit(AstStat* stat) override
+    {
+        return !found;
+    }
+
+    bool visit(AstExpr* expr) override
+    {
+        return !found;
+    }
+};
+
+// Luwu (helpful subtyping errors): a return type pack that is empty -- the function returns no values at all,
+// written `()`.
+static bool returnsNoValues(TypePackId tp)
+{
+    auto [head, tail] = flatten(tp);
+    return head.empty() && !tail;
+}
+
+// Luwu (helpful subtyping errors): a return type pack of exactly one `nil`, which is what `(): nil` means and
+// what a lone `return nil` produces. The whole confusion these messages exist for is that this is not
+// `()`.
+static bool returnsOnlyNil(TypePackId tp)
+{
+    auto [head, tail] = flatten(tp);
+    return head.size() == 1 && !tail && isNil(follow(head[0]));
+}
+
+// Luwu (helpful subtyping errors): `return`/falling off the end produces no values; `return nil` produces one
+// value that is nil. Lua hides the difference in the common case -- `local x = f()` gives nil either way --
+// and upstream reports it as "Expected this to be 'nil', but got '()'", which doesn't say the two differ.
+// Returns the whole message, or nullopt when the mismatch isn't between something and nothing.
+static std::string valueCount(size_t count)
+{
+    if (count == 1)
+        return "1 value";
+    return std::to_string(count) + " values";
+}
+
+// Luwu (helpful subtyping errors): two return lists of different lengths. Upstream prints both lists in full ("Expected
+// this to be 'number', but got 'number, string'"), which hides the count among the types: a function-typed value makes
+// the two sides near-identical walls of text that differ by a `, {T}` at the end.
+static std::optional<std::string> explainReturnLengthMismatch(TypePackId givenTp, TypePackId wantedTp)
+{
+    // A variadic list, or one ending in a call or `...`, can make up the difference
+    if (!finite(givenTp) || !finite(wantedTp))
+        return std::nullopt;
+
+    const size_t wanted = size(wantedTp);
+    const size_t given = size(givenTp);
+    if (wanted == given)
+        return std::nullopt;
+
+    std::string message = "Expected this function to return " + valueCount(wanted) + ", but it returns " + valueCount(given) + ".\n";
+    if (given > wanted)
+        message += "Consider annotating every value it returns (e.g. ': (A, B)'), or removing the extra ones.";
+    else
+        message += "Consider returning every value the annotation lists, or removing the ones it doesn't from the annotation.";
+
+    return message;
+}
+
+static std::optional<std::string> explainReturnCountMismatch(TypePackId givenTp, TypePackId wantedTp)
+{
+    const bool wantsNothing = returnsNoValues(wantedTp);
+    const bool givesNothing = returnsNoValues(givenTp);
+
+    if (wantsNothing == givesNothing)
+        return explainReturnLengthMismatch(givenTp, wantedTp);
+
+    if (wantsNothing)
+    {
+        std::string message = "Expected this function to return no values, but it returns ";
+
+        if (!returnsOnlyNil(givenTp))
+            return message + "'" + toString(givenTp) + "'.";
+
+        return message + "the value 'nil'.\n"
+                         "Consider changing this to a bare 'return', or if you want to return a value annotate the function's "
+                         "return type as optional (a type followed by '?').";
+    }
+
+    if (!returnsOnlyNil(wantedTp))
+        return "Expected this function to return '" + toString(wantedTp) + "', but it returns nothing at all.";
+
+    return "Expected this function to return the value 'nil', but it returns nothing at all.\n"
+           "Consider adding 'return nil', or annotating the return type as '()' if it is meant to return nothing.";
+}
+
+// Luwu: a `return` that gives at least one value may leave off trailing values the function declares as optional,
+// the same rule a call already follows for trailing optional arguments. `return nil` ends an iterator declared
+// `(): (number?, { number }?)`. Upstream requires every declared value (`return nil, nil`), which for an iterator with
+// a long multiret means `return nil, nil, nil, nil, nil, nil`. A bare `return` still doesn't satisfy `-> nil` or
+// `-> (number?, string?)`: returning nothing is not returning `nil`.
+static void padOmittedOptionalReturns(std::vector<TypeId>& actualHead, std::optional<TypePackId> actualTail, TypePackId expectedRetType)
+{
+    if (actualHead.empty() || actualTail)
+        return;
+
+    auto [expectedHead, _] = flatten(expectedRetType);
+    if (actualHead.size() >= expectedHead.size())
+        return;
+
+    for (size_t i = actualHead.size(); i < expectedHead.size(); ++i)
+    {
+        if (!isOptional(expectedHead[i]))
+            return;
+    }
+
+    actualHead.insert(actualHead.end(), expectedHead.begin() + actualHead.size(), expectedHead.end());
+}
+
+void TypeChecker2::visit(AstStatReturn* ret)
+{
+    Scope* scope = findInnermostScope(ret->location);
+    TypePackId expectedRetType = scope->returnType;
+
+    // Luwu: in a function whose return type was inferred value by value (ConstraintSolver::dispatchInferredReturn), a
+    // `return` that gives some values gives `nil` for the rest. Because the inferred type already holds that `nil`, the
+    // `return` is checked only against the values it gives. One that gives nothing is checked against all of them: a
+    // function that returns a value must `return nil` on its other paths.
+    if (module->inferredReturnPacks.contains(follow(expectedRetType)))
+    {
+        auto [given, givenTail] = flatten(returnedPack(ret));
+        auto [head, tail] = flatten(expectedRetType);
+        bool givesSomeValues = !givenTail && !given.empty();
+        if (givesSomeValues && (given.size() < head.size() || tail))
+        {
+            head.resize(std::min(head.size(), given.size()));
+            expectedRetType = module->internalTypes->addTypePack(std::move(head));
+        }
+    }
+
+    // Narrowly scoped to the pack tests themselves: the checks in between report on expressions,
+    // and a pack mismatch from one of those is not about what this function returns.
+    auto testReturnPack = [this](TypePackId actual, TypePackId expected, Location location)
+    {
+        ScopedMemberValue<bool> inReturn{checkingReturnStatement, true};
+        testIsSubtype(actual, expected, location);
+    };
+
+    if (ret->list.size == 0)
+    {
+        testReturnPack(builtinTypes->emptyTypePack, expectedRetType, ret->location);
+        return;
+    }
+
+    auto [head, _] = extendTypePack(*module->internalTypes, builtinTypes, expectedRetType, ret->list.size);
+
+    // Luwu literal types: a returned table checked against the literal fields of the return type
+    for (size_t idx = 0; idx < ret->list.size && idx < head.size(); idx++)
+        checkLiteralFields(ret->list.data[idx], head[idx], NotNull{scope});
+
+    bool isSubtype = true;
+    std::vector<TypeId> actualHead;
+    std::optional<TypePackId> actualTail;
+    for (size_t idx = 0; idx < ret->list.size - 1; idx++)
+    {
+        if (idx < head.size())
+        {
+            isSubtype &= testLiteralOrAstTypeIsSubtype(ret->list.data[idx], head[idx]);
+            actualHead.push_back(head[idx]);
+        }
+        else
+        {
+            actualHead.push_back(lookupType(ret->list.data[idx]));
+        }
+    }
+
+    // This stanza is deconstructing what constraint generation does to
+    // return statements. If we have some statement like:
+    //
+    //  return E0, E1, E2, ... , EN
+    //
+    // All expressions *except* the last will be typeArguments, and the last can
+    // potentially be a pack. However, if the last expression is a function
+    // call or varargs (`...`), then we _could_ have a pack in the final
+    // position. Additionally, if we have an argument overflow, then we can't
+    // do anything interesting with subtyping.
+    //
+    // _If_ the last argument is not a function call or varargs and we have
+    // at least an argument underflow, then we grab the last type out of
+    // the type pack head and use that to check the subtype of
+    auto lastExpr = ret->list.data[ret->list.size - 1];
+    if (head.size() < ret->list.size || lastExpr->is<AstExprCall>() || lastExpr->is<AstExprVarargs>())
+    {
+        actualTail = lookupPack(lastExpr);
+    }
+    else
+    {
+        auto lastType = head[ret->list.size - 1];
+        isSubtype &= testLiteralOrAstTypeIsSubtype(lastExpr, lastType);
+        actualHead.push_back(lastType);
+    }
+
+    // After all that, we still fire a pack subtype test to determine
+    // whether we have a well-formed return statement. We only fire
+    // this if all the previous subtype tests have succeeded, lest
+    // we double error.
+    if (isSubtype)
+    {
+        padOmittedOptionalReturns(actualHead, actualTail, expectedRetType);
+        auto reconstructedRetType = module->internalTypes->addTypePack(TypePack{std::move(actualHead), std::move(actualTail)});
+        testReturnPack(reconstructedRetType, expectedRetType, ret->location);
+    }
+
+    for (AstExpr* expr : ret->list)
+        visit(expr, ValueContext::RValue);
+}
+
+void TypeChecker2::visit(AstStatExpr* expr)
+{
+    visit(expr->expr, ValueContext::RValue);
+}
+
+void TypeChecker2::visit(AstStatLocal* local)
+{
+    size_t count = std::max(local->values.size, local->vars.size);
+    for (size_t i = 0; i < count; ++i)
+    {
+        AstExpr* value = i < local->values.size ? local->values.data[i] : nullptr;
+        const bool isPack = value && (value->is<AstExprCall>() || value->is<AstExprVarargs>());
+
+        if (value)
+            visit(value, ValueContext::RValue);
+
+        if (i != local->values.size - 1 || !isPack)
+        {
+            AstLocal* var = i < local->vars.size ? local->vars.data[i] : nullptr;
+
+            if (var && var->annotation)
+            {
+                TypeId annotationType = lookupAnnotation(var->annotation);
+                TypeId valueType = value ? lookupType(value) : nullptr;
+                if (valueType)
+                {
+                    testPotentialLiteralIsSubtype(value, annotationType);
+                    checkLiteralLocalValue(var, value, valueType, annotationType);
+                }
+
+                visit(var->annotation);
+            }
+        }
+        else if (value)
+        {
+            TypePackId valuePack = lookupPack(value);
+            TypePack valueTypes;
+            if (i < local->vars.size)
+                valueTypes = extendTypePack(*module->internalTypes, builtinTypes, valuePack, local->vars.size - i);
+
+            Location errorLocation;
+            for (size_t j = i; j < local->vars.size; ++j)
+            {
+                if (j - i >= valueTypes.head.size())
+                {
+                    errorLocation = local->vars.data[j]->location;
+                    break;
+                }
+
+                AstLocal* var = local->vars.data[j];
+                if (var->annotation)
+                {
+                    TypeId varType = lookupAnnotation(var->annotation);
+                    testIsSubtype(valueTypes.head[j - i], varType, value->location);
+                    checkLiteralLocalValue(var, value, valueTypes.head[j - i], varType);
+
+                    visit(var->annotation);
+                }
+            }
+
+            if (valueTypes.head.size() < local->vars.size - i)
+            {
+                reportError(
+                    CountMismatch{
+                        // We subtract 1 here because the final AST
+                        // expression is not worth one value.  It is worth 0
+                        // or more depending on valueTypes.head
+                        local->values.size - 1 + valueTypes.head.size(),
+                        std::nullopt,
+                        local->vars.size,
+                        local->values.data[local->values.size - 1]->is<AstExprCall>() ? CountMismatch::FunctionResult : CountMismatch::ExprListResult,
+                    },
+                    errorLocation
+                );
+            }
+        }
+    }
+}
+
+void TypeChecker2::visit(AstStatFor* forStatement)
+{
+    if (forStatement->var->annotation)
+    {
+        visit(forStatement->var->annotation);
+
+        TypeId annotatedType = lookupAnnotation(forStatement->var->annotation);
+        testIsSubtype(builtinTypes->numberType, annotatedType, forStatement->var->location);
+    }
+
+    auto checkNumber = [this](AstExpr* expr)
+    {
+        if (!expr)
+            return;
+
+        visit(expr, ValueContext::RValue);
+        testIsSubtype(lookupType(expr), builtinTypes->numberType, expr->location);
+    };
+
+    checkNumber(forStatement->from);
+    checkNumber(forStatement->to);
+    checkNumber(forStatement->step);
+
+    visit(forStatement->body);
+}
+
+// Luwu Classes (rfcs/classes): `for ... in x` where `x` is an object (or a class or trait value) without `__iter`.
+// `kind` is luwuNominalKind(iteratorTy).
+static std::string notIterableMessage(TypeId iteratorTy, const char* kind)
+{
+    if (std::string_view(kind) == "object")
+        return "Cannot iterate over " + describeLuwuNominalValue(iteratorTy) + ": its class doesn't define '__iter'";
+
+    return "Cannot iterate over " + describeLuwuNominalValue(iteratorTy) + " itself; only objects can be iterated, when their class defines '__iter'";
+}
+
+void TypeChecker2::visit(AstStatForIn* forInStatement)
+{
+    for (AstLocal* local : forInStatement->vars)
+    {
+        if (local->annotation)
+            visit(local->annotation);
+    }
+
+    for (AstExpr* expr : forInStatement->values)
+        visit(expr, ValueContext::RValue);
+
+    visit(forInStatement->body);
+
+    // Rule out crazy stuff.  Maybe possible if the file is not syntactically valid.
+    if (!forInStatement->vars.size || !forInStatement->values.size)
+        return;
+
+    NotNull<Scope> scope = stack.back();
+    TypeArena& arena = *module->internalTypes;
+
+    std::vector<TypeId> variableTypes;
+    for (AstLocal* var : forInStatement->vars)
+    {
+        std::optional<TypeId> ty = scope->lookup(var);
+        LUAU_ASSERT(ty);
+        variableTypes.emplace_back(*ty);
+    }
+
+    AstExpr* firstValue = forInStatement->values.data[0];
+
+    // we need to build up a typepack for the iterators/values portion of the for-in statement.
+    std::vector<TypeId> valueTypes;
+    std::optional<TypePackId> iteratorTail;
+
+    // since the first value may be the only iterator (e.g. if it is a call), we want to
+    // look to see if it has a resulting typepack as our iterators.
+    TypePackId* retPack = module->astTypePacks.find(firstValue);
+    if (retPack)
+    {
+        auto [head, tail] = flatten(*retPack);
+        valueTypes = head;
+        iteratorTail = tail;
+    }
+    else
+    {
+        valueTypes.emplace_back(lookupType(firstValue));
+    }
+
+    // if the initial and expected typeArguments from the iterator unified during constraint solving,
+    // we'll have a resolved type to use here, but we'll only use it if either the iterator is
+    // directly present in the for-in statement or if we have an iterator state constraining us
+    TypeId* resolvedTy = module->astForInNextTypes.find(firstValue);
+    if (resolvedTy && (!retPack || valueTypes.size() > 1))
+        valueTypes[0] = *resolvedTy;
+
+    for (size_t i = 1; i < forInStatement->values.size - 1; ++i)
+    {
+        valueTypes.emplace_back(lookupType(forInStatement->values.data[i]));
+    }
+
+    // if we had more than one value, the tail from the first value is no longer appropriate to use.
+    if (forInStatement->values.size > 1)
+    {
+        auto [head, tail] = flatten(lookupPack(forInStatement->values.data[forInStatement->values.size - 1]));
+        valueTypes.insert(valueTypes.end(), head.begin(), head.end());
+        iteratorTail = tail;
+    }
+
+    // and now we can put everything together to get the actual typepack of the iterators.
+    TypePackId iteratorPack = arena.addTypePack(std::move(valueTypes), iteratorTail);
+
+    // ... and then expand it out to 3 values (if possible)
+    TypePack iteratorTypes = extendTypePack(arena, builtinTypes, iteratorPack, 3);
+    if (iteratorTypes.head.empty())
+    {
+        reportError(GenericError{"for..in loops require at least one value to iterate over.  Got zero"}, getLocation(forInStatement->values));
+        return;
+    }
+    TypeId iteratorTy = follow(iteratorTypes.head[0]);
+
+    auto checkFunction = [this, &arena, &forInStatement, &variableTypes](const FunctionType* iterFtv, std::vector<TypeId> iterTys, bool isMm)
+    {
+        if (iterTys.size() < 1 || iterTys.size() > 3)
+        {
+            if (isMm)
+                reportError(GenericError{"__iter metamethod must return (next[, table[, state]])"}, getLocation(forInStatement->values));
+            else
+                reportError(GenericError{"for..in loops must be passed (next[, table[, state]])"}, getLocation(forInStatement->values));
+
+            return;
+        }
+
+        // It is okay if there aren't enough iterators, but the iteratee must provide enough.
+        TypePack expectedVariableTypes = extendTypePack(arena, builtinTypes, iterFtv->retTypes, variableTypes.size());
+        if (expectedVariableTypes.head.size() < variableTypes.size())
+        {
+            if (isMm)
+                reportError(GenericError{"__iter metamethod's next() function does not return enough values"}, getLocation(forInStatement->values));
+            else
+                reportError(GenericError{"next() does not return enough values"}, forInStatement->values.data[0]->location);
+
+            return;
+        }
+
+        // nextFn is going to be invoked with (arrayTy, startIndexTy)
+
+        // It will be passed two arguments on every iteration save the
+        // first.
+
+        // It may be invoked with 0 or 1 argument on the first iteration.
+        // This depends on the typeArguments in iterateePack and therefore
+        // iteratorTypes.
+
+        // If the iteratee is an error type, then we can't really say anything else about iteration over it.
+        // After all, it _could've_ been a table.
+        if (get<ErrorType>(follow(flattenPack(iterFtv->argTypes))))
+            return;
+
+        // If iteratorTypes is too short to be a valid call to nextFn, we have to report a count mismatch error.
+        // If 2 is too short to be a valid call to nextFn, we have to report a count mismatch error.
+        // If 2 is too long to be a valid call to nextFn, we have to report a count mismatch error.
+        auto [minCount, maxCount] = getParameterExtents(TxnLog::empty(), iterFtv->argTypes, /*includeHiddenVariadics*/ true);
+
+        TypePack flattenedArgTypes = extendTypePack(arena, builtinTypes, iterFtv->argTypes, 2);
+        size_t firstIterationArgCount = iterTys.empty() ? 0 : iterTys.size() - 1;
+        size_t actualArgCount = expectedVariableTypes.head.size();
+        if (firstIterationArgCount < minCount)
+        {
+            if (isMm)
+                reportError(GenericError{"__iter metamethod must return (next[, table[, state]])"}, getLocation(forInStatement->values));
+            else
+                reportError(CountMismatch{2, std::nullopt, firstIterationArgCount, CountMismatch::Arg}, forInStatement->values.data[0]->location);
+
+            return;
+        }
+        else if (actualArgCount < minCount)
+        {
+            if (isMm)
+                reportError(GenericError{"__iter metamethod must return (next[, table[, state]])"}, getLocation(forInStatement->values));
+            else
+                reportError(CountMismatch{2, std::nullopt, firstIterationArgCount, CountMismatch::Arg}, forInStatement->values.data[0]->location);
+
+            return;
+        }
+
+        const TypeId iterFunc = follow(iterTys[0]);
+
+        std::vector<TypeId> prospectiveArgTypes = std::vector(iterTys.begin() + 1, iterTys.end());
+        // Right pad with nils if needed
+        if (const TypePack* iterFuncArgs = get<TypePack>(follow(iterFtv->argTypes));
+            iterFuncArgs && iterFuncArgs->head.size() > prospectiveArgTypes.size())
+            prospectiveArgTypes.resize(iterFuncArgs->head.size(), builtinTypes->nilType);
+        const TypePackId prospectiveArgs = arena.addTypePack(prospectiveArgTypes, std::nullopt);
+
+        std::vector<TypeId> prospectiveRetTypes = {};
+        if (variableTypes.size() > 0) // Type inference intersects the control variable with ~nil, so we make it optional here
+            prospectiveRetTypes.emplace_back(arena.addType(UnionType{{variableTypes[0], builtinTypes->nilType}}));
+        if (variableTypes.size() > 1)
+            prospectiveRetTypes.emplace_back(variableTypes[1]);
+        // Right pad with anys, since not all the return values are used (eg for key in pairs(t))
+        if (const TypePack* iterFuncRets = get<TypePack>(follow(iterFtv->retTypes));
+            iterFuncRets && iterFuncRets->head.size() > prospectiveRetTypes.size())
+            prospectiveRetTypes.resize(iterFuncRets->head.size(), builtinTypes->anyType);
+        // Add a variadic any tail because sometimes iterFunc returns a variadic pack (see forin_metatable_iter_mm)
+        const TypePackId prospectiveRets = arena.addTypePack(prospectiveRetTypes, builtinTypes->anyTypePack);
+
+        const TypeId prospectiveFunction = arena.addType(FunctionType{prospectiveArgs, prospectiveRets, std::nullopt, isMm});
+
+        testIsSubtypeForInStat(iterFunc, prospectiveFunction, *forInStatement);
+    };
+
+    std::shared_ptr<const NormalizedType> iteratorNorm = normalizer.normalize(iteratorTy);
+
+    if (!iteratorNorm)
+        reportError(NormalizationTooComplex{}, firstValue->location);
+
+    /*
+     * If the first iterator argument is a function
+     *  * There must be 1 to 3 iterator arguments.  Name them (nextTy,
+     *    arrayTy, startIndexTy)
+     *  * The return type of nextTy() must correspond to the variables'
+     *    typeArguments and counts.  HOWEVER the first iterator will never be nil.
+     *  * The first return value of nextTy must be compatible with
+     *    startIndexTy.
+     *  * The first argument to nextTy() must be compatible with arrayTy if
+     *    present.  nil if not.
+     *  * The second argument to nextTy() must be compatible with
+     *    startIndexTy if it is present.  Else, it must be compatible with
+     *    nil.
+     *  * nextTy() must be callable with only 2 arguments.
+     */
+    if (const FunctionType* nextFn = get<FunctionType>(iteratorTy))
+    {
+        checkFunction(nextFn, iteratorTypes.head, false);
+    }
+    else if (const TableType* ttv = get<TableType>(iteratorTy))
+    {
+        if ((forInStatement->vars.size == 1 || forInStatement->vars.size == 2) && ttv->indexer)
+        {
+            testIsSubtype(variableTypes[0], ttv->indexer->indexType, forInStatement->vars.data[0]->location);
+            if (variableTypes.size() == 2)
+                testIsSubtype(variableTypes[1], ttv->indexer->indexResultType, forInStatement->vars.data[1]->location);
+        }
+        else
+            reportError(GenericError{"Cannot iterate over a table without indexer"}, forInStatement->values.data[0]->location);
+    }
+    else if (get<AnyType>(iteratorTy) || get<ErrorType>(iteratorTy) || get<NeverType>(iteratorTy))
+    {
+        // nothing
+    }
+    else if (isOptional(iteratorTy) && !(iteratorNorm && iteratorNorm->shouldSuppressErrors()))
+    {
+        reportError(OptionalValueAccess{iteratorTy}, forInStatement->values.data[0]->location);
+    }
+    else if (std::optional<TypeId> iterMmTy =
+                 findMetatableEntry(builtinTypes, module->errors, iteratorTy, "__iter", forInStatement->values.data[0]->location))
+    {
+        Instantiation instantiation{TxnLog::empty(), &arena, builtinTypes, TypeLevel{}, scope};
+
+        if (std::optional<TypeId> instantiatedIterMmTy = instantiate(builtinTypes, NotNull{&arena}, limits, scope, *iterMmTy))
+        {
+            if (const FunctionType* iterMmFtv = get<FunctionType>(*instantiatedIterMmTy))
+            {
+                TypePackId argPack = arena.addTypePack({iteratorTy});
+                testIsSubtype(argPack, iterMmFtv->argTypes, forInStatement->values.data[0]->location);
+
+                TypePack mmIteratorTypes = extendTypePack(arena, builtinTypes, iterMmFtv->retTypes, 3);
+
+                if (mmIteratorTypes.head.size() == 0)
+                {
+                    reportError(GenericError{"__iter must return at least one value"}, forInStatement->values.data[0]->location);
+                    return;
+                }
+
+                TypeId nextFn = follow(mmIteratorTypes.head[0]);
+
+                if (std::optional<TypeId> instantiatedNextFn = instantiation.substitute(nextFn))
+                {
+                    std::vector<TypeId> instantiatedIteratorTypes = mmIteratorTypes.head;
+                    instantiatedIteratorTypes[0] = *instantiatedNextFn;
+
+                    if (const FunctionType* nextFtv = get<FunctionType>(*instantiatedNextFn))
+                    {
+                        checkFunction(nextFtv, std::move(instantiatedIteratorTypes), true);
+                    }
+                    else if (!isErrorSuppressing(forInStatement->values.data[0]->location, *instantiatedNextFn))
+                    {
+                        reportError(CannotCallNonFunction{*instantiatedNextFn}, forInStatement->values.data[0]->location);
+                    }
+                }
+                else
+                {
+                    reportError(UnificationTooComplex{}, forInStatement->values.data[0]->location);
+                }
+            }
+            else if (!isErrorSuppressing(forInStatement->values.data[0]->location, *iterMmTy))
+            {
+                // TODO: This will not tell the user that this is because the
+                // metamethod isn't callable. This is not ideal, and we should
+                // improve this error message.
+
+                // TODO: This will also not handle intersections of functions or
+                // callable tables (which are supported by the runtime).
+                reportError(CannotCallNonFunction{*iterMmTy}, forInStatement->values.data[0]->location);
+            }
+        }
+        else
+        {
+            reportError(UnificationTooComplex{}, forInStatement->values.data[0]->location);
+        }
+    }
+    else if (iteratorNorm && iteratorNorm->hasTables())
+    {
+        // Ok. All tables can be iterated.
+    }
+    else if (!iteratorNorm || !iteratorNorm->shouldSuppressErrors())
+    {
+        // Luwu Classes (rfcs/classes): upstream reports any other iteratee as "Cannot call a value of type X", which
+        // for an object hides that its class just doesn't define `__iter`.
+        if (const char* kind = luwuNominalKind(iteratorTy))
+            reportError(GenericError{notIterableMessage(iteratorTy, kind)}, forInStatement->values.data[0]->location);
+        else
+            reportError(CannotCallNonFunction{iteratorTy}, forInStatement->values.data[0]->location);
+    }
+}
+
+std::optional<TypeId> TypeChecker2::getBindingType(AstExpr* expr)
+{
+    if (auto localExpr = expr->as<AstExprLocal>())
+    {
+        Scope* s = stack.back();
+        return s->lookup(localExpr->local);
+    }
+    else if (auto globalExpr = expr->as<AstExprGlobal>())
+    {
+        Scope* s = stack.back();
+        return s->lookup(globalExpr->name);
+    }
+    else
+        return std::nullopt;
+}
+
+void TypeChecker2::reportErrorsFromAssigningToNever(AstExpr* lhs, TypeId rhsType)
+{
+
+    if (auto indexName = lhs->as<AstExprIndexName>())
+    {
+        TypeId indexedType = lookupType(indexName->expr);
+
+        // if it's already never, I don't think we have anything to do here.
+        if (get<NeverType>(indexedType))
+            return;
+
+        std::string prop = indexName->index.value;
+
+        std::shared_ptr<const NormalizedType> norm = normalizer.normalize(indexedType);
+        if (!norm)
+        {
+            reportError(NormalizationTooComplex{}, lhs->location);
+            return;
+        }
+
+        // if the type is error suppressing, we don't actually have any work left to do.
+        if (norm->shouldSuppressErrors())
+            return;
+
+        const auto propTypes = lookupProp(norm.get(), prop, ValueContext::LValue, lhs->location, builtinTypes->stringType, module->errors);
+
+        reportError(CannotAssignToNever{rhsType, propTypes.typesOfProp, CannotAssignToNever::Reason::PropertyNarrowed}, lhs->location);
+    }
+}
+
+void TypeChecker2::visit(AstStatAssign* assign)
+{
+    size_t count = std::min(assign->vars.size, assign->values.size);
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        AstExpr* lhs = assign->vars.data[i];
+        visit(lhs, ValueContext::LValue);
+        TypeId lhsType = lookupType(lhs);
+
+        AstExpr* rhs = assign->values.data[i];
+        visit(rhs, ValueContext::RValue);
+        TypeId rhsType = lookupType(rhs);
+
+        if (get<NeverType>(lhsType))
+        {
+            reportErrorsFromAssigningToNever(lhs, rhsType);
+            continue;
+        }
+
+        // FIXME CLI-142462: Due to the fact that we do not type state
+        // tables properly, table typeArguments "time travel." We can take
+        // advantage of this for the specific code pattern of:
+        //
+        //  local t = {}
+        //  t.foo = {} -- Type of the RHS gets time warped to `{ bar: {} }`
+        //  t.foo.bar = {}
+        //
+        if (testLiteralOrAstTypeIsSubtype(rhs, lhsType))
+        {
+            // If rhsType </: lhsType, then it's not useful to also report that rhsType </: bindingType
+            if (std::optional<TypeId> bindingType = getBindingType(lhs))
+                testLiteralOrAstTypeIsSubtype(rhs, *bindingType);
+        }
+
+        // Luwu literal types: `t.padding = v` for a literal field, or a table assigned to a literal local or field
+        NotNull<Scope> scope{findInnermostScope(assign->location)};
+        AstExprIndexName* field = lhs->as<AstExprIndexName>();
+        const LiteralCheck* check = field ? findLiteralField(tableTypeOf(lookupType(field->expr)), field->index.value) : nullptr;
+        AstExprLocal* local = lhs->as<AstExprLocal>();
+        if (!check && local)
+            check = module->literalLocals.find(local->local);
+
+        if (check)
+            checkLiteralValue(rhs, rhsType, *check, scope);
+        else
+            checkLiteralFields(rhs, getBindingType(lhs).value_or(lhsType), scope);
+    }
+}
+
+void TypeChecker2::visit(AstStatCompoundAssign* stat)
+{
+    AstExprBinary fake{stat->location, stat->op, stat->var, stat->value};
+    visit(&fake, stat);
+
+    TypeId* resultTy = module->astCompoundAssignResultTypes.find(stat);
+
+    if (module->constraintGenerationDidNotComplete && !resultTy)
+        return;
+
+    LUAU_ASSERT(resultTy);
+    TypeId varTy = lookupType(stat->var);
+
+    testIsSubtype(*resultTy, varTy, stat->location);
+}
+
+void TypeChecker2::visit(AstStatFunction* stat)
+{
+    visit(stat->name, ValueContext::LValue);
+    visit(stat->func);
+
+    if (FFlag::LuauCheckFunctionStatementTypes)
+    {
+        // Consider a block of code like:
+        //
+        //  type X = { x: (number) -> number }
+        //  function f(t: X)
+        //      function t.x(a: string): string
+        //          return "Hello, " .. a
+        //      end
+        //  end
+        //
+        // We need to check that the function we're assigning to `t.x` has the
+        // correct type, like when we're assigning an expression to a local
+        auto lhsType = lookupType(stat->name);
+        auto rhsType = lookupType(stat->func);
+        testIsSubtype(rhsType, lhsType, stat->func->location);
+    }
+}
+
+void TypeChecker2::visit(AstStatLocalFunction* stat)
+{
+    visit(stat->func);
+}
+
+void TypeChecker2::visit(const AstTypeList* typeList)
+{
+    for (AstType* ty : typeList->types)
+        visit(ty);
+
+    if (typeList->tailType)
+        visit(typeList->tailType);
+}
+
+void TypeChecker2::visit(AstStatTypeAlias* stat)
+{
+    // We will not visit type aliases that do not have an associated scope,
+    // this means that (probably) this was a duplicate type alias or a
+    // type alias with an illegal name (like `typeof`).
+    if (!module->astScopes.contains(stat))
+        return;
+
+    if (const Scope* scope = findInnermostScope(stat->location))
+    {
+        if (auto loc = scope->isInvalidTypeAlias(stat->name.value))
+            reportError(RecursiveRestraintViolation{}, *loc);
+    }
+
+    visitGenerics(stat->generics, stat->genericPacks);
+
+    // Luwu Destructuring (rfcs/destructuring.md): a destructured alias of a generic type has its generics, so its
+    // reference, written without type arguments, isn't checked against them
+    if (const Scope* scope = findInnermostScope(stat->location); scope && importedGenericOfDestructuredAlias(*scope, stat))
+        return;
+
+    visit(stat->type);
+}
+
+void TypeChecker2::visit(AstStatTypeFunction* stat)
+{
+    visit(stat->body);
+}
+
+void TypeChecker2::visit(AstTypeList types)
+{
+    for (AstType* type : types.types)
+        visit(type);
+    if (types.tailType)
+        visit(types.tailType);
+}
+
+void TypeChecker2::visit(AstStatDeclareFunction* stat)
+{
+    visitGenerics(stat->generics, stat->genericPacks);
+    visit(stat->params);
+    visit(stat->retTypes);
+    // Luwu try expressions
+    if (stat->errorHint)
+        visit(stat->errorHint);
+}
+
+void TypeChecker2::visit(AstStatDeclareGlobal* stat)
+{
+    if (stat->type)
+        visit(stat->type);
+}
+
+void TypeChecker2::visit(AstStatDeclareExternType* stat)
+{
+    visitGenerics(stat->generics, stat->genericPacks);
+
+    for (const AstDeclaredExternTypeProperty& prop : stat->props)
+        visit(prop.ty);
+}
+
+// Luwu Declare Statements (rfcs/declare-statements.md): a declared class is only its types; there are no bodies or
+// default values to check.
+void TypeChecker2::visit(AstStatDeclareClass* stat)
+{
+    AstStatClass* shape = stat->shape;
+    visitGenerics(shape->generics, shape->genericPacks);
+
+    if (shape->primaryConstructor)
+    {
+        for (AstLocal* arg : shape->primaryConstructor->args)
+        {
+            if (arg->annotation)
+                visit(arg->annotation);
+        }
+    }
+
+    for (const AstClassMember& member : shape->members)
+    {
+        if (const AstClassProperty* prop = member.get_if<AstClassProperty>())
+        {
+            if (prop->ty)
+                visit(prop->ty);
+        }
+        else if (const AstClassMethod* method = member.get_if<AstClassMethod>())
+        {
+            AstExprFunction* function = method->function;
+            visitGenerics(function->generics, function->genericPacks);
+
+            for (AstLocal* arg : function->args)
+            {
+                if (arg->annotation)
+                    visit(arg->annotation);
+            }
+
+            if (function->varargAnnotation)
+                visit(function->varargAnnotation);
+
+            if (function->returnAnnotation)
+                visit(function->returnAnnotation);
+
+            // Luwu try expressions
+            if (function->errorHint)
+                visit(function->errorHint);
+        }
+    }
+}
+
+// Luwu Traits (rfcs/classes/traits.md): where `stat` declares its member `name` (`__init` included: the method, or the
+// primary constructor), so an error about how it meets a trait's expectation goes on it
+static std::optional<Location> classMemberLocation(AstStatClass* stat, const Name& name)
+{
+    for (const AstClassMember& member : stat->members)
+    {
+        if (const AstClassProperty* prop = member.get_if<AstClassProperty>(); prop && name == prop->name.value)
+            return prop->nameLocation;
+        if (const AstClassMethod* method = member.get_if<AstClassMethod>(); method && name == method->functionName.value)
+            return method->nameLocation;
+    }
+
+    if (const AstClassPrimaryConstructor* primaryConstructor = stat->primaryConstructor)
+    {
+        if (name == "__init")
+            return primaryConstructor->argLocation;
+
+        for (AstLocal* param : primaryConstructor->args)
+            if (name == param->name.value)
+                return param->location;
+    }
+
+    return std::nullopt;
+}
+
+// Luwu Traits (rfcs/classes/traits.md): where to report something about `trait` in `stat`: its `implements` entry, or for
+// a trait implied through another one's `needs`, the entry that implies it. Never the class's name: the class header is
+// not where a trait's requirement is broken.
+static const AstClassTraitRef& traitRefFor(NotNull<Scope> scope, AstStatClass* stat, const ExternType* trait)
+{
+    LUAU_ASSERT(stat->implements.size > 0);
+
+    for (const AstClassTraitRef& ref : stat->implements)
+    {
+        AstName name;
+        if (AstExprGlobal* global = ref.trait->as<AstExprGlobal>())
+            name = global->name;
+        else if (AstExprIndexName* index = ref.trait->as<AstExprIndexName>())
+            name = index->index;
+
+        if (name.value && trait->name == name.value)
+            return ref;
+    }
+
+    for (const AstClassTraitRef& ref : stat->implements)
+    {
+        std::optional<TypeFun> listed = scope->lookupTraitRef(ref);
+        const ExternType* listedType = listed ? get<ExternType>(follow(listed->type)) : nullptr;
+        if (listedType && isSubclass(listedType, trait))
+            return ref;
+    }
+
+    // a trait none of the entries resolves to or needs (an instantiation of a generic one) still goes on the list
+    return stat->implements.data[0];
+}
+
+static Location traitRefLocation(NotNull<Scope> scope, AstStatClass* stat, const ExternType* trait)
+{
+    return traitRefFor(scope, stat, trait).trait->location;
+}
+
+// Luwu Traits (rfcs/classes/traits.md): the class's constructor has to accept what the trait's expected `__init` takes
+// after `self`, since the trait's code constructs it with those; parameters beyond them must accept nil.
+void TypeChecker2::checkTraitConstructorExpectation(AstStatClass* stat, const ExternType* classType, const ExternType* traitType)
+{
+    auto expectedInit = traitType->props().find("__init");
+    bool expectsInit = traitType->traitInfo->expectations.count("__init") && expectedInit != traitType->props().end() && expectedInit->second.readTy;
+    const FunctionType* expected = expectsInit ? get<FunctionType>(follow(*expectedInit->second.readTy)) : nullptr;
+
+    const Klass* klass = classType->relation ? get_if<Klass>(&*classType->relation) : nullptr;
+    const ExternType* classValue = klass ? get<ExternType>(follow(klass->ty)) : nullptr;
+    const TableType* metatable = classValue && classValue->metatable ? get<TableType>(follow(*classValue->metatable)) : nullptr;
+    auto call = metatable ? metatable->props.find("__call") : TableType::Props::const_iterator{};
+    bool hasCall = metatable && call != metatable->props.end() && call->second.readTy;
+    const FunctionType* ctor = hasCall ? get<FunctionType>(follow(*call->second.readTy)) : nullptr;
+
+    if (!expected || !ctor)
+        return;
+
+    // `__init(self, ...)` against the constructor `(class, ...) -> Class`: position 0 is `self` and the class respectively
+    auto [expectedArgs, expectedTail] = flatten(expected->argTypes);
+    auto [ctorArgs, ctorTail] = flatten(ctor->argTypes);
+    NotNull<Scope> scope{findInnermostScope(stat->location)};
+    Location location = classMemberLocation(stat, "__init").value_or(traitRefLocation(scope, stat, traitType));
+
+    for (size_t i = 1; i < ctorArgs.size(); ++i)
+    {
+        TypeId passed = i < expectedArgs.size() ? expectedArgs[i] : builtinTypes->nilType;
+        testIsSubtype(passed, ctorArgs[i], location);
+    }
+}
+
+// Luwu Traits (rfcs/classes/traits.md): `fn` without its `self` parameter, when it has one. A method's `self` is its own
+// class's type, so a class's method is never a subtype of the trait's expectation with `self` left in.
+TypeId TypeChecker2::withoutSelfParameter(TypeId fnTy)
+{
+    const FunctionType* fn = get<FunctionType>(follow(fnTy));
+    bool hasSelf = fn && !fn->argNames.empty() && fn->argNames[0] && fn->argNames[0]->name == "self";
+    if (!hasSelf)
+        return fnTy;
+
+    return withoutFirstParameter(*module->internalTypes, fnTy);
+}
+
+// Luwu Traits (rfcs/classes/traits.md): the name of the first parameter `override` requires past those `overridden` takes,
+// if any. Luau's subtyping lets a function that wants more arguments stand in for one called with fewer, which would call
+// an override with nil for a parameter that can't be nil.
+std::optional<std::string> TypeChecker2::requiredExtraParameter(TypeId override, TypeId overridden)
+{
+    const FunctionType* overrideFn = get<FunctionType>(follow(override));
+    const FunctionType* overriddenFn = get<FunctionType>(follow(overridden));
+    if (!overrideFn || !overriddenFn)
+        return std::nullopt;
+
+    // A method's signature ends in an implicit `...any`; only a `...` the function writes takes more arguments
+    auto [overriddenParams, overriddenTail] = flatten(overriddenFn->argTypes);
+    bool writesVararg = overriddenFn->definition && overriddenFn->definition->varargLocation;
+    bool takesAnyMore = overriddenTail && (writesVararg || get<GenericTypePack>(follow(*overriddenTail)));
+    if (takesAnyMore)
+        return std::nullopt;
+
+    auto [overrideParams, _] = flatten(overrideFn->argTypes);
+    for (size_t i = overriddenParams.size(); i < overrideParams.size(); ++i)
+    {
+        if (isOptional(overrideParams[i]) || get<AnyType>(follow(overrideParams[i])) || get<UnknownType>(follow(overrideParams[i])))
+            continue;
+
+        bool named = i < overrideFn->argNames.size() && overrideFn->argNames[i];
+        return named ? overrideFn->argNames[i]->name : "#" + std::to_string(i + 1);
+    }
+    return std::nullopt;
+}
+
+static std::string extraRequiredParameterMessage(const Name& function, const std::string& parameter, const std::string& trait)
+{
+    return format(
+        "'%s' requires '%s', which trait '%s' doesn't pass when it calls '%s'; make '%s' optional",
+        function.c_str(),
+        parameter.c_str(),
+        trait.c_str(),
+        function.c_str(),
+        parameter.c_str()
+    );
+}
+
+// Luwu Traits (rfcs/classes/traits.md): traits whose versions of a function can't be called each other's way, which no
+// function in the class can stand in for
+static std::string conflictingTraitFunctionsMessage(
+    const std::string& className,
+    const Name& function,
+    const std::vector<std::pair<std::string, std::string>>& versions
+)
+{
+    std::string traits;
+    for (size_t i = 0; i < versions.size(); ++i)
+    {
+        if (i > 0)
+            traits += i + 1 == versions.size() ? " and " : ", ";
+        traits += "'" + versions[i].first + "'";
+    }
+
+    std::string message = format("Traits %s conflict on function '%s'.", traits.c_str(), function.c_str());
+    for (const auto& [trait, signature] : versions)
+        message += format("\n- '%s' has '%s: %s'", trait.c_str(), function.c_str(), signature.c_str());
+
+    message += format(
+        "\n\nHelp (conflicting trait functions):\n  - '%s' in class '%s' can't be called as each of these at once\n"
+        "  - Rename '%s' in one of the traits",
+        function.c_str(),
+        className.c_str(),
+        function.c_str()
+    );
+    return message;
+}
+
+// Luwu Traits (rfcs/classes/traits.md): a trait function as `classTy` has it, with the class for `Self`
+TypeId TypeChecker2::traitFunctionFor(const ExternType* traitType, TypeId classTy, const Name& name, TypeId function)
+{
+    const ExternType::TraitInfo& info = *traitType->traitInfo;
+    auto self = info.selfFunctions.find(name);
+    if (self == info.selfFunctions.end())
+        return function;
+
+    // As the class's copy of the trait function gets it (InstantiateNominalPropConstraint)
+    ApplyTypeFunction substitution{module->internalTypes.get()};
+    substitution.typeArguments[self->second.generic] = classTy;
+    if (self->second.selfType)
+        substitution.typeArguments[self->second.selfType] = classTy;
+    std::optional<TypeId> substituted = substitution.substitute(function);
+    if (!substituted)
+        return function;
+
+    if (*substituted != function)
+        dropSubstitutedGenerics(*substituted);
+    return *substituted;
+}
+
+// Luwu Traits (rfcs/classes/traits.md): a trait field naming `Self`, as `classTy` has it
+std::optional<TypeId> TypeChecker2::selfFieldFor(const ExternType* traitType, TypeId classTy, const Name& name)
+{
+    const ExternType::TraitInfo& info = *traitType->traitInfo;
+    auto fieldTemplate = info.selfFieldTemplates.find(name);
+    if (fieldTemplate == info.selfFieldTemplates.end() || !info.selfMarker)
+        return std::nullopt;
+
+    DenseHashMap<TypeId, TypeId> replacements{nullptr};
+    DenseHashMap<TypePackId, TypePackId> packReplacements{nullptr};
+    replacements[*info.selfMarker] = classTy;
+    Replacer replacer{NotNull{module->internalTypes.get()}, NotNull{&replacements}, NotNull{&packReplacements}};
+    return replacer.substitute(fieldTemplate->second);
+}
+
+void TypeChecker2::checkTraitFieldExpectations(AstStatClass* stat)
+{
+    NotNull<Scope> scope{findInnermostScope(stat->location)};
+    std::optional<TypeFun> classTypeFun = scope->lookupType(stat->name->name.value);
+    const ExternType* classType = classTypeFun ? get<ExternType>(follow(classTypeFun->type)) : nullptr;
+    if (!classType)
+        return;
+
+    // every member the class is missing, grouped by the `implements` entry it's reported on, so a class missing several
+    // gets one error listing them rather than one error each
+    std::vector<MissingTraitMembers> missing;
+    // each function the class writes in place of a trait's, with every trait's version of it
+    std::map<Name, std::vector<OverriddenTraitFunction>> overridden;
+
+    for (TypeId trait : classType->implementedTraits)
+    {
+        const ExternType* traitType = get<ExternType>(follow(trait));
+        const ClassFieldUserData* traitFields = traitType ? dynamic_cast<const ClassFieldUserData*>(traitType->userData.get()) : nullptr;
+        bool isTrait = traitFields && traitType->traitInfo;
+        if (!isTrait)
+            continue;
+
+        checkTraitConstructorExpectation(stat, classType, traitType);
+
+        // A field the class overrides has to fit the trait's type, as an expected field does. One the class doesn't
+        // override has the trait's own type here, so comparing every trait field the class has finds the overrides. A
+        // name that is a function in the class was already reported as one.
+        const ClassFieldUserData* classFields = dynamic_cast<const ClassFieldUserData*>(classType->userData.get());
+
+        for (const Name& name : traitFields->fieldNames)
+        {
+            bool classHasField = classFields && classFields->fieldNames.count(name);
+            if (traitType->traitInfo->expectations.count(name) || !classHasField)
+                continue;
+
+            const Property* provided = findNominalMember(traitType, name);
+            const Property* found = findNominalMember(classType, name);
+            if (!provided || !found || !provided->readTy || !found->readTy)
+                continue;
+
+            // A field naming `Self` is this class's own type in the class (the trait's field has the trait for it). Not
+            // overridden, the class has it from the trait as written; overridden, it has to fit that.
+            TypeId providedTy = *provided->readTy;
+            std::optional<Location> declaredAt = classMemberLocation(stat, name);
+            if (std::optional<TypeId> selfField = selfFieldFor(traitType, classTypeFun->type, name))
+            {
+                if (!declaredAt)
+                    continue;
+                providedTy = *selfField;
+            }
+
+            Location location = declaredAt.value_or(traitRefLocation(scope, stat, traitType));
+            testIsSubtype(*found->readTy, providedTy, location);
+        }
+
+        // A function the class writes in place of the trait's (checked below, with every other trait's version of it).
+        // Its `Self` is this class. One the trait has from a trait it needs is that trait's.
+        for (const auto& [name, provided] : traitType->props())
+        {
+            bool written = !traitFields->fieldNames.count(name) && !traitType->traitInfo->expectations.count(name);
+            bool checkable = written && name != "__init" && !traitType->traitInfo->fromNeeds.count(name) && provided.readTy;
+            if (!checkable || containsErrorType(*provided.readTy) || !classMemberLocation(stat, name))
+                continue;
+
+            TypeId providedFunction = traitFunctionFor(traitType, classTypeFun->type, name, *provided.readTy);
+            if (get<FunctionType>(follow(providedFunction)))
+                overridden[name].push_back(OverriddenTraitFunction{traitType, providedFunction});
+        }
+
+        for (const auto& [name, optional] : traitType->traitInfo->expectations)
+        {
+            // an expected constructor is checked by checkTraitConstructorExpectation
+            if (name != "__init" && !findNominalMember(classType, name))
+                addMissingTraitMember(missing, stat, traitType, name, traitFields->fieldNames.count(name) > 0);
+
+            const Property* expected = findNominalMember(traitType, name);
+            const Property* found = findNominalMember(classType, name);
+            if (name == "__init" || !expected || !found || !expected->readTy || !found->readTy)
+                continue;
+
+            Location location = classMemberLocation(stat, name).value_or(traitRefLocation(scope, stat, traitType));
+
+            if (traitFields->fieldNames.count(name))
+            {
+                testIsSubtype(*found->readTy, *expected->readTy, location);
+                continue;
+            }
+
+            // An optional function the class leaves out has the trait's own `F?` type, and isn't a function. An expectation
+            // whose signature has an error (reported where it is written) isn't compared.
+            TypeId expectedFunction = expectedTraitFunction(*expected->readTy);
+            bool bothFunctions = get<FunctionType>(expectedFunction) && get<FunctionType>(follow(*found->readTy));
+            if (bothFunctions && !containsErrorType(expectedFunction))
+                testIsSubtype(withoutSelfParameter(*found->readTy), withoutSelfParameter(expectedFunction), location);
+        }
+    }
+
+    for (const MissingTraitMembers& group : missing)
+        reportMissingTraitMembers(classType, group);
+
+    for (const auto& [name, versions] : overridden)
+    {
+        const Property* found = findNominalMember(classType, name);
+        std::optional<Location> location = classMemberLocation(stat, name);
+        if (location && found && found->readTy && get<FunctionType>(follow(*found->readTy)))
+            checkTraitFunctionOverride(classType, name, *found->readTy, versions, *location);
+    }
+}
+
+// Luwu Traits (rfcs/classes/traits.md): whether `function` can be called as `as` is: it takes what `as` is passed (`self`
+// aside, and no more required arguments) and returns what `as` returns
+bool TypeChecker2::worksAsTraitFunction(TypeId function, TypeId as, NotNull<Scope> scope)
+{
+    if (requiredExtraParameter(function, as))
+        return false;
+    return subtyping->isSubtype(withoutSelfParameter(function), withoutSelfParameter(as), scope).isSubtype;
+}
+
+// Luwu Traits (rfcs/classes/traits.md): a class's function in place of one or more traits' has to work as each of them,
+// since code holding any of those traits calls it as that trait's (an override that can't be called the same way would
+// get the wrong arguments at runtime). When the traits' versions can't be called each other's way, no one function
+// works as all of them: that is reported once, naming them, since only renaming one of them fixes it.
+void TypeChecker2::checkTraitFunctionOverride(
+    const ExternType* classType,
+    const Name& name,
+    TypeId override,
+    const std::vector<OverriddenTraitFunction>& versions,
+    Location location
+)
+{
+    NotNull<Scope> scope{findInnermostScope(location)};
+
+    std::vector<const OverriddenTraitFunction*> unfit;
+    for (const OverriddenTraitFunction& version : versions)
+    {
+        if (!worksAsTraitFunction(override, version.function, scope))
+            unfit.push_back(&version);
+    }
+    if (unfit.empty())
+        return;
+
+    bool conflicting = false;
+    for (size_t i = 0; i < versions.size() && !conflicting; ++i)
+    {
+        for (size_t j = i + 1; j < versions.size() && !conflicting; ++j)
+        {
+            bool eitherWorks = worksAsTraitFunction(versions[i].function, versions[j].function, scope) ||
+                               worksAsTraitFunction(versions[j].function, versions[i].function, scope);
+            conflicting = !eitherWorks;
+        }
+    }
+
+    if (conflicting)
+    {
+        std::vector<std::pair<std::string, std::string>> signatures;
+        for (const OverriddenTraitFunction& version : versions)
+            signatures.emplace_back(version.trait->name, toString(withoutSelfParameter(version.function)));
+        reportError(GenericError{conflictingTraitFunctionsMessage(classType->name, name, signatures)}, location);
+        return;
+    }
+
+    std::vector<TypeId> reported;
+    for (const OverriddenTraitFunction* version : unfit)
+    {
+        // Traits with the same signature (each works as the other) get one error between them
+        bool sameAsReported = std::any_of(
+            reported.begin(),
+            reported.end(),
+            [&](TypeId other)
+            {
+                return worksAsTraitFunction(other, version->function, scope) && worksAsTraitFunction(version->function, other, scope);
+            }
+        );
+        if (sameAsReported)
+            continue;
+        reported.push_back(version->function);
+
+        if (std::optional<std::string> extra = requiredExtraParameter(override, version->function))
+            reportError(GenericError{extraRequiredParameterMessage(name, *extra, version->trait->name)}, location);
+        else
+            testIsSubtype(withoutSelfParameter(override), withoutSelfParameter(version->function), location);
+    }
+}
+
+// Luwu Traits (rfcs/classes/traits.md): "'C' implements 'Base<string>', but 'Mut<number>' needs 'Base<number>'"
+static std::string neededTraitMismatchMessage(
+    const std::string& className,
+    TypeId implemented,
+    TypeId needing,
+    const std::string& neededName,
+    const std::vector<TypeId>& neededArguments
+)
+{
+    std::string needed = neededName + "<";
+    for (size_t i = 0; i < neededArguments.size(); ++i)
+        needed += (i > 0 ? ", " : "") + toString(neededArguments[i]);
+    needed += ">";
+
+    return format(
+        "'%s' implements '%s', but '%s' needs '%s'",
+        className.c_str(),
+        toString(implemented).c_str(),
+        toString(needing).c_str(),
+        needed.c_str()
+    );
+}
+
+void TypeChecker2::checkNeededTraitArguments(AstStatClass* stat)
+{
+    NotNull<Scope> scope{findInnermostScope(stat->location)};
+    std::optional<TypeFun> classTypeFun = scope->lookupType(stat->name->name.value);
+    const ExternType* classType = classTypeFun ? get<ExternType>(follow(classTypeFun->type)) : nullptr;
+    if (!classType)
+        return;
+
+    // The class's instantiation of the generic trait `traitTemplate`, or nullptr when it implements none
+    auto implementedInstantiation = [&](TypeId traitTemplate) -> TypeId
+    {
+        for (TypeId trait : classType->implementedTraits)
+        {
+            const ExternType* traitType = get<ExternType>(follow(trait));
+            if (traitType && traitType->genericTemplate && traitTemplateOf(trait) == traitTemplate)
+                return follow(trait);
+        }
+
+        return nullptr;
+    };
+
+    for (TypeId trait : classType->implementedTraits)
+    {
+        trait = follow(trait);
+        const ExternType* traitType = get<ExternType>(trait);
+        if (!traitType || !traitType->traitInfo)
+            continue;
+
+        const ExternType* traitTemplate = get<ExternType>(traitTemplateOf(trait));
+        if (!traitTemplate)
+            continue;
+
+        for (const auto& [neededTrait, _] : traitType->traitInfo->neededTypeArguments)
+        {
+            TypeId needed = follow(neededTrait);
+            TypeId implemented = implementedInstantiation(needed);
+            const ExternType* implementedType = implemented ? get<ExternType>(implemented) : nullptr;
+            const ExternType* neededType = get<ExternType>(needed);
+            if (!implementedType || !neededType)
+                continue;
+
+            std::vector<TypeId> copiedReferences;
+            std::optional<std::vector<TypeId>> arguments = neededTraitTypeArguments(
+                module->internalTypes.get(), *traitTemplate, needed, traitType->instantiatedTypeParams, copiedReferences
+            );
+            if (!arguments || arguments->size() != implementedType->instantiatedTypeParams.size())
+                continue;
+
+            // a nominal's type parameters are invariant, so each argument has to be equivalent
+            bool matches = true;
+            for (size_t i = 0; i < arguments->size() && matches; ++i)
+            {
+                TypeId expected = (*arguments)[i];
+                TypeId found = implementedType->instantiatedTypeParams[i];
+                bool narrower = subtyping->isSubtype(expected, found, scope).isSubtype;
+                bool wider = subtyping->isSubtype(found, expected, scope).isSubtype;
+                matches = narrower && wider;
+            }
+
+            if (!matches)
+            {
+                std::string message = neededTraitMismatchMessage(stat->name->name.value, implemented, trait, neededType->name, *arguments);
+                reportError(GenericError{message}, traitRefLocation(scope, stat, traitType));
+            }
+        }
+    }
+}
+
+void TypeChecker2::checkTraitArguments(AstStatClass* stat)
+{
+    NotNull<Scope> scope{findInnermostScope(stat->location)};
+
+    for (const AstClassTraitRef& ref : stat->implements)
+    {
+        for (AstExpr* arg : ref.args)
+            visit(arg, ValueContext::RValue);
+
+        std::optional<TypeFun> traitFun = scope->lookupTraitRef(ref);
+        const ExternType* traitType = traitFun ? get<ExternType>(follow(traitFun->type)) : nullptr;
+
+        // a generic trait's parameter types mention its own generics (see ConstraintGenerator::checkTraitArguments)
+        bool isGeneric = traitFun && (!traitFun->typeParams.empty() || !traitFun->typePackParams.empty());
+        if (!traitType || !traitType->traitInfo || isGeneric)
+            continue;
+
+        const std::vector<ExternType::TraitInfo::Parameter>& params = traitType->traitInfo->parameters;
+
+        for (size_t i = 0; i < ref.args.size && i < params.size(); ++i)
+        {
+            auto field = traitType->props().find(params[i].name);
+            if (field != traitType->props().end() && field->second.readTy)
+                testIsSubtype(lookupType(ref.args.data[i]), *field->second.readTy, ref.args.data[i]->location);
+        }
+    }
+}
+
+// Luwu Traits (rfcs/classes/traits.md): what a value of type `ty` is, for "expected this to be a trait, but got '...'",
+// named like the runtime's luaR_describenontrait without its article: 'nil', 'none', 'true', 'table'. Nullopt when the
+// type doesn't say (`any`, a union, an extern type, ...).
+static std::optional<std::string> describeNonTraitValue(TypeId ty)
+{
+    ty = follow(ty);
+
+    if (const SingletonType* singleton = get<SingletonType>(ty))
+    {
+        if (const BooleanSingleton* boolean = get<BooleanSingleton>(singleton))
+            return boolean->value ? "true" : "false";
+        return "string";
+    }
+
+    if (get<TableType>(ty) || get<MetatableType>(ty))
+        return "table";
+    if (get<FunctionType>(ty))
+        return "function";
+
+    const PrimitiveType* primitive = get<PrimitiveType>(ty);
+    if (!primitive)
+        return std::nullopt;
+
+    switch (primitive->type)
+    {
+    case PrimitiveType::NilType:
+        return "nil";
+    case PrimitiveType::NoneType:
+        return "none";
+    case PrimitiveType::Boolean:
+        return "boolean";
+    case PrimitiveType::Number:
+        return "number";
+    case PrimitiveType::Integer:
+        return "integer";
+    case PrimitiveType::String:
+        return "string";
+    case PrimitiveType::Thread:
+        return "thread";
+    case PrimitiveType::Function:
+        return "function";
+    case PrimitiveType::Table:
+        return "table";
+    case PrimitiveType::Buffer:
+        return "buffer";
+    }
+
+    return std::nullopt;
+}
+
+// Luwu Traits (rfcs/classes/traits.md): an entry of `implements` or `needs` that names no trait. Analysis skips such an
+// entry everywhere else, so without this the class or trait checks as if the entry weren't there; the runtime raises.
+void TypeChecker2::checkTraitRefs(AstStatClass* stat, const AstArray<AstClassTraitRef>& refs)
+{
+    NotNull<Scope> scope{findInnermostScope(stat->location)};
+
+    for (const AstClassTraitRef& ref : refs)
+    {
+        // A global's value decides first: `none` is also the name of a type, but `implements none` reads the value.
+        AstExprGlobal* global = ref.trait->as<AstExprGlobal>();
+        std::optional<TypeId> globalValue = global ? scope->lookup(global->name) : std::nullopt;
+
+        bool isClass = false;
+        // what the entry is instead, when it is neither a trait nor a class
+        std::optional<std::string> got;
+        // the entry names a trait whose type failed to check, e.g. one exported from a module that failed to export
+        bool isBrokenTrait = false;
+
+        const ExternType* valueType = globalValue ? get<ExternType>(follow(*globalValue)) : nullptr;
+        bool isTraitValue = valueType && valueType->root == builtinTypes->traitType;
+        bool isClassValue = valueType && valueType->root == builtinTypes->classType;
+
+        if (isTraitValue)
+            continue;
+        else if (isClassValue)
+            isClass = true;
+        else if (globalValue)
+            got = describeNonTraitValue(*globalValue);
+
+        bool undecided = !isClass && !got;
+        if (undecided)
+        {
+            if (std::optional<TypeFun> found = scope->lookupTraitRef(ref))
+            {
+                const ExternType* foundType = get<ExternType>(follow(found->type));
+                if (foundType && foundType->traitInfo)
+                    continue;
+
+                isBrokenTrait = get<ErrorType>(follow(found->type)) != nullptr;
+
+                isClass = foundType && foundType->relation && get_if<Klass>(&*foundType->relation);
+                // a type of that name with no value of it, which the runtime reads as nil
+                if (!isClass && global && !globalValue)
+                    got = "nil";
+            }
+            else if (global && !globalValue)
+                got = "nil";
+            else if (AstExprIndexName* index = ref.trait->as<AstExprIndexName>())
+            {
+                // `mod.Trait`, where `mod` is a required module that has no such type. Any other expression is only
+                // known at runtime.
+                AstExprLocal* moduleLocal = index->expr->as<AstExprLocal>();
+                bool isModule = false;
+                for (const Scope* s = scope.get(); moduleLocal && s && !isModule; s = s->parent.get())
+                    isModule = s->importedTypeBindings.count(moduleLocal->local->name.value) > 0;
+
+                if (isModule)
+                    got = "nil";
+            }
+        }
+
+        if (isBrokenTrait)
+        {
+            const char* kind = stat->isTrait ? "trait" : "class";
+            reportError(
+                GenericError{format(
+                    "This trait failed to typecheck, so %s '%s' gets none of its members; check the errors where it is defined",
+                    kind,
+                    stat->name->name.value
+                )},
+                ref.trait->location
+            );
+        }
+        else if (isClass && stat->isTrait)
+            reportError(GenericError{"This is a class, traits are not allowed to depend on classes (only other traits)"}, ref.trait->location);
+        else if (isClass)
+            reportError(GenericError{"This is a class, classes can only implement traits (not other classes)"}, ref.trait->location);
+        else if (got)
+            reportError(GenericError{format("Expected this to be a trait, but got '%s'", got->c_str())}, ref.trait->location);
+    }
+}
+
+// Luwu Traits (rfcs/classes/traits.md): a trait's field or function overrides the member of the same name in a trait it
+// needs (directly or through others) for the classes implementing both. Checked where the override is written, so code
+// holding the needed trait is typed right whichever runs: a field overrides a field and a function a function, the
+// overridden member isn't `final`, access (and a field's constness) stays the same, and the type fits. The runtime
+// checks all but the type again (luaR_overridingtrait).
+void TypeChecker2::checkTraitOverrides(AstStatClass* stat)
+{
+    NotNull<Scope> scope{findInnermostScope(stat->location)};
+    std::optional<TypeFun> traitFun = scope->lookupType(stat->name->name.value);
+    const ExternType* traitType = traitFun ? get<ExternType>(follow(traitFun->type)) : nullptr;
+    if (!traitType || !traitType->traitInfo)
+        return;
+
+    // every trait this one needs, once each however the `needs` graph branches
+    std::vector<const ExternType*> needed;
+    std::vector<TypeId> pending{traitType->implementedTraits.begin(), traitType->implementedTraits.end()};
+    DenseHashSet<const ExternType*> visited{nullptr};
+    while (!pending.empty())
+    {
+        const ExternType* current = get<ExternType>(follow(pending.back()));
+        // a trait needed with type arguments is listed as an instantiation (`Base<T>`), once per trait listing it
+        const ExternType* currentTrait = get<ExternType>(traitTemplateOf(pending.back()));
+        pending.pop_back();
+
+        if (!current || !current->traitInfo || visited.contains(currentTrait) || currentTrait == traitType)
+            continue;
+
+        visited.insert(currentTrait);
+        needed.push_back(current);
+        pending.insert(pending.end(), current->implementedTraits.begin(), current->implementedTraits.end());
+    }
+
+    // What this trait writes itself: its fields and functions, and its parameters, each of which declares a field. A
+    // trait's field always has a value (the parser refuses one without), so an overriding field does too.
+    struct Declared
+    {
+        Name name;
+        Location location;
+        bool isField;
+    };
+
+    std::vector<Declared> declared;
+    for (const AstClassMember& member : stat->members)
+    {
+        if (const AstClassProperty* prop = member.get_if<AstClassProperty>(); prop && !prop->expectLocation)
+            declared.push_back({prop->name.value, prop->nameLocation, /* isField */ true});
+        else if (const AstClassMethod* method = member.get_if<AstClassMethod>(); method && !method->expectLocation)
+            declared.push_back({method->functionName.value, method->nameLocation, /* isField */ false});
+    }
+
+    if (stat->primaryConstructor)
+    {
+        for (AstLocal* param : stat->primaryConstructor->args)
+        {
+            bool restated = std::any_of(
+                declared.begin(),
+                declared.end(),
+                [&](const Declared& d)
+                {
+                    return d.name == param->name.value;
+                }
+            );
+
+            if (!restated)
+                declared.push_back({param->name.value, param->location, /* isField */ true});
+        }
+    }
+
+    for (const Declared& mine : declared)
+    {
+        // each trait's `__implemented` hook is its own: a needing trait's doesn't override the needed trait's
+        if (mine.name == "__implemented")
+            continue;
+
+        const Property* myProp = findNominalMember(traitType, mine.name);
+
+        for (const ExternType* other : needed)
+        {
+            // only where the member is written: an expectation, or a member the other trait has from its own needs
+            const ExternType::TraitInfo& info = *other->traitInfo;
+            if (info.expectations.count(mine.name) || info.fromNeeds.count(mine.name))
+                continue;
+
+            const Property* theirs = findNominalMember(other, mine.name);
+            if (!theirs)
+                continue;
+
+            const ClassFieldUserData* otherFields = dynamic_cast<const ClassFieldUserData*>(other->userData.get());
+            bool theirsIsField = otherFields && otherFields->fieldNames.count(mine.name);
+
+            if (mine.isField != theirsIsField)
+                reportError(
+                    GenericError{format(
+                        "Trait '%s' can't redefine '%s' as a %s: it is a %s in trait '%s'",
+                        traitType->name.c_str(),
+                        mine.name.c_str(),
+                        mine.isField ? "field" : "function",
+                        theirsIsField ? "field" : "function",
+                        other->name.c_str()
+                    )},
+                    mine.location
+                );
+            else if (info.finals.count(mine.name))
+                reportError(
+                    GenericError{format("'%s' is final in trait '%s' and can't be overridden", mine.name.c_str(), other->name.c_str())}, mine.location
+                );
+            else if (myProp && myProp->isPrivate != theirs->isPrivate)
+                reportError(
+                    GenericError{format(
+                        "'%s' must be %s to override it from trait '%s'",
+                        mine.name.c_str(),
+                        theirs->isPrivate ? "private" : "public",
+                        other->name.c_str()
+                    )},
+                    mine.location
+                );
+            else if (mine.isField && myProp && myProp->isConst != theirs->isConst)
+                reportError(
+                    GenericError{format(
+                        "'%s' must be %s to override it from trait '%s'",
+                        mine.name.c_str(),
+                        theirs->isConst ? "const" : "non-const",
+                        other->name.c_str()
+                    )},
+                    mine.location
+                );
+            else if (mine.isField && myProp && myProp->readTy && theirs->readTy && !containsErrorType(*theirs->readTy))
+                testIsSubtype(*myProp->readTy, *theirs->readTy, mine.location);
+            else if (!mine.isField && myProp && myProp->readTy && theirs->readTy && !containsErrorType(*theirs->readTy))
+                testIsSubtype(withoutSelfParameter(*myProp->readTy), withoutSelfParameter(*theirs->readTy), mine.location);
+        }
+    }
+}
+
+void TypeChecker2::addMissingTraitMember(
+    std::vector<MissingTraitMembers>& missing,
+    AstStatClass* stat,
+    const ExternType* traitType,
+    const Name& name,
+    bool isField
+)
+{
+    NotNull<Scope> scope{findInnermostScope(stat->location)};
+    const AstClassTraitRef& ref = traitRefFor(scope, stat, traitType);
+
+    auto group = std::find_if(
+        missing.begin(),
+        missing.end(),
+        [&](const MissingTraitMembers& g)
+        {
+            return g.location == ref.trait->location;
+        }
+    );
+
+    if (group == missing.end())
+    {
+        // the trait the entry names, which a member reached through its `needs` isn't
+        std::optional<TypeFun> listed = scope->lookupTraitRef(ref);
+        const ExternType* listedType = listed ? get<ExternType>(follow(listed->type)) : nullptr;
+        missing.push_back({ref.trait->location, listedType ? listedType->name : traitType->name});
+        group = missing.end() - 1;
+    }
+
+    // the member as the trait declares it: `name: type` for a field, a signature for a function
+    const Property* expected = findNominalMember(traitType, name);
+    std::optional<TypeId> expectedTy = expected ? expected->readTy : std::nullopt;
+    const FunctionType* expectedFn = expectedTy ? get<FunctionType>(follow(*expectedTy)) : nullptr;
+
+    std::string member = name;
+    if (isField && expectedTy)
+        member += ": " + toString(*expectedTy);
+    else if (expectedFn)
+        member = "function " + toStringNamedFunction(name, *expectedFn);
+
+    // written as the class has to write it
+    if (expected && isField && expected->isConst)
+        member = "const " + member;
+    if (expected && traitType->traitInfo->hasAccessSpecifiers)
+        member = (expected->isPrivate ? "private " : "public ") + member;
+
+    std::string entry = "'" + member + "'";
+    if (traitType->name != group->traitName)
+        entry += " (from '" + traitType->name + "')";
+
+    group->members.push_back(std::move(entry));
+    (isField ? group->fields : group->functions)++;
+}
+
+// "'Flag' is missing 3 members to implement 'ArgInProgress':" and a bullet per member, like a table literal's missing
+// fields
+void TypeChecker2::reportMissingTraitMembers(const ExternType* classType, const MissingTraitMembers& group)
+{
+    size_t count = group.members.size();
+    const char* kind = group.functions == 0 ? "field" : group.fields == 0 ? "function" : "member";
+
+    std::string message = "'" + classType->name + "' is missing ";
+    message += count == 1 ? std::string("a ") + kind : std::to_string(count) + " " + kind + "s";
+    message += " to implement '" + group.traitName + "':";
+
+    for (const std::string& member : group.members)
+        message += "\n  • " + member;
+
+    reportError(GenericError{message}, group.location);
+}
+
+void TypeChecker2::visit(AstStatClass* stat)
+{
+    LUAU_ASSERT(FFlag::LuwuClasses);
+
+    visitGenerics(stat->generics, stat->genericPacks);
+
+    // Luwu Classes (rfcs/classes): a primary constructor's parameters are checked like default
+    // function arguments -- annotation resolved, default checked against it.
+    if (const AstClassPrimaryConstructor* primaryConstructor = stat->primaryConstructor)
+    {
+        for (size_t i = 0; i < primaryConstructor->args.size; ++i)
+        {
+            AstLocal* param = primaryConstructor->args.data[i];
+            AstExpr* paramDefault = primaryConstructor->argsDefaults.data[i];
+
+            if (param->annotation)
+                visit(param->annotation);
+
+            if (paramDefault)
+                visit(paramDefault, ValueContext::RValue);
+
+            // A default is checked like a local's value: `{}` fits a table type whose fields are all optional
+            if (paramDefault && param->annotation)
+                testPotentialLiteralIsSubtype(paramDefault, lookupAnnotation(param->annotation));
+        }
+
+        // A class with a primary constructor has no table constructor, so a field the body gives no
+        // default and no parameter names can never be initialized -- it is `nil` forever. That is
+        // fine if the field's type says so, and an error if it doesn't.
+        NotNull<Scope> scope{findInnermostScope(stat->location)};
+        std::optional<TypeFun> classTypeFun = scope->lookupType(stat->name->name.value);
+
+        for (const AstClassMember& member : stat->members)
+        {
+            const AstClassProperty* prop = member.get_if<AstClassProperty>();
+
+            // Luwu Traits (rfcs/classes/traits.md): an expected field is the implementing class's to initialize
+            if (!prop || prop->defaultValue || !prop->ty || prop->expectLocation)
+                continue;
+
+            size_t paramIndex = primaryConstructor->args.size;
+            for (size_t i = 0; i < primaryConstructor->args.size; ++i)
+                if (primaryConstructor->args.data[i]->name == prop->name)
+                {
+                    paramIndex = i;
+                    break;
+                }
+
+            TypeId propTy = follow(lookupAnnotation(prop->ty));
+
+            if (paramIndex < primaryConstructor->args.size)
+            {
+                // A bare restatement is initialized from the parameter it names, so the parameter's
+                // type has to fit the annotation -- `class Cat(breed: CatBreed) private breed: number
+                // end` assigns a CatBreed to a number-typed field.
+                AstLocal* param = primaryConstructor->args.data[paramIndex];
+                AstExpr* paramDefault = primaryConstructor->argsDefaults.data[paramIndex];
+
+                std::optional<TypeId> paramTy;
+                if (param->annotation)
+                    paramTy = lookupAnnotation(param->annotation);
+                else if (paramDefault)
+                    paramTy = lookupType(paramDefault);
+
+                // the annotation is what the restatement is *for*, so it is what we blame
+                if (paramTy)
+                    testIsSubtype(*paramTy, propTy, prop->ty->location);
+
+                continue;
+            }
+
+            if (!classTypeFun)
+                continue;
+
+            if (!subtyping->isSubtype(builtinTypes->nilType, propTy, scope).isSubtype)
+                reportError(UninitializableClassField{classTypeFun->type, prop->name.value}, prop->nameLocation);
+        }
+    }
+
+    // A class whose fields are all private and which has no functions can be constructed, but nothing
+    // can ever read or write what it holds: only the class's own functions may touch a private field,
+    // and there are none (rfcs/classes).
+    size_t fieldCount = 0;
+    bool hasPublicField = false;
+    bool hasFunction = false;
+
+    for (const AstClassMember& member : stat->members)
+    {
+        if (const AstClassProperty* prop = member.get_if<AstClassProperty>())
+        {
+            ++fieldCount;
+            hasPublicField |= prop->visibility == AstClassMemberVisibility::Public;
+        }
+        else
+            hasFunction = true;
+    }
+
+    // a primary constructor parameter declares a field too, unless the class body restates it, in
+    // which case the restatement was already counted above
+    if (const AstClassPrimaryConstructor* primaryConstructor = stat->primaryConstructor)
+    {
+        for (size_t i = 0; i < primaryConstructor->args.size; ++i)
+        {
+            AstName paramName = primaryConstructor->args.data[i]->name;
+
+            bool restated = false;
+            for (const AstClassMember& member : stat->members)
+            {
+                const AstClassProperty* prop = member.get_if<AstClassProperty>();
+                if (prop && prop->name == paramName)
+                    restated = true;
+            }
+
+            if (restated)
+                continue;
+
+            ++fieldCount;
+
+            if (primaryConstructor->argsQualifiers.size != primaryConstructor->args.size ||
+                primaryConstructor->argsQualifiers.data[i].visibility == AstClassMemberVisibility::Public)
+                hasPublicField = true;
+        }
+    }
+
+    if (fieldCount > 0 && !hasPublicField && !hasFunction)
+    {
+        NotNull<Scope> scope{findInnermostScope(stat->location)};
+        std::optional<TypeFun> classTypeFun = scope->lookupType(stat->name->name.value);
+
+        // Luwu Traits (rfcs/classes/traits.md): the traits a class implements add members too, whose code may use the
+        // class's private fields
+        const ExternType* objectType = classTypeFun ? get<ExternType>(follow(classTypeFun->type)) : nullptr;
+        bool traitsAddMembers = false;
+        if (objectType && !objectType->implementedTraits.empty())
+        {
+            for (const auto& [_, prop] : objectType->props())
+                traitsAddMembers |= !prop.isPrivate;
+
+            const TableType* metatable = objectType->metatable ? get<TableType>(follow(*objectType->metatable)) : nullptr;
+            traitsAddMembers |= metatable && !metatable->props.empty();
+        }
+
+        if (classTypeFun && !traitsAddMembers)
+            reportError(UnusableClass{classTypeFun->type}, stat->name->location);
+    }
+
+    // A class with a private constructor can only be instantiated from its own body. If nothing there calls it
+    // (`Name(...)` or `Name { ... }`, in a method, a closure nested in one, or a field default), no instance can
+    // ever exist (rfcs/classes). A trait is never instantiated itself: its `expect private function __init` is the
+    // constructor its implementing classes must have (rfcs/classes/traits.md).
+    bool privateConstructor = stat->primaryConstructor && stat->primaryConstructor->visibility == AstClassMemberVisibility::Private;
+
+    for (const AstClassMember& member : stat->members)
+    {
+        const AstClassMethod* method = member.get_if<AstClassMethod>();
+        if (method && method->functionName == "__init" && method->visibility == AstClassMemberVisibility::Private)
+            privateConstructor = true;
+    }
+
+    if (stat->isTrait)
+        privateConstructor = false;
+
+    if (privateConstructor)
+    {
+        // A local must be the class's own binding: a different local with the same name (another
+        // module's class of that name) doesn't construct this one. A global matches by name, since
+        // the parser makes a reference to the class from before its declaration a global.
+        struct ConstructorCallFinder : AstVisitor
+        {
+            AstLocal* classLocal = nullptr;
+            bool found = false;
+
+            bool visit(AstExprCall* call) override
+            {
+                AstExpr* callee = call->func;
+                while (AstExprGroup* group = callee->as<AstExprGroup>())
+                    callee = group->expr;
+
+                if (AstExprGlobal* global = callee->as<AstExprGlobal>(); global && global->name == classLocal->name)
+                    found = true;
+                else if (AstExprLocal* local = callee->as<AstExprLocal>(); local && local->local == classLocal)
+                    found = true;
+
+                return !found;
+            }
+        };
+
+        ConstructorCallFinder finder;
+        finder.classLocal = stat->name;
+
+        for (const AstClassMember& member : stat->members)
+        {
+            if (const AstClassMethod* method = member.get_if<AstClassMethod>())
+                method->function->visit(&finder);
+            else if (const AstClassProperty* prop = member.get_if<AstClassProperty>(); prop && prop->defaultValue)
+                prop->defaultValue->visit(&finder);
+        }
+
+        // Luwu Traits (rfcs/classes/traits.md): a trait that expects `__init` constructs its implementing classes through
+        // `class<Trait>` values, which no search can follow, so such a class may well be instantiated
+        if (!finder.found && stat->implements.size > 0)
+        {
+            std::optional<TypeFun> classTypeFun = findInnermostScope(stat->location)->lookupType(stat->name->name.value);
+            const ExternType* classType = classTypeFun ? get<ExternType>(follow(classTypeFun->type)) : nullptr;
+
+            for (TypeId trait : classType ? classType->implementedTraits : std::vector<TypeId>{})
+            {
+                const ExternType* traitType = get<ExternType>(follow(trait));
+                if (traitType && traitType->traitInfo && traitType->traitInfo->expectations.count("__init"))
+                    finder.found = true;
+            }
+        }
+
+        // Luwu Traits (rfcs/classes/traits.md): a trait the class implements may construct it from its own code -- its
+        // `__create` and its statics, the functions that run as the trait's rather than as a class's copy
+        if (!finder.found && stat->implements.size > 0 && sourceModule->root)
+        {
+            auto isImplemented = [&](AstName name)
+            {
+                for (const AstClassTraitRef& ref : stat->implements)
+                    if (AstExprGlobal* global = ref.trait->as<AstExprGlobal>(); global && global->name == name)
+                        return true;
+
+                return false;
+            };
+
+            for (AstStat* other : sourceModule->root->body)
+            {
+                AstStatClass* trait = other->as<AstStatClass>();
+                if (!trait || !trait->isTrait || !isImplemented(trait->name->name))
+                    continue;
+
+                for (const AstClassMember& member : trait->members)
+                {
+                    const AstClassMethod* method = member.get_if<AstClassMethod>();
+                    bool runsAsTrait = method && !method->expectLocation &&
+                                       (method->function->args.size == 0 || method->function->args.data[0]->name != "self");
+                    if (runsAsTrait)
+                        method->function->visit(&finder);
+                }
+            }
+        }
+
+        if (!finder.found)
+        {
+            NotNull<Scope> scope{findInnermostScope(stat->location)};
+            if (std::optional<TypeFun> classTypeFun = scope->lookupType(stat->name->name.value))
+                reportError(UninstantiableClass{classTypeFun->type}, stat->name->location);
+        }
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): every `implements` and `needs` entry has to name a trait
+    if (FFlag::LuwuTraits)
+    {
+        checkTraitRefs(stat, stat->implements);
+        checkTraitRefs(stat, stat->needs);
+
+        if (stat->isTrait && stat->needs.size > 0)
+            checkTraitOverrides(stat);
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): a member a trait expects has to fit the type the trait's functions assume. A
+    // function's `self` differs by design (the trait's object type there, the class's here), so functions are compared
+    // without it (withoutSelfParameter).
+    if (stat->implements.size > 0)
+    {
+        checkTraitFieldExpectations(stat);
+        checkTraitArguments(stat);
+        checkNeededTraitArguments(stat);
+    }
+
+    for (const auto& member : stat->members)
+    {
+        if (const auto* prop = member.get_if<AstClassProperty>())
+        {
+            if (prop->ty)
+                visit(prop->ty);
+
+            if (prop->defaultValue)
+                visit(prop->defaultValue, ValueContext::RValue);
+
+            // If there's no annotation, the property's type was already inferred from the default
+            // value itself (see ConstraintGenerator), so there's nothing to compare against here.
+            if (prop->ty && prop->defaultValue)
+                testIsSubtype(lookupType(prop->defaultValue), lookupAnnotation(prop->ty), prop->defaultValue->location);
+        }
+        else if (const auto* method = member.get_if<AstClassMethod>())
+        {
+            // Luwu Traits (rfcs/classes/traits.md): an expected function is a signature, with nothing to check in its body.
+            // Its annotations are still checked: a generic type without its arguments, an unknown name.
+            if (method->expectLocation)
+            {
+                const AstExprFunction* fn = method->function;
+                visitGenerics(fn->generics, fn->genericPacks);
+
+                for (AstLocal* arg : fn->args)
+                    if (arg->annotation)
+                        visit(arg->annotation);
+
+                if (fn->varargAnnotation)
+                    visit(fn->varargAnnotation);
+
+                if (fn->returnAnnotation)
+                    visit(fn->returnAnnotation);
+
+                // Luwu try expressions
+                if (fn->errorHint)
+                    visit(fn->errorHint);
+
+                continue;
+            }
+
+            visit(method->function);
+
+            if (method->functionName == "__tostring")
+            {
+                if (const FunctionType* ftv = get<FunctionType>(lookupType(method->function)))
+                {
+                    NotNull<Scope> scope{findInnermostScope(method->function->location)};
+                    std::optional<TypeId> ret = first(ftv->retTypes);
+                    if (!ret || !subtyping->isSubtype(follow(*ret), builtinTypes->stringType, scope).isSubtype)
+                        reportError(GenericError{"Metamethod '__tostring' must return a string"}, method->function->location);
+                }
+            }
+            else if (method->functionName == "__init")
+            {
+                if (const FunctionType* ftv = get<FunctionType>(lookupType(method->function)))
+                {
+                    if (first(ftv->retTypes))
+                        reportError(
+                            GenericError{"__init constructor should assign fields to self and should not return a value"},
+                            method->function->location
+                        );
+                }
+            }
+            else if (method->functionName == "__eq" || method->functionName == "__lt" || method->functionName == "__le")
+            {
+                if (const FunctionType* ftv = get<FunctionType>(lookupType(method->function)))
+                {
+                    NotNull<Scope> scope{findInnermostScope(method->function->location)};
+                    std::optional<TypeId> ret = first(ftv->retTypes);
+                    if (!ret || !subtyping->isSubtype(follow(*ret), builtinTypes->booleanType, scope).isSubtype)
+                        reportError(
+                            GenericError{format("Metamethod '%s' must return a boolean", method->functionName.value)},
+                            method->function->location
+                        );
+                }
+            }
+            else if (method->functionName == "__len")
+            {
+                if (const FunctionType* ftv = get<FunctionType>(lookupType(method->function)))
+                {
+                    NotNull<Scope> scope{findInnermostScope(method->function->location)};
+                    std::optional<TypeId> ret = first(ftv->retTypes);
+                    if (!ret || !subtyping->isSubtype(follow(*ret), builtinTypes->numberType, scope).isSubtype)
+                        reportError(GenericError{"Metamethod '__len' must return a number"}, method->function->location);
+                }
+            }
+            else if (
+                method->functionName == "__add" || method->functionName == "__sub" || method->functionName == "__mul" ||
+                method->functionName == "__div" || method->functionName == "__mod" || method->functionName == "__pow" ||
+                method->functionName == "__idiv" || method->functionName == "__unm" || method->functionName == "__concat"
+            )
+            {
+                if (const FunctionType* ftv = get<FunctionType>(lookupType(method->function)))
+                {
+                    if (!first(ftv->retTypes))
+                        reportError(
+                            GenericError{format("Metamethod '%s' must return a value", method->functionName.value)}, method->function->location
+                        );
+                }
+            }
+            else if (method->functionName == "__iter")
+            {
+                if (const FunctionType* ftv = get<FunctionType>(lookupType(method->function)))
+                {
+                    if (!first(ftv->retTypes))
+                        reportError(GenericError{"Metamethod '__iter' must return a value"}, method->function->location);
+                }
+            }
+        }
+        else
+            LUAU_ASSERT(!"Unknown class member!");
+    }
+}
+
+void TypeChecker2::visit(AstStatError* stat)
+{
+    for (AstExpr* expr : stat->expressions)
+        visit(expr, ValueContext::RValue);
+
+    for (AstStat* s : stat->statements)
+    {
+        // Luwu Classes (rfcs/classes): a class the parser refused (a second one with a name already taken) was never
+        // given a type, so its members have none to check; the parse error is what's wrong with it
+        if (s->is<AstStatClass>())
+            continue;
+
+        visit(s);
+    }
+}
+
+void TypeChecker2::visit(AstExpr* expr, ValueContext context)
+{
+    auto StackPusher = pushStack(expr);
+
+    if (auto e = expr->as<AstExprGroup>())
+        return visit(e, context);
+    else if (auto e = expr->as<AstExprConstantNil>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprConstantBool>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprConstantNumber>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprConstantInteger>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprConstantString>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprLocal>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprGlobal>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprVarargs>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprCall>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprIndexName>())
+        return visit(e, context);
+    else if (auto e = expr->as<AstExprIndexExpr>())
+        return visit(e, context);
+    else if (auto e = expr->as<AstExprFunction>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprTable>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprUnary>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprBinary>())
+    {
+        visit(e);
+        return;
+    }
+    else if (auto e = expr->as<AstExprTypeAssertion>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprIfElse>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprDo>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprTableComprehension>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprPop>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprInstantiate>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprInterpString>())
+        return visit(e);
+    else if (auto e = expr->as<AstExprTry>())
+        return visit(e->expr, ValueContext::RValue);
+    else if (auto e = expr->as<AstExprError>())
+        return visit(e);
+    else
+        LUAU_ASSERT(!"TypeChecker2 encountered an unknown expression type");
+}
+
+void TypeChecker2::visit(AstExprGroup* expr, ValueContext context)
+{
+    visit(expr->expr, context);
+}
+
+void TypeChecker2::visit(AstExprConstantNil* expr)
+{
+#if defined(LUAU_ENABLE_ASSERT)
+    TypeId actualType = lookupType(expr);
+    TypeId expectedType = builtinTypes->nilType;
+    NotNull<Scope> scope{findInnermostScope(expr->location)};
+
+    SubtypingResult r = subtyping->isSubtype(actualType, expectedType, scope);
+    LUAU_ASSERT(r.isSubtype || isErrorSuppressing(expr->location, actualType));
+#endif
+}
+
+void TypeChecker2::visit(AstExprConstantBool* expr)
+{
+    // booleans use specialized inference logic for singleton typeArguments, which can lead to real type errors here.
+
+    const TypeId bestType = expr->value ? builtinTypes->trueType : builtinTypes->falseType;
+    const TypeId inferredType = lookupType(expr);
+    NotNull<Scope> scope{findInnermostScope(expr->location)};
+
+    SubtypingResult r = subtyping->isSubtype(bestType, inferredType, scope);
+    if (!r.isErrorSuppressing)
+    {
+        if (!r.isSubtype)
+            reportError(TypeMismatch{inferredType, bestType}, expr->location);
+        for (auto& e : r.errors)
+            e.location = expr->location;
+        reportErrors(r.errors);
+    }
+}
+
+void TypeChecker2::visit(AstExprConstantNumber* expr)
+{
+#if defined(LUAU_ENABLE_ASSERT)
+    const TypeId bestType = builtinTypes->numberType;
+    const TypeId inferredType = lookupType(expr);
+    NotNull<Scope> scope{findInnermostScope(expr->location)};
+
+    const SubtypingResult r = subtyping->isSubtype(bestType, inferredType, scope);
+    LUAU_ASSERT(r.isSubtype || isErrorSuppressing(expr->location, inferredType));
+#endif
+}
+
+void TypeChecker2::visit(AstExprConstantInteger* expr)
+{
+#if defined(LUAU_ENABLE_ASSERT)
+    const TypeId bestType = builtinTypes->integerType;
+    const TypeId inferredType = lookupType(expr);
+    NotNull<Scope> scope{findInnermostScope(expr->location)};
+
+    const SubtypingResult r = subtyping->isSubtype(bestType, inferredType, scope);
+    LUAU_ASSERT(r.isSubtype || isErrorSuppressing(expr->location, inferredType));
+#endif
+}
+
+void TypeChecker2::visit(AstExprConstantString* expr)
+{
+    // strings use specialized inference logic for singleton typeArguments, which can lead to real type errors here.
+
+    const TypeId bestType = module->internalTypes->addType(SingletonType{StringSingleton{std::string{expr->value.data, expr->value.size}}});
+    const TypeId inferredType = lookupType(expr);
+    NotNull<Scope> scope{findInnermostScope(expr->location)};
+
+    SubtypingResult r = subtyping->isSubtype(bestType, inferredType, scope);
+    if (!isErrorSuppressing(expr->location, inferredType))
+    {
+        if (!r.isSubtype)
+            reportError(TypeMismatch{inferredType, bestType}, expr->location);
+        for (auto& e : r.errors)
+            e.location = expr->location;
+        reportErrors(r.errors);
+    }
+}
+
+void TypeChecker2::visit(AstExprLocal* expr)
+{
+    // TODO!
+
+    // Luwu: each use of a local with an error type gets a note pointing at the error (reportNoTypeNotes). Not
+    // `lookupType`, which can report errors of its own.
+    if (TypeId* ty = module->astTypes.find(expr); ty && get<ErrorType>(follow(*ty)))
+        noTypeUses.push_back(expr);
+}
+
+void TypeChecker2::visit(AstExprGlobal* expr)
+{
+    NotNull<Scope> scope = stack.back();
+    if (!scope->lookup(expr->name))
+    {
+        reportUnknownVariable(expr, scope);
+    }
+    else
+    {
+        if (scope->shouldWarnGlobal(expr->name.value) && !warnedGlobals.contains(expr->name.value))
+        {
+            reportUnknownVariable(expr, scope);
+            warnedGlobals.insert(expr->name.value);
+        }
+        else if (scope->shouldWarnGlobal(expr->name.value))
+        {
+            // Luwu: a global only assigned in this module is reported once, but a misspelled local is a typo at every use
+            if (std::optional<UnknownSymbol> typo = misspelledLocalError(unknownVariableExplainer(), expr))
+                reportError(std::move(*typo), expr->location);
+        }
+    }
+}
+
+UnknownVariableExplainer& TypeChecker2::unknownVariableExplainer()
+{
+    if (!unknownVariables)
+        unknownVariables = std::make_unique<UnknownVariableExplainer>(sourceModule->root);
+    return *unknownVariables;
+}
+
+void TypeChecker2::reportUnknownVariable(const AstExprGlobal* expr, NotNull<Scope> scope)
+{
+    reportError(unknownVariableError(unknownVariableExplainer(), expr, *scope, module->notes), expr->location);
+}
+
+void TypeChecker2::visit(AstExprVarargs* expr)
+{
+    // TODO!
+}
+
+// Luwu (helpful subtyping errors): each overload as the message lists it, with its parameter names.
+static ToStringOptions overloadPrintOptions()
+{
+    ToStringOptions options;
+    options.functionTypeArguments = true;
+    options.sortUnionMembers = false;
+    return options;
+}
+
+static std::vector<std::string> overloadSignatures(const std::vector<TypeId>& overloads)
+{
+    std::vector<std::string> signatures;
+    for (TypeId overload : overloads)
+        signatures.push_back(toString(overload, overloadPrintOptions()));
+    return signatures;
+}
+
+// Luwu (helpful subtyping errors): a call's arguments as a parameter list, printed like the overloads they're compared
+// with. A string or boolean literal is printed as written, since its type has been widened by now.
+static std::string argumentList(const AstExprCall* call, TypePackId arguments)
+{
+    const auto [head, tail] = flatten(arguments);
+    // A method call's arguments start with the receiver, which the call's AST arguments don't include
+    const size_t receivers = call->self ? 1 : 0;
+
+    std::string printed;
+    for (size_t i = 0; i < head.size(); ++i)
+    {
+        if (i > 0)
+            printed += ", ";
+
+        const AstExpr* written = i >= receivers && i - receivers < call->args.size ? call->args.data[i - receivers] : nullptr;
+        if (const AstExprConstantString* string = written ? written->as<AstExprConstantString>() : nullptr)
+            printed += "\"" + escape(std::string_view(string->value.data, string->value.size)) + "\"";
+        else if (const AstExprConstantBool* boolean = written ? written->as<AstExprConstantBool>() : nullptr)
+            printed += boolean->value ? "true" : "false";
+        else
+            printed += toString(head[i], overloadPrintOptions());
+    }
+    if (tail)
+        printed += std::string(head.empty() ? "" : ", ") + toString(*tail, overloadPrintOptions());
+    return "(" + printed + ")";
+}
+
+static void reportAvailableOverloads(ErrorVec& errors, Location location, const ModuleName& moduleName, const std::vector<TypeId>& overloads)
+{
+    if (overloads.empty())
+        return;
+
+    std::stringstream s;
+    s << "Available overloads: ";
+
+    if (overloads.size() <= 1)
+        return;
+
+    for (size_t i = 0; i < overloads.size(); ++i)
+    {
+        if (i > 0)
+            s << ((i == overloads.size() - 1) ? "; and " : "; ");
+
+        s << toString(overloads[i]);
+    }
+
+    errors.emplace_back(location, moduleName, ExtraInformation{s.str()});
+}
+
+// Luwu (helpful subtyping errors): `a`, `a.b.c` for a local or global and plain property reads off it, else
+// nullopt. Anything with a call or a computed index in it isn't a name the reader can look up.
+static std::optional<std::string> bindingName(AstExpr* expr)
+{
+    if (AstExprGroup* group = expr->as<AstExprGroup>())
+        return bindingName(group->expr);
+    if (AstExprLocal* local = expr->as<AstExprLocal>())
+        return std::string{local->local->name.value};
+    if (AstExprGlobal* global = expr->as<AstExprGlobal>())
+        return std::string{global->name.value};
+    if (AstExprIndexName* index = expr->as<AstExprIndexName>(); index && index->op == '.')
+    {
+        if (std::optional<std::string> base = bindingName(index->expr))
+            return *base + "." + index->index.value;
+    }
+    return std::nullopt;
+}
+
+// Luwu (helpful subtyping errors): whether `name` is a class or trait read by its own name (`Ink`, of type `class<Ink>`).
+// Calling the value 'Ink' only repeats the type printed next to it.
+static bool namesItsOwnDeclaration(const std::string& name, TypeId ty)
+{
+    const ExternType* etv = get<ExternType>(follow(ty));
+    return etv && nominalValueKind(*etv) && etv->name == name;
+}
+
+// Luwu (helpful subtyping errors): how to refer to the function being called in a diagnostic: a name as
+// `bindingName` gives it, with a method's `:` kept (`damaged:Connect`). Anything else (an immediately-invoked
+// function, a call through an expression) has no name the reader would recognize, so it's empty and the
+// message drops the clause that would have used it.
+static std::string calleeDisplayName(AstExpr* func)
+{
+    if (AstExprIndexName* indexName = func->as<AstExprIndexName>())
+    {
+        std::optional<std::string> base = bindingName(indexName->expr);
+        return base ? *base + indexName->op + indexName->index.value : std::string(indexName->index.value);
+    }
+
+    return bindingName(func).value_or(std::string{});
+}
+
+// Luwu (helpful subtyping errors): `reportError` stamps the module being checked, so a diagnostic can only
+// point into a function known to be declared there. A function with no recorded module is refused too.
+static bool isDeclaredInModule(const FunctionType* fn, const ModuleName& checkedModule)
+{
+    return fn && fn->definition && fn->definition->definitionModuleName == checkedModule;
+}
+
+// Luwu (helpful subtyping errors): the type annotation written on the parameter at `index`, when the callee
+// is a function in this module and that parameter was annotated at all. Written rather than inferred, so a
+// diagnostic about the parameter can point at what the user typed.
+static AstType* parameterAnnotation(
+    const FunctionType* callee,
+    size_t index,
+    const ModuleName& checkedModule,
+    const TypeChecker2::DeclarationIndex& declarations
+)
+{
+    if (!isDeclaredInModule(callee, checkedModule))
+        return nullptr;
+
+    AstExprFunction* fn = declarations.functionAt(callee->definition->definitionLocation);
+    if (!fn)
+        return nullptr;
+
+    size_t argIndex = index;
+
+    // `self` takes the first slot of the type's argument list but is never written in `args`.
+    if (fn->self)
+    {
+        if (argIndex == 0)
+            return nullptr;
+
+        argIndex -= 1;
+    }
+
+    if (argIndex >= fn->args.size)
+        return nullptr;
+
+    return fn->args.data[argIndex]->annotation;
+}
+
+// Luwu: `debug.profilebegin or fallback` and `(x :: any) or fallback` give a union with an `*error-type*` member
+// and a `~(false?)` one, because `any` (and an error) refined by truthiness splits that way. Normalizing that union
+// loses the error, so upstream reports "Cannot call a value of type ~(false?) in union" on every call of it: a second
+// error for a mistake already reported where the error came from, or for an `any` the user chose.
+static bool hasErrorSuppressingMember(TypeId ty)
+{
+    const UnionType* ut = get<UnionType>(follow(ty));
+    if (!ut)
+        return false;
+
+    for (TypeId member : ut)
+    {
+        if (get<ErrorType>(member) || get<AnyType>(member))
+            return true;
+    }
+    return false;
+}
+
+void TypeChecker2::appendArgumentTypes(TypePack& args, AstExprCall* call)
+{
+    for (size_t i = 0; i < call->args.size; ++i)
+    {
+        AstExpr* arg = call->args.data[i];
+        TypeId* argTy = module->astTypes.find(arg);
+        if (argTy)
+            args.head.push_back(*argTy);
+        else if (i == call->args.size - 1)
+        {
+            if (auto argTail = module->astTypePacks.find(arg))
+            {
+                auto [head, tail] = flatten(*argTail);
+                args.head.insert(args.head.end(), head.begin(), head.end());
+                args.tail = tail;
+            }
+            else
+                args.tail = builtinTypes->anyTypePack;
+        }
+        else
+            args.head.push_back(builtinTypes->anyType);
+    }
+}
+
+// Luwu: a method merged by mergeUnionMethods takes any member as `self`, which is only right if each member's own method
+// takes that member. Checked here, member by member: a `self` more general than its member (`(self: Shape)` on `Circle`)
+// is fine; one that can't take its own member (`A`'s method wanting a `B`) fails as `A:m()` would.
+void TypeChecker2::checkUnionMethodSelves(AstExprIndexName* indexExpr)
+{
+    const UnionType* members = get<UnionType>(follow(lookupType(indexExpr->expr)));
+    if (!members)
+        return;
+
+    std::string name = indexExpr->index.value;
+    for (TypeId member : members->options)
+    {
+        member = follow(member);
+
+        std::optional<TypeId> method;
+        if (const ExternType* nominal = get<ExternType>(member))
+        {
+            if (const Property* prop = lookupExternTypeProp(nominal, name))
+                method = prop->readTy;
+        }
+        else
+        {
+            ErrorVec ignored;
+            method = findTablePropertyRespectingMeta(builtinTypes, ignored, member, name, ValueContext::RValue, indexExpr->location, true);
+        }
+
+        const FunctionType* fn = method ? get<FunctionType>(follow(*method)) : nullptr;
+        auto [params, _] = fn ? flatten(fn->argTypes) : std::pair<std::vector<TypeId>, std::optional<TypePackId>>{};
+        if (!params.empty())
+            testIsSubtype(member, params[0], indexExpr->expr->location);
+    }
+}
+
+std::optional<TypeChecker2::ForwardedLiteral> TypeChecker2::forwardedLiteral(AstExpr* written)
+{
+    if (AstExprLocal* local = written->as<AstExprLocal>())
+    {
+        if (const LiteralCheck* check = module->literalLocals.find(local->local))
+            return ForwardedLiteral{local->local->name.value, *check};
+        return std::nullopt;
+    }
+
+    if (AstExprIndexName* field = written->as<AstExprIndexName>())
+    {
+        const LiteralCheck* check = findLiteralField(tableTypeOf(lookupType(field->expr)), field->index.value);
+        if (!check)
+            return std::nullopt;
+
+        AstExprLocal* owner = field->expr->as<AstExprLocal>();
+        std::string name = owner ? std::string(owner->local->name.value) + "." + field->index.value : field->index.value;
+        return ForwardedLiteral{std::move(name), *check};
+    }
+
+    return std::nullopt;
+}
+
+void TypeChecker2::checkLiteralValue(AstExpr* value, TypeId inferred, const LiteralCheck& check, NotNull<Scope> scope)
+{
+    AstExpr* written = unwrapGroup(value);
+    // A cast to a literal type (`s :: literal<string>`) passes as one, checked by nothing, like a cast to `any`
+    if (module->literalAssertions.contains(written))
+        return;
+
+    // A value checked where it was given (a literal parameter or local, a literal field) and passed on unchanged. Only the
+    // same validator can stand in for this one's, which can't see what that literal was.
+    if (std::optional<ForwardedLiteral> forwarded = forwardedLiteral(written))
+    {
+        bool sameCheck = !check.validator || validatorName(check.validator) == validatorName(forwarded->check.validator);
+        if (!sameCheck)
+            reportError(GenericError{forwardedLiteralMessage(forwarded->name, forwarded->check.validator, check.validator)}, value->location);
+        return;
+    }
+
+    TypeArena& arena = *module->internalTypes;
+    TypeId literalTy = writtenLiteralType(arena, builtinTypes, value, inferred);
+
+    if (isErrorSuppressing(value->location, literalTy))
+        return;
+
+    // What the rest of the union allows (`nil` for `literal<B>?`) isn't checked
+    if (check.alternatives && subtyping->isSubtype(literalTy, check.alternatives, scope).isSubtype)
+        return;
+
+    if (isMissingLiteral(check.base, literalTy))
+    {
+        reportError(GenericError{notALiteralMessage(check.base, literalTy)}, value->location);
+        return;
+    }
+
+    if (!check.validator)
+        return;
+
+    // A validator given the same literal again says the same thing: only where it's said changes
+    std::optional<std::pair<TypeId, std::string>> key;
+    if (const SingletonType* singleton = get<SingletonType>(follow(literalTy)))
+    {
+        if (const StringSingleton* string = get<StringSingleton>(singleton))
+            key = {follow(check.validator), "s:" + string->value};
+        else if (const BooleanSingleton* boolean = get<BooleanSingleton>(singleton))
+            key = {follow(check.validator), boolean->value ? "b:true" : "b:false"};
+    }
+
+    auto report = [&](const ValidatedLiteral& validated)
+    {
+        auto relocated = [&](ErrorVec errors)
+        {
+            for (TypeError& error : errors)
+                error.location = value->location;
+            return errors;
+        };
+        reportErrors(relocated(validated.messages));
+        // The validator raised (`error(...)` in a user type function): that error says why
+        if (!validated.errors.empty())
+            reportErrors(relocated(validated.errors));
+        else if (validated.accepted)
+            testIsSubtype(literalTy, *validated.accepted, value->location);
+    };
+
+    if (key)
+    {
+        if (auto it = validatedLiterals.find(*key); it != validatedLiterals.end())
+        {
+            report(it->second);
+            return;
+        }
+    }
+
+    std::optional<TypeId> instance = applyLiteralValidator(arena, check, follow(check.validator), literalTy);
+    if (!instance)
+        return;
+
+    TypeFunctionContext context{NotNull{&arena}, builtinTypes, scope, NotNull{&normalizer}, typeFunctionRuntime, ice, limits, subtyping};
+    FunctionGraphReductionResult reduction = reduceTypeFunctions(*instance, value->location, NotNull{&context}, /* force */ true);
+
+    ValidatedLiteral validated;
+    validated.messages = std::move(reduction.messages);
+    validated.errors = std::move(reduction.errors);
+    // Still unreduced, e.g. the value's type is a generic: nothing is known about it yet
+    if (TypeId accepted = follow(*instance); !get<TypeFunctionInstanceType>(accepted))
+        validated.accepted = accepted;
+
+    report(validated);
+    if (key)
+        validatedLiterals.emplace(*key, std::move(validated));
+}
+
+void TypeChecker2::checkLiteralFields(AstExpr* value, TypeId expected, NotNull<Scope> scope)
+{
+    const TableType* expectedTable = tableTypeOf(expected);
+    if (!expectedTable)
+        return;
+
+    AstExpr* written = unwrapGroup(value);
+    if (AstExprTable* literal = written->as<AstExprTable>())
+    {
+        // Field by field, into the tables nested in it too
+        for (const AstExprTable::Item& item : literal->items)
+        {
+            AstExprConstantString* key = item.kind == AstExprTable::Item::Kind::Record ? item.key->as<AstExprConstantString>() : nullptr;
+            if (!key)
+                continue;
+
+            std::string name(key->value.data, key->value.size);
+            if (const LiteralCheck* check = findLiteralField(expectedTable, name))
+                checkLiteralValue(item.value, lookupType(item.value), *check, scope);
+            else if (auto prop = expectedTable->props.find(name); prop != expectedTable->props.end())
+            {
+                std::optional<TypeId> fieldTy = prop->second.writeTy ? prop->second.writeTy : prop->second.readTy;
+                if (fieldTy)
+                    checkLiteralFields(item.value, *fieldTy, scope);
+            }
+        }
+        return;
+    }
+
+    if (expectedTable->literalFields.empty() || module->literalAssertions.contains(written))
+        return;
+
+    // Any other table must have been checked against the same fields already: a value annotated with them
+    TypeId valueTy = lookupType(value);
+    const TableType* valueTable = tableTypeOf(valueTy);
+    if (!valueTable || isErrorSuppressing(value->location, valueTy))
+        return;
+
+    for (const auto& [name, check] : expectedTable->literalFields)
+    {
+        const LiteralCheck* given = findLiteralField(valueTable, name);
+        bool sameCheck = given && (!check.validator || validatorName(check.validator) == validatorName(given->validator));
+        if (!sameCheck)
+        {
+            reportError(GenericError{uncheckedTableMessage(written, literalFieldDisplay(name, check))}, value->location);
+            return;
+        }
+    }
+}
+
+void TypeChecker2::checkLiteralLocalValue(AstLocal* var, AstExpr* value, TypeId valueType, TypeId annotationType)
+{
+    NotNull<Scope> scope{findInnermostScope(value->location)};
+    if (const LiteralCheck* check = module->literalLocals.find(var))
+        checkLiteralValue(value, valueType, *check, scope);
+    else
+        checkLiteralFields(value, annotationType, scope);
+}
+
+void TypeChecker2::checkLiteralArguments(AstExprCall* call, const FunctionType* fty, size_t selfOffset, NotNull<Scope> scope)
+{
+    std::vector<TypeId> params = extendTypePack(*module->internalTypes, builtinTypes, fty->argTypes, call->args.size + selfOffset).head;
+
+    for (size_t idx = 0; idx < call->args.size; ++idx)
+    {
+        // A multret argument (a call last in the list) is checked by its first value only
+        AstExpr* arg = call->args.data[idx];
+
+        if (const FunctionType::LiteralParameter* literal = findLiteralParameter(*fty, idx + selfOffset))
+            checkLiteralValue(arg, lookupType(arg), *literal, scope);
+        else if (idx + selfOffset < params.size())
+            checkLiteralFields(arg, params[idx + selfOffset], scope);
+    }
+}
+
+void TypeChecker2::visitCall(AstExprCall* call)
+{
+    TypePack args;
+    std::vector<AstExpr*> argExprs;
+    NotNull<Scope> scope{findInnermostScope(call->location)};
+    argExprs.reserve(call->args.size + 1);
+
+    TypeId* originalCallTy = module->astOriginalCallTypes.find(call->func);
+    TypeId* selectedOverloadTy = module->astOverloadResolvedTypes.find(call);
+    if (!originalCallTy)
+        return;
+
+    TypeId fnTy = follow(*originalCallTy);
+
+
+    // Luwu: calling `never` or an error type is reported (reportImproperUse); upstream returns here for both.
+    if (reportImproperUse(call->func, fnTy, ImproperUse::Call) || get<AnyType>(fnTy))
+        return;
+    else if (isOptional(fnTy))
+    {
+        switch (shouldSuppressErrors(NotNull{&normalizer}, fnTy))
+        {
+        case ErrorSuppression::Suppress:
+            break;
+        case ErrorSuppression::NormalizationFailed:
+            reportError(NormalizationTooComplex{}, call->func->location);
+            [[fallthrough]];
+        case ErrorSuppression::DoNotSuppress:
+            reportError(OptionalValueAccess{fnTy}, call->func->location);
+        }
+        return;
+    }
+
+    if (call->typeArguments.size)
+    {
+        checkTypeInstantiation(call, fnTy, call->location, call->typeArguments);
+    }
+
+    if (selectedOverloadTy)
+    {
+        SubtypingResult result = subtyping->isSubtype(*originalCallTy, *selectedOverloadTy, scope);
+        if (result.isSubtype)
+            fnTy = follow(*selectedOverloadTy);
+
+        if (result.isErrorSuppressing)
+        {
+            for (auto& e : result.errors)
+                e.location = call->location;
+        }
+
+        reportErrors(std::move(result.errors));
+        if (result.normalizationTooComplex)
+        {
+            reportError(NormalizationTooComplex{}, call->func->location);
+            return;
+        }
+    }
+
+    // Luwu: `v:m()` on a union whose members each have their own `m` (the solver typed the call the same way). After the
+    // overload the solver picked, which is the union again.
+    if (call->self)
+    {
+        if (std::optional<TypeId> merged = mergeUnionMethods(builtinTypes, NotNull{module->internalTypes.get()}, fnTy))
+        {
+            fnTy = *merged;
+            if (AstExprIndexName* indexExpr = call->func->as<AstExprIndexName>())
+                checkUnionMethodSelves(indexExpr);
+        }
+    }
+
+    if (call->self)
+    {
+        AstExprIndexName* indexExpr = call->func->as<AstExprIndexName>();
+        if (!indexExpr)
+        {
+            reportError(InternalError{"method call expression has no 'self'"}, call->location);
+            return;
+        }
+
+        args.head.push_back(lookupType(indexExpr->expr));
+        argExprs.push_back(indexExpr->expr);
+    }
+
+    // Errors reported from here on are about the arguments.
+    const size_t firstArgumentError = module->errors.size();
+
+    const FunctionType* fty = get<FunctionType>(fnTy);
+    size_t selfOffset = call->self ? 1 : 0;
+
+    if (!fty && !call->self)
+    {
+        // `fnTy` isn't itself callable, so this call is dispatched through a
+        // `__call` metamethod, which forwards `call->func` as its first
+        // argument -- same as `self` above -- so param types need to be read
+        // starting from its second parameter. A bad metatable is reported by the solver already.
+        ErrorVec metatableErrors;
+        if (auto callMm = findMetatableEntry(builtinTypes, metatableErrors, fnTy, "__call", call->func->location))
+        {
+            fty = get<FunctionType>(follow(*callMm));
+            if (fty)
+            {
+                selfOffset = 1;
+                checkPrivateConstructorAccess(fnTy, call->func->location);
+            }
+        }
+    }
+
+    if (fty)
+        checkLiteralArguments(call, fty, selfOffset, scope);
+
+    // FIXME: Similar to bidirectional inference prior, this does not support
+    // overloaded functions nor generic typeArguments (yet).
+    if (fty && fty->generics.empty() && fty->genericPacks.empty() && call->args.size > 0)
+    {
+        std::vector<TypeId> paramsHead = extendTypePack(*module->internalTypes, builtinTypes, fty->argTypes, call->args.size + selfOffset).head;
+
+        for (size_t idx = 0; idx < call->args.size; ++idx)
+        {
+            AstExpr* argExpr = call->args.data[idx];
+
+            // The last argument might be an ordinary value, but it can also be an entire pack.
+            if (idx == call->args.size - 1)
+            {
+                if (TypePackId* lastArgPack = module->astTypePacks.find(argExpr))
+                {
+                    auto [lastArgHead, lastArgTail] = flatten(*lastArgPack);
+                    args.head.insert(args.head.end(), lastArgHead.begin(), lastArgHead.end());
+                    args.tail = lastArgTail;
+                    // Luwu (helpful subtyping errors): so an error about the pack (a variadic tail of the
+                    // wrong type) can point at it. Upstream leaves it out, since it never reports one.
+                    argExprs.push_back(argExpr);
+                    continue;
+                }
+            }
+
+            TypeId argExprType = lookupType(argExpr);
+            argExprs.push_back(argExpr);
+            if (idx + selfOffset >= paramsHead.size() || isErrorSuppressing(argExpr->location, argExprType))
+                args.head.push_back(argExprType);
+            else
+            {
+                // Scoped to this one test: an explanation reported from inside it can name the
+                // callee and point at the parameter, which nothing else reporting a mismatch can.
+                {
+                    ScopedMemberValue<std::optional<ArgumentContext>> inArgument{
+                        argumentContext, ArgumentContext{call->func, fty, idx + selfOffset}
+                    };
+                    testLiteralOrAstTypeIsSubtype(argExpr, paramsHead[idx + selfOffset]);
+                }
+
+                args.head.push_back(paramsHead[idx + selfOffset]);
+            }
+        }
+    }
+    else
+    {
+        for (AstExpr* arg : call->args)
+            argExprs.push_back(arg);
+        appendArgumentTypes(args, call);
+    }
+
+    TypePackId argsTp = module->internalTypes->addTypePack(args);
+    if (auto ftv = get<FunctionType>(follow(*originalCallTy)))
+    {
+        if (ftv->magic)
+        {
+            bool usedMagic = ftv->magic->typeCheck(MagicFunctionTypeCheckContext{NotNull{this}, builtinTypes, call, argsTp, scope});
+            if (usedMagic)
+                return;
+        }
+    }
+
+    OverloadResolver resolver{
+        builtinTypes,
+        NotNull{module->internalTypes.get()},
+        NotNull{&normalizer},
+        typeFunctionRuntime,
+        NotNull{stack.back()},
+        ice,
+        limits,
+        call->location,
+    };
+    resolver.reportedTypeFunctionApplications = &reportedTypeFunctionApplications;
+    DenseHashSet<TypeId> uniqueTypes{nullptr};
+    findUniqueTypes(NotNull{&uniqueTypes}, argExprs, NotNull{&module->astTypes});
+
+    TypePackId argsPack = module->internalTypes->addTypePack(args);
+    const OverloadResolution result2 = resolver.resolveOverload(fnTy, argsPack, call->func->location, NotNull{&uniqueTypes}, false);
+
+    if (!result2.potentialOverloads.empty())
+        reportError(InternalError{"Internal error: outstanding free or blocked type in function call"}, call->location);
+
+    /*
+     * If one overload matches, stop.  Nothing to report.
+     *
+     * If 2 or more overloads match, report that it is ambiguous.  List the overloads that match.
+     *
+     * If 0 overloads match:
+     *      If multiple overloads are arity matches, but are nonviable, report MultipleNonviableOverloads and report the overloads that have matching
+     * arities. Note: Error suppressing overloads are ignored in this calculation! If only one overload is an arity match but it is nonviable, report
+     * subtyping errors for just that.
+     *
+     *      If no overloads are arity matches, list all overloads.
+     */
+
+    if (!result2.ok.empty())
+    {
+        if (result2.ok.size() > 1)
+            reportError(AmbiguousFunctionCall{fnTy, argsPack}, call->location);
+        return;
+    }
+
+    // Luwu (helpful subtyping errors): `t:f(x)` on a function that doesn't take `t` fails on its argument count or
+    // its first parameter. When `t.f(x)` type-checks, that is the fix, and the errors about the arguments go.
+    if (FFlag::LuwuHelpfulSubtypingErrors && call->self)
+    {
+        TypePack dotArgs;
+        appendArgumentTypes(dotArgs, call);
+        TypePackId dotArgsPack = module->internalTypes->addTypePack(std::move(dotArgs));
+        const OverloadResolution dotCall = resolver.resolveOverload(fnTy, dotArgsPack, call->func->location, NotNull{&uniqueTypes}, false);
+        if (!dotCall.ok.empty())
+        {
+            module->errors.erase(module->errors.begin() + firstArgumentError, module->errors.end());
+            reportError(FunctionDoesNotTakeSelf{}, call->func->location);
+            return;
+        }
+    }
+
+    std::vector<TypeId> overloadsToReport;
+
+    if (1 == result2.incompatibleOverloads.size())
+    {
+        for (const auto& [ty, reasons] : result2.incompatibleOverloads)
+        {
+            if (const SubtypingReasonings* sr = get_if<SubtypingReasonings>(&reasons))
+            {
+                // When the overload is a `__call` metamethod,
+                // `OverloadResolver::testFunctionOrCallMetamethod` passes the callee as its first
+                // argument. Every path in `reasons` then indexes into a pack one entry longer than
+                // the one built from `call->args`, so rebuild that longer pack and the matching
+                // expression list here. Otherwise argument N's reasoning would be matched against
+                // argument N - 1. For a one-argument call, such as a class constructor, it would be
+                // matched against nothing, and `maybeEmplaceError` would silently drop it.
+                TypePackId reportedArgsPack = argsPack;
+                std::vector<AstExpr*> reportedArgExprs = argExprs;
+                if (result2.metamethods.contains(ty))
+                {
+                    reportedArgsPack = module->internalTypes->addTypePack({fnTy}, argsPack);
+                    reportedArgExprs.insert(reportedArgExprs.begin(), call->func);
+                }
+
+                size_t firstReported = module->errors.size();
+                for (const SubtypingReasoning& reason : *sr)
+                    resolver.reportErrors(
+                        module->errors, ty, call->func->location, module->name, reportedArgsPack, reportedArgExprs, reason
+                    );
+
+                // Luwu (helpful subtyping errors): a variadic tail passed to a variadic parameter (`f(...)`) is
+                // reported by the resolver as two bare packs. Say who takes what, and explain the element
+                // types the way a single mismatched argument would be.
+                if (FFlag::LuwuHelpfulSubtypingErrors)
+                {
+                    for (size_t i = firstReported; i < module->errors.size(); ++i)
+                    {
+                        const TypePackMismatch* tpm = get<TypePackMismatch>(module->errors[i]);
+                        if (!tpm || tpm->overrideMessage)
+                            continue;
+
+                        const TypePackId wantedTp = tpm->wantedTp;
+                        const TypePackId givenTp = tpm->givenTp;
+                        const VariadicTypePack* wanted = get<VariadicTypePack>(follow(wantedTp));
+                        const VariadicTypePack* given = get<VariadicTypePack>(follow(givenTp));
+                        if (!wanted || !given)
+                            continue;
+
+                        ToStringOptions options;
+                        options.sortUnionMembers = false;
+                        std::string callee = calleeDisplayName(call->func);
+                        std::string message = (callee.empty() ? std::string("This function") : "'" + callee + "'") + " takes '" +
+                                              toString(wantedTp, options) + "', but was given '" + toString(givenTp, options) + "'";
+
+                        std::optional<MismatchExplanation> explanation =
+                            explainMismatch(given->ty, wanted->ty, subtyping, scope, builtinTypes, std::nullopt, "passed", std::nullopt, helpifier);
+                        if (explanation && !explanation->standalone)
+                            message += explanation->reason;
+
+                        // Looked up again rather than held across the explainer: `module->errors` can grow.
+                        get<TypePackMismatch>(module->errors[i])->overrideMessage = std::move(message);
+                    }
+                }
+            }
+            else if (const auto errorVec = get_if<ErrorVec>(&reasons))
+            {
+                for (const TypeError& error : *errorVec)
+                {
+                    const CannotCallNonFunction* uncallable = get<CannotCallNonFunction>(error);
+                    if (!uncallable || !hasErrorSuppressingMember(uncallable->ty))
+                        reportError(error);
+                }
+            }
+            else
+                LUAU_ASSERT(!"Unreachable");
+        }
+
+        return;
+    }
+
+    // TODO: arity mismatches need expected/actual counts.
+    const auto [argHead, _argTail] = flatten(argsPack);
+    if (result2.incompatibleOverloads.size() > 1)
+    {
+        overloadsToReport.reserve(result2.nonFunctions.size());
+        for (const auto& [overloadTy, _reasons] : result2.incompatibleOverloads)
+        {
+            if (!isErrorSuppressing(call->location, overloadTy))
+                overloadsToReport.emplace_back(overloadTy);
+        }
+
+        // If all nonviable overloads are error suppressing, don't report anything.
+        if (!overloadsToReport.empty() && FFlag::LuwuHelpfulSubtypingErrors)
+        {
+            MultipleNonviableOverloads error{argHead.size()};
+            error.callee = calleeDisplayName(call->func);
+            error.overloads = overloadSignatures(overloadsToReport);
+            error.arguments = argumentList(call, argsPack);
+            reportError(std::move(error), call->location);
+        }
+        else if (!overloadsToReport.empty())
+        {
+            reportError(MultipleNonviableOverloads{argHead.size()}, call->location);
+            reportAvailableOverloads(module->errors, call->location, module->name, overloadsToReport);
+        }
+
+        return;
+    }
+
+    LUAU_ASSERT(0 == result2.ok.size() && 0 == result2.incompatibleOverloads.size());
+
+    if (1 == result2.arityMismatches.size())
+    {
+        const TypeId fnTy = follow(result2.arityMismatches.front());
+        const FunctionType* fn = get<FunctionType>(fnTy);
+        LUAU_ASSERT(fn);
+
+        if (fn)
+        {
+            const bool isVariadic = Luau::isVariadic(fn->argTypes);
+
+            // A `__call` metamethod is invoked with `call->func` forwarded as its first argument, which
+            // `argHead` (built from `call->args`) doesn't include. Report the counts as the call is written:
+            // leave the forwarded argument out of the expected parameters rather than adding it to the
+            // arguments. For a class, `Cat("tom")` against `Cat(name, age)` then reads "expects 2, got 1".
+            size_t specifiedCount = argHead.size();
+
+            auto [minParams, optMaxParams] = getParameterExtents(TxnLog::empty(), fn->argTypes);
+            if (result2.metamethods.contains(fnTy))
+            {
+                if (minParams > 0)
+                    minParams -= 1;
+                if (optMaxParams && *optMaxParams > 0)
+                    *optMaxParams -= 1;
+            }
+
+            reportError(CountMismatch{minParams, optMaxParams, specifiedCount, CountMismatch::Arg, isVariadic}, call->func->location);
+            return;
+        }
+    }
+
+    // Luwu (helpful subtyping errors): one error, naming the function and listing its overloads a line each.
+    if (!result2.arityMismatches.empty() && FFlag::LuwuHelpfulSubtypingErrors)
+    {
+        std::string callee = calleeDisplayName(call->func);
+        std::string function = callee.empty() ? "this function" : "'" + callee + "'";
+        std::string arguments = argHead.size() == 1 ? "1 argument" : std::to_string(argHead.size()) + " arguments";
+        std::string message = "No overload of " + function + " takes " + arguments + ":\n" + numberedOverloads(overloadSignatures(result2.arityMismatches));
+        reportError(GenericError{std::move(message)}, call->func->location);
+        return;
+    }
+
+    if (!result2.arityMismatches.empty())
+    {
+        std::stringstream ss;
+        ss << "No overload for function accepts " << argHead.size() << " arguments.";
+        reportError(GenericError{ss.str()}, call->func->location);
+        reportAvailableOverloads(module->errors, call->func->location, module->name, result2.arityMismatches);
+        return;
+    }
+
+    if (!result2.nonFunctions.empty())
+    {
+        auto norm = normalizer.normalize(fnTy);
+        // Luwu: upstream reports this and then reads `norm` below anyway, dereferencing null. Normalizing can fail here
+        // though `shouldSuppressErrors` normalized the same type above: the normalizer may have cleared its cache since.
+        if (!norm)
+        {
+            reportError(NormalizationTooComplex{}, call->func->location);
+            return;
+        }
+        if (normalizer.isInhabited(norm.get()) == NormalizationResult::HitLimits)
+            reportError(NormalizationTooComplex{}, call->func->location);
+        // Luwu: a `never` the normalizer had to work out (`number & ~number`). Upstream reports it can't be called.
+        if (isUninhabited(norm.get()))
+        {
+            reportUnreachableUse(call->func, ImproperUse::Call);
+            return;
+        }
+        // At this point norm is non-null and inhabited.
+        if (!norm->shouldSuppressErrors())
+            reportError(CannotCallNonFunction{fnTy}, call->func->location);
+        return;
+    }
+}
+
+void TypeChecker2::visit(AstExprCall* call)
+{
+    std::optional<InConditionalContext> flipper;
+
+    // We want to preserve the existing conditional context if we are in a `typeof` call.
+    if (!matchTypeOf(*call))
+        flipper.emplace(&typeContext, TypeContext::Default);
+
+    visit(call->func, ValueContext::RValue);
+
+    if (matchAssert(*call) && call->args.size > 0)
+    {
+        {
+            InConditionalContext flipper(&typeContext);
+            visit(call->args.data[0], ValueContext::RValue);
+        }
+
+        for (size_t i = 1; i < call->args.size; ++i)
+            visit(call->args.data[i], ValueContext::RValue);
+    }
+    else
+    {
+        for (AstExpr* arg : call->args)
+            visit(arg, ValueContext::RValue);
+    }
+
+    if (call->fromTypeTest)
+        checkImpossibleTypeTest(call);
+
+    visitCall(call);
+}
+
+// Luwu match expressions: a type test's operand for a message. A value `is` read into a hidden local (`(matched)`,
+// `(destructured)`) has no name a user wrote.
+static std::string typeTestOperandName(std::optional<std::string> name, const char* fallback)
+{
+    if (!name || name->empty() || (*name)[0] == '(')
+        return fallback;
+    return "'" + *name + "'";
+}
+
+// Luwu match expressions: `x is C`, where no value of x's type can be a C. The test is always false, so the code it
+// guards never runs. That's reported here once, and the tested local counts as reported (improperlyUsedLocals), so
+// the reads it guards don't add a "'x' is 'never' here" each.
+void TypeChecker2::checkImpossibleTypeTest(AstExprCall* call)
+{
+    AstExprIndexName* callee = call->func->as<AstExprIndexName>();
+    if (!callee || callee->index != "isinstance" || call->args.size != 2)
+        return;
+
+    TypeId valueTy = follow(lookupType(call->args.data[0]));
+    if (is<AnyType, UnknownType, ErrorType, NeverType, FreeType, BlockedType, GenericType>(valueTy))
+        return;
+
+    std::optional<TypeId> objectTy = objectTypeOfClassValue(builtinTypes, lookupType(call->args.data[1]));
+    if (!objectTy || normalizer.isIntersectionInhabited(valueTy, *objectTy) != NormalizationResult::False)
+        return;
+
+    std::string value = typeTestOperandName(bindingName(call->args.data[0]), "This value");
+    std::string type = typeTestOperandName(bindingName(call->args.data[1]), "this class");
+    std::string message = value + " can never be " + type + ": it's '" + toString(valueTy) + "'";
+
+    // `x is ok` on a value that isn't a result is usually a call missing its `try`
+    const ExternType* objectClass = get<ExternType>(follow(*objectTy));
+    bool resultVariant = objectClass && (objectClass->name == "ok" || objectClass->name == "err");
+    if (resultVariant)
+        message += ". Write 'try' before the call to test its result";
+
+    reportError(GenericError{std::move(message)}, call->location);
+
+    if (const AstExprLocal* tested = call->args.data[0]->as<AstExprLocal>())
+        improperlyUsedLocals.insert(tested->local);
+}
+
+std::optional<TypeId> TypeChecker2::tryStripUnionFromNil(TypeId ty) const
+{
+    if (const UnionType* utv = get<UnionType>(ty))
+    {
+        if (!std::any_of(begin(utv), end(utv), isNil))
+            return ty;
+
+        std::vector<TypeId> result;
+
+        for (TypeId option : utv)
+        {
+            if (!isNil(option))
+                result.push_back(option);
+        }
+
+        if (result.empty())
+            return std::nullopt;
+
+        return result.size() == 1 ? result[0] : module->internalTypes->addType(UnionType{std::move(result)});
+    }
+
+    return std::nullopt;
+}
+
+// Luwu try expressions: a union without its weakunknown members, so `(NotFound | unknown).kind` reads NotFound's.
+// weakunknown on its own stays.
+TypeId TypeChecker2::stripWeakUnknown(TypeId ty) const
+{
+    const UnionType* utv = get<UnionType>(ty);
+    if (!utv)
+        return ty;
+
+    std::vector<TypeId> rest;
+    for (TypeId option : utv)
+    {
+        if (follow(option) != builtinTypes->weakUnknownType)
+            rest.push_back(option);
+    }
+
+    if (rest.size() == utv->options.size() || rest.empty())
+        return ty;
+    if (rest.size() == 1)
+        return follow(rest[0]);
+    return module->internalTypes->addType(UnionType{std::move(rest)});
+}
+
+TypeId TypeChecker2::stripFromNilAndReport(TypeId ty, const Location& location)
+{
+    ty = follow(ty);
+
+    if (auto utv = get<UnionType>(ty))
+    {
+        if (!std::any_of(begin(utv), end(utv), isNil))
+            return ty;
+    }
+
+    if (std::optional<TypeId> strippedUnion = tryStripUnionFromNil(ty))
+    {
+        switch (shouldSuppressErrors(NotNull{&normalizer}, ty))
+        {
+        case ErrorSuppression::Suppress:
+            break;
+        case ErrorSuppression::NormalizationFailed:
+            reportError(NormalizationTooComplex{}, location);
+            [[fallthrough]];
+        case ErrorSuppression::DoNotSuppress:
+            reportError(OptionalValueAccess{ty}, location);
+        }
+
+        return follow(*strippedUnion);
+    }
+
+    return ty;
+}
+
+// Luwu Destructuring (rfcs/destructuring.md): an element of a positional pattern on an object, or a union of objects,
+// reads the field each class's primary constructor takes at that position. Returns false for any other value, whose
+// element is checked like `t[i]`.
+bool TypeChecker2::checkPositionalElement(AstExprIndexExpr* indexExpr)
+{
+    const AstExprConstantNumber* number = indexExpr->index->as<AstExprConstantNumber>();
+    if (!number || number->value < 1)
+        return false;
+
+    size_t position = size_t(number->value) - 1;
+
+    std::vector<TypeId> options;
+    TypeId exprType = follow(lookupType(indexExpr->expr));
+    if (const UnionType* union_ = get<UnionType>(exprType))
+    {
+        for (TypeId option : union_)
+            options.push_back(follow(option));
+    }
+    else
+    {
+        options.push_back(exprType);
+    }
+
+    for (TypeId option : options)
+    {
+        if (!getClassFieldUserData(option))
+            return false;
+    }
+
+    visit(indexExpr->expr, ValueContext::RValue);
+
+    for (TypeId option : options)
+    {
+        const ExternType* cls = get<ExternType>(option);
+        const ClassFieldUserData* data = getClassFieldUserData(option);
+        LUAU_ASSERT(cls && data);
+
+        bool hasPosition = data->positionalFields && position < data->positionalFields->size();
+        if (hasPosition)
+        {
+            checkPrivatePropertyAccess(option, (*data->positionalFields)[position], indexExpr->location);
+            continue;
+        }
+
+        // A class without a primary constructor can't be destructured at any position: one error for the pattern
+        bool reportsPattern = data->positionalFields || position == 0;
+        if (reportsPattern)
+            reportError(PositionalDestructuring{cls->name, position, data->positionalFields}, indexExpr->location);
+    }
+
+    return true;
+}
+
+void TypeChecker2::checkPrivatePropertyAccess(TypeId tableTy, const std::string& prop, const Location& location)
+{
+    if (!FFlag::LuwuClasses)
+        return;
+
+    const ExternType* cls = get<ExternType>(follow(tableTy));
+    while (cls)
+    {
+        auto it = cls->props().find(prop);
+        if (it != cls->props().end())
+        {
+            // a class's functions are its only read-only members; its fields are always read-write,
+            // even `const` ones (see ConstraintGenerator)
+            if (it->second.isPrivate && !isInsideClassDeclaration(cls, module->name, location))
+                reportError(PrivatePropertyAccess{tableTy, prop, it->second.isReadOnly(), cls->name}, location);
+            return;
+        }
+
+        cls = cls->parent ? get<ExternType>(follow(*cls->parent)) : nullptr;
+    }
+}
+
+bool TypeChecker2::checkConstructorReadByName(TypeId tableTy, const std::string& prop, ValueContext context, const Location& location)
+{
+    if (!FFlag::LuwuClasses)
+        return false;
+
+    if (context != ValueContext::RValue || prop != "__init")
+        return false;
+
+    const ExternType* cls = get<ExternType>(follow(tableTy));
+    const bool isClassOrObject =
+        cls && (cls->root == builtinTypes->classType || cls->root == builtinTypes->objectType || cls->root == builtinTypes->traitType);
+    if (!isClassOrObject)
+        return false;
+
+    reportError(ConstructorReadByName{tableTy, cls->name}, location);
+    return true;
+}
+
+namespace
+{
+
+// Luwu Classes (rfcs/classes): the locals of `init` that always hold `self`. A local counts when it is
+// initialized from `self` or from another such local, and nothing in `init` assigns to it, closures
+// included: a reassigned one may hold another object when the write runs.
+struct SelfAliasCollector : AstVisitor
+{
+    DenseHashSet<const AstLocal*> aliases{nullptr};
+    DenseHashSet<const AstLocal*> written{nullptr};
+
+    explicit SelfAliasCollector(const AstLocal* self)
+    {
+        aliases.insert(self);
+    }
+
+    void markWritten(AstExpr* target)
+    {
+        if (AstExprLocal* local = target->as<AstExprLocal>())
+            written.insert(local->local);
+    }
+
+    bool visit(AstStatLocal* node) override
+    {
+        // statements are visited in source order, so an alias of an alias is already known here
+        for (size_t i = 0; i < node->vars.size && i < node->values.size; ++i)
+        {
+            AstExprLocal* value = node->values.data[i]->as<AstExprLocal>();
+            if (value && aliases.contains(value->local))
+                aliases.insert(node->vars.data[i]);
+        }
+
+        return true;
+    }
+
+    bool visit(AstStatAssign* node) override
+    {
+        for (AstExpr* target : node->vars)
+            markWritten(target);
+
+        return true;
+    }
+
+    bool visit(AstStatCompoundAssign* node) override
+    {
+        markWritten(node->var);
+        return true;
+    }
+
+    bool visit(AstStatFunction* node) override
+    {
+        markWritten(node->name);
+        return true;
+    }
+};
+
+} // namespace
+
+bool TypeChecker2::isInitWritingItsSelf(const ExternType* cls, const AstExpr* objectExpr) const
+{
+    // Mirrors the runtime rule: the running closure is the class's `__init` itself (a function nested
+    // in it is not), and the object is the one it is constructing, in its `self` parameter. The object
+    // may be named through a local that always holds `self` (SelfAliasCollector).
+    if (enclosingFunctions.empty() || !cls->initLocation || cls->definitionModuleName != module->name)
+        return false;
+
+    const AstExprFunction* fn = enclosingFunctions.back();
+    if (fn->location != *cls->initLocation)
+        return false;
+
+    const AstLocal* self = fn->self ? fn->self : (fn->args.size > 0 ? fn->args.data[0] : nullptr);
+    const AstExprLocal* object = objectExpr->as<AstExprLocal>();
+    if (!self || !object)
+        return false;
+
+    if (object->local == self)
+        return true;
+
+    DenseHashSet<const AstLocal*>* aliases = initSelfAliases.find(fn);
+    if (!aliases)
+    {
+        SelfAliasCollector collector(self);
+        const_cast<AstExprFunction*>(fn)->body->visit(&collector);
+
+        DenseHashSet<const AstLocal*> stable{nullptr};
+        for (const AstLocal* local : collector.aliases)
+        {
+            if (!collector.written.contains(local))
+                stable.insert(local);
+        }
+
+        aliases = &initSelfAliases.try_insert(fn, std::move(stable)).first;
+    }
+
+    return aliases->contains(object->local);
+}
+
+void TypeChecker2::checkConstPropertyAssignment(
+    TypeId tableTy,
+    const AstExpr* objectExpr,
+    const std::string& prop,
+    ValueContext context,
+    const Location& location
+)
+{
+    if (!FFlag::LuwuClasses)
+        return;
+
+    if (context != ValueContext::LValue)
+        return;
+
+    const ExternType* cls = get<ExternType>(follow(tableTy));
+    while (cls)
+    {
+        auto it = cls->props().find(prop);
+        if (it != cls->props().end())
+        {
+            if (it->second.isFinal)
+                reportError(GenericError{format("'%s' is a final field of '%s' and can't be assigned", prop.c_str(), cls->name.c_str())}, location);
+            else if (it->second.isConst && !isInitWritingItsSelf(cls, objectExpr))
+                reportError(ConstPropertyAssignment{tableTy, prop, cls->name}, location);
+            return;
+        }
+
+        cls = cls->parent ? get<ExternType>(follow(*cls->parent)) : nullptr;
+    }
+}
+
+void TypeChecker2::checkPrivateConstructorAccess(TypeId classTy, const Location& location)
+{
+    if (!FFlag::LuwuClasses)
+        return;
+
+    const ExternType* cls = get<ExternType>(follow(classTy));
+    if (!cls || cls->root != builtinTypes->classType || !cls->relation)
+        return;
+
+    const Obj* obj = get_if<Obj>(&*cls->relation);
+    if (!obj)
+        return;
+
+    const ExternType* instanceCls = get<ExternType>(follow(obj->ty));
+    if (!instanceCls)
+        return;
+
+    auto it = instanceCls->props().find("__init");
+    if (it == instanceCls->props().end())
+        return;
+
+    // Luwu Traits (rfcs/classes/traits.md): the code of a trait the class implements may construct it too, which is what
+    // lets a factory trait's `__create` be the only way to make its classes
+    bool insideImplementedTrait = std::any_of(
+        instanceCls->implementedTraits.begin(),
+        instanceCls->implementedTraits.end(),
+        [&](TypeId trait)
+        {
+            const ExternType* traitCls = get<ExternType>(follow(trait));
+            return traitCls && isInsideClassDeclaration(traitCls, module->name, location);
+        }
+    );
+
+    bool mayConstruct = isInsideClassDeclaration(instanceCls, module->name, location) || insideImplementedTrait;
+    if (it->second.isPrivate && !mayConstruct)
+        reportError(PrivateConstructorAccess{classTy}, location);
+}
+
+void TypeChecker2::visitExprName(
+    AstExpr* expr,
+    Location location,
+    const std::string& propName,
+    ValueContext context,
+    TypeId astIndexExprTy,
+    char separator
+)
+{
+    visit(expr, ValueContext::RValue);
+    TypeId leftType = stripWeakUnknown(stripFromNilAndReport(lookupType(expr), location));
+    if (reportImproperUse(expr, leftType, ImproperUse::Index))
+        return;
+    std::string receiver;
+    if (std::optional<std::string> name = separator ? bindingName(expr) : std::nullopt)
+        receiver = *name + separator;
+    if (checkIndexTypeFromType(leftType, propName, context, location, astIndexExprTy, receiver, separator == ':'))
+    {
+        reportUnreachableUse(expr, ImproperUse::Index);
+        return;
+    }
+    const bool readsConstructor = checkConstructorReadByName(leftType, propName, context, location);
+    if (!readsConstructor)
+        checkPrivatePropertyAccess(leftType, propName, location);
+    checkConstPropertyAssignment(leftType, expr, propName, context, location);
+}
+
+// Luwu: with class compat, the `class` library's definitions have both languages' names (EmbeddedBuiltinDefinitions), and
+// each module sees only its own: upstream's `classof` in a Luau module, Luwu's `of`, `name`, `fields` and `implements` in a
+// Luwu module.
+static bool isOtherLanguagesClassMember(Language language, std::string_view member)
+{
+    if (language == Language::Luwu)
+        return member == "classof";
+
+    return member == "of" || member == "name" || member == "fields" || member == "implements";
+}
+
+void TypeChecker2::visit(AstExprIndexName* indexName, ValueContext context)
+{
+    AstExprGlobal* global = indexName->expr->as<AstExprGlobal>();
+    bool otherLanguagesClassMember =
+        global && global->name == "class" && luauClassCompat() && isOtherLanguagesClassMember(module->language, indexName->index.value);
+    if (otherLanguagesClassMember)
+    {
+        reportError(UnknownProperty{lookupType(indexName->expr), indexName->index.value}, indexName->location);
+        return;
+    }
+
+    // If we're indexing like _.foo - foo could either be a prop or a string.
+    visitExprName(indexName->expr, indexName->location, indexName->index.value, context, builtinTypes->stringType, indexName->op);
+}
+
+void TypeChecker2::indexExprMetatableHelper(AstExprIndexExpr* indexExpr, const MetatableType* metaTable, TypeId exprType, TypeId indexType)
+{
+    if (auto tt = get<TableType>(follow(metaTable->table)); tt && tt->indexer)
+        testIsSubtype(indexType, tt->indexer->indexType, indexExpr->index->location);
+    else if (auto mt = get<MetatableType>(follow(metaTable->table)))
+        indexExprMetatableHelper(indexExpr, mt, exprType, indexType);
+    else if (auto tmt = get<TableType>(follow(metaTable->metatable)); tmt && tmt->indexer)
+        testIsSubtype(indexType, tmt->indexer->indexType, indexExpr->index->location);
+    else if (auto mtmt = get<MetatableType>(follow(metaTable->metatable)))
+        indexExprMetatableHelper(indexExpr, mtmt, exprType, indexType);
+    else
+    {
+        // CLI-122161: We're not handling unions correctly (probably).
+        reportError(CannotExtendTable{exprType, CannotExtendTable::Indexer, "indexer??"}, indexExpr->location);
+    }
+}
+
+void TypeChecker2::visit(AstExprIndexExpr* indexExpr, ValueContext context)
+{
+    // CLI-169235: This should probably all be the same logic as `index`, we
+    // do some really weird stuff here.
+    if (auto str = indexExpr->index->as<AstExprConstantString>())
+    {
+        TypeId astIndexExprType = lookupType(indexExpr->index);
+        const std::string stringValue(str->value.data, str->value.size);
+        visitExprName(indexExpr->expr, indexExpr->location, stringValue, context, astIndexExprType, 0);
+        return;
+    }
+
+    if (indexExpr->positional && checkPositionalElement(indexExpr))
+        return;
+
+    visit(indexExpr->expr, ValueContext::RValue);
+    visit(indexExpr->index, ValueContext::RValue);
+
+    TypeId exprType = follow(lookupType(indexExpr->expr));
+    TypeId indexType = follow(lookupType(indexExpr->index));
+
+    if (reportImproperUse(indexExpr->expr, exprType, ImproperUse::Index))
+        return;
+
+    if (auto tt = get<TableType>(exprType))
+    {
+        if (tt->indexer)
+        {
+            testIsSubtype(indexType, tt->indexer->indexType, indexExpr->index->location);
+            if (context == ValueContext::LValue && tt->indexer->isReadOnly)
+                reportError(PropertyAccessViolation{exprType, "indexer", PropertyAccessViolation::CannotWrite}, indexExpr->location);
+        }
+        else
+            reportError(CannotExtendTable{exprType, CannotExtendTable::Indexer, "indexer??"}, indexExpr->location);
+    }
+    else if (auto mt = get<MetatableType>(exprType))
+    {
+        return indexExprMetatableHelper(indexExpr, mt, exprType, indexType);
+    }
+    else if (auto cls = get<ExternType>(exprType))
+    {
+        if (cls->indexer)
+            testIsSubtype(indexType, cls->indexer->indexType, indexExpr->index->location);
+        else
+            reportError(DynamicPropertyLookupOnExternTypesUnsafe{exprType}, indexExpr->location);
+    }
+    else if (get<UnionType>(exprType) && isOptional(exprType))
+    {
+        switch (shouldSuppressErrors(NotNull{&normalizer}, exprType))
+        {
+        case ErrorSuppression::Suppress:
+            break;
+        case ErrorSuppression::NormalizationFailed:
+            reportError(NormalizationTooComplex{}, indexExpr->location);
+            [[fallthrough]];
+        case ErrorSuppression::DoNotSuppress:
+            reportError(OptionalValueAccess{exprType}, indexExpr->location);
+        }
+    }
+    else if (auto ut = get<UnionType>(exprType))
+    {
+        // if all of the typeArguments are a table type, the union must be a table, and so we shouldn't error.
+        if (!std::all_of(begin(ut), end(ut), getTableType))
+        {
+            switch (shouldSuppressErrors(NotNull{&normalizer}, exprType))
+            {
+            case ErrorSuppression::Suppress:
+                break;
+            case ErrorSuppression::NormalizationFailed:
+                reportError(NormalizationTooComplex{}, indexExpr->location);
+                [[fallthrough]];
+            case ErrorSuppression::DoNotSuppress:
+                reportError(NotATable{exprType}, indexExpr->location);
+            }
+        }
+    }
+    else if (auto it = get<IntersectionType>(exprType))
+    {
+        // if any of the typeArguments are a table type, the intersection must be a table, and so we shouldn't error.
+        if (!std::any_of(begin(it), end(it), getTableType))
+        {
+            // Luwu: an intersection with nothing in it (`number & ~number`) is `never`. Upstream says it isn't a table.
+            std::shared_ptr<const NormalizedType> norm = normalizer.normalize(exprType);
+            if (norm && isUninhabited(norm.get()))
+                reportUnreachableUse(indexExpr->expr, ImproperUse::Index);
+            else
+                reportError(NotATable{exprType}, indexExpr->location);
+        }
+    }
+    else if (get<NeverType>(exprType) || isErrorSuppressing(indexExpr->location, exprType))
+    {
+        // Nothing
+    }
+    else
+        reportError(NotATable{exprType}, indexExpr->location);
+}
+
+void TypeChecker2::visit(AstExprFunction* fn)
+{
+    InConditionalContext flipper(&typeContext, TypeContext::Default);
+
+    auto StackPusher = pushStack(fn);
+
+    EnclosingFunctionPusher functionPusher{enclosingFunctions, fn};
+
+    visitGenerics(fn->generics, fn->genericPacks);
+
+    // a default value is an ordinary expression, so it needs the same checks as any other (unknown
+    // globals, bad calls), not just the subtype test against its parameter's annotation below
+    for (AstExpr* argDefault : fn->argsDefaults)
+        if (argDefault)
+            visit(argDefault, ValueContext::RValue);
+
+    TypeId inferredFnTy = lookupType(fn);
+    functionDeclStack.push_back(inferredFnTy);
+
+    std::shared_ptr<const NormalizedType> normalizedFnTy = normalizer.normalize(inferredFnTy);
+    if (!normalizedFnTy)
+    {
+        reportError(CodeTooComplex{}, fn->location);
+    }
+    else if (get<ErrorType>(normalizedFnTy->errors))
+    {
+        // If we have an error type, we don't want to do anything else involving the normalized type
+        normalizedFnTy = nullptr;
+    }
+    else if (!normalizedFnTy->hasFunctions())
+    {
+        reportError(InternalError{"Internal error: Lambda has non-function type " + toString(inferredFnTy)}, fn->location);
+        return;
+    }
+    else
+    {
+        if (1 != normalizedFnTy->functions.parts.size())
+        {
+            reportError(InternalError{"Unexpected: Lambda has unexpected type " + toString(inferredFnTy)}, fn->location);
+            return;
+        }
+
+        const FunctionType* inferredFtv = get<FunctionType>(normalizedFnTy->functions.parts.front());
+        LUAU_ASSERT(inferredFtv);
+
+        // There is no way to write an annotation for the self argument, so we
+        // cannot do anything to check it.
+        auto argIt = begin(inferredFtv->argTypes);
+        if (fn->self)
+            ++argIt;
+
+        for (size_t i = 0; i < fn->args.size; ++i)
+        {
+            const auto& arg = fn->args.data[i];
+
+            if (argIt == end(inferredFtv->argTypes))
+                break;
+
+            TypeId inferredArgTy = *argIt;
+
+            if (arg->annotation)
+            {
+                // we need to typecheck any argument annotations themselves.
+                visit(arg->annotation);
+
+                TypeId annotatedArgTy = lookupAnnotation(arg->annotation);
+
+                if (FFlag::LuwuDefaultArguments)
+                {
+                    TypeId argTy = fn->argsDefaults.data[i] ? stripNil(builtinTypes, *module->internalTypes, inferredArgTy) : inferredArgTy;
+                    testIsSubtype(argTy, annotatedArgTy, arg->location);
+
+                    if (AstExpr* defaultValue = fn->argsDefaults.data[i])
+                        testPotentialLiteralIsSubtype(defaultValue, annotatedArgTy);
+                }
+                else
+                {
+                    testIsSubtype(inferredArgTy, annotatedArgTy, arg->location);
+                }
+            }
+
+            // Some Luau constructs can result in an argument type being
+            // reduced to never by inference. In this case, we want to
+            // report an error at the function, instead of reporting an
+            // error at every callsite.
+            if (is<NeverType>(follow(inferredArgTy)))
+            {
+                // If the annotation simplified to never, we don't want to
+                // even look at contributors.
+                bool explicitlyNever = false;
+                if (arg->annotation)
+                {
+                    TypeId annotatedArgTy = lookupAnnotation(arg->annotation);
+                    explicitlyNever = is<NeverType>(annotatedArgTy);
+                }
+
+                // Not following here is deliberate: the contribution map is
+                // keyed by type pointer, but that type pointer has, at some
+                // point, been transmuted to a bound type pointing to never.
+                if (const auto contributors = module->upperBoundContributors.find(inferredArgTy); contributors && !explicitlyNever)
+                {
+                    // It's unfortunate that we can't link error messages
+                    // together. For now, this will work.
+                    reportError(
+                        GenericError{format(
+                            "Parameter '%s' has been reduced to never. This function is not callable with any possible value.", arg->name.value
+                        )},
+                        arg->location
+                    );
+                    for (const auto& [site, component] : *contributors)
+                        reportError(
+                            ExtraInformation{
+                                format("Parameter '%s' is required to be a subtype of '%s' here.", arg->name.value, toString(component).c_str())
+                            },
+                            site
+                        );
+                }
+            }
+
+            ++argIt;
+        }
+
+        // we need to typecheck the vararg annotation, if it exists.
+        if (fn->vararg && fn->varargAnnotation)
+            visit(fn->varargAnnotation);
+
+        const AstStat* fallthrough = getFallthrough(fn->body);
+        if (fallthrough && !allowsNoReturnValues(follow(inferredFtv->retTypes)))
+        {
+            ReturnStatementFinder finder;
+            fn->body->visit(&finder);
+
+            if (!finder.found)
+            {
+                // With no return statement anywhere, this is the same mistake as writing a bare
+                // `return`, so it gets the same explanation rather than a second phrasing of it.
+                // There is no code path worth pointing at either -- there is only the one.
+                FunctionExitsWithoutReturning error{inferredFtv->retTypes};
+                error.overrideMessage = explainReturnCountMismatch(builtinTypes->emptyTypePack, inferredFtv->retTypes);
+                reportError(std::move(error), getEndLocation(fn));
+            }
+            else
+            {
+                // Upstream reports only the summary on the function's `end`. Luwu adds a second error on
+                // the code path that escapes, since the `end` doesn't say which path that is.
+                reportError(FunctionExitsWithoutReturning{inferredFtv->retTypes}, getEndLocation(fn));
+
+                const FallthroughSite site = classifyFallthrough(fallthrough);
+                FunctionExitsWithoutReturning pathError{inferredFtv->retTypes};
+                pathError.overrideMessage = describeFallthrough(site.kind, inferredFtv->retTypes);
+                reportError(std::move(pathError), site.location);
+            }
+        }
+    }
+
+    visit(fn->body);
+
+    // we need to typecheck the return annotation itself, if it exists.
+    if (fn->returnAnnotation)
+        visit(fn->returnAnnotation);
+
+    // Luwu try expressions
+    if (fn->errorHint)
+        visit(fn->errorHint);
+
+
+    // If the function type has a function annotation, we need to see if we can suggest an annotation
+    if (normalizedFnTy)
+        suggestAnnotations(fn, normalizedFnTy->functions.parts.front());
+
+    checkInferredReturns(fn);
+
+    functionDeclStack.pop_back();
+}
+
+void TypeChecker2::visit(AstExprTable* expr)
+{
+    InConditionalContext inContext(&typeContext, TypeContext::Default);
+
+    for (const AstExprTable::Item& item : expr->items)
+    {
+        if (item.key)
+            visit(item.key, ValueContext::RValue);
+        visit(item.value, ValueContext::RValue);
+    }
+
+    if (FFlag::LuwuHelpfulSubtypingErrors)
+    {
+        if (const TypeId* expected = module->astExpectedTypes.find(expr))
+        {
+            for (auto& [location, typo] : literalPropertyTypos(expr, *expected))
+                reportError(std::move(typo), location);
+        }
+    }
+}
+
+
+TypePackId TypeChecker2::returnedPack(AstStatReturn* ret)
+{
+    std::vector<TypeId> head;
+    std::optional<TypePackId> tail;
+    for (size_t i = 0; i < ret->list.size; ++i)
+    {
+        AstExpr* value = ret->list.data[i];
+        bool last = i + 1 == ret->list.size;
+        if (last && (value->is<AstExprCall>() || value->is<AstExprVarargs>()))
+            tail = lookupPack(value);
+        else
+            head.push_back(lookupType(value));
+    }
+    return module->internalTypes->addTypePack(TypePack{std::move(head), tail});
+}
+
+namespace
+{
+
+// Luwu: how many returns must agree before the one that differs is reported (InconsistentReturn)
+constexpr size_t kMinAgreeingReturns = 3;
+
+// Luwu: the most returned table or string literals compared for typos in one function. Each is compared with each.
+constexpr size_t kMaxComparedLiterals = 32;
+
+// Luwu: what a value returns as, for comparing it with other returns: a string or boolean literal as its type.
+TypeId widenLiteral(NotNull<BuiltinTypes> builtinTypes, TypeId ty)
+{
+    ty = follow(ty);
+    if (const SingletonType* singleton = get<SingletonType>(ty))
+    {
+        if (get<StringSingleton>(singleton))
+            return builtinTypes->stringType;
+        if (get<BooleanSingleton>(singleton))
+            return builtinTypes->booleanType;
+    }
+    return ty;
+}
+
+// Luwu: `nil`, `none` and `never` (a `return error(...)`) say nothing about what a function returns.
+bool isAbsence(TypeId ty)
+{
+    ty = follow(ty);
+    return isNil(ty) || isNone(ty) || get<NeverType>(ty);
+}
+
+AstExpr* stripGroups(AstExpr* expr)
+{
+    while (AstExprGroup* group = expr->as<AstExprGroup>())
+        expr = group->expr;
+    return expr;
+}
+
+// Luwu: a key or string literal a function returns, and where.
+struct Spelling
+{
+    std::string name;
+    // Its place among every spelling collected from the function's returns, in source order.
+    size_t order;
+    Location location;
+};
+
+// Luwu: of two spellings, the one to report as the typo: the one fewer returns use, or the later one if they tie.
+bool isTheTypo(const Spelling& written, const Spelling& other, const std::unordered_map<std::string, size_t>& uses)
+{
+    size_t writtenUses = uses.at(written.name);
+    size_t otherUses = uses.at(other.name);
+    if (writtenUses != otherUses)
+        return writtenUses < otherUses;
+    return written.order > other.order;
+}
+
+} // namespace
+
+// Luwu: the rules a function whose return type is inferred from its returns keeps (ConstraintSolver::
+// dispatchInferredReturn). Its returns join into one type, but some differences between them are almost always mistakes.
+void TypeChecker2::checkInferredReturns(const AstExprFunction* fn)
+{
+    std::vector<AstStatReturn*> returns = findOwnReturns(fn);
+    if (returns.size() < 2)
+        return;
+
+    Scope* scope = findInnermostScope(returns.front()->location);
+    if (!scope || !module->inferredReturnPacks.contains(follow(scope->returnType)))
+        return;
+
+    reportInconsistentReturn(returns);
+    reportReturnedKeyTypos(returns);
+    reportReturnedStringTypos(returns);
+}
+
+// Luwu: the one return whose values differ from what every other return agrees on, when at least
+// kMinAgreeingReturns agree. `nil`, `none` and `x :: any` returns don't count. Neither does a return ending in a variadic
+// or generic tail: its values can't be lined up with the others.
+void TypeChecker2::reportInconsistentReturn(const std::vector<AstStatReturn*>& returns)
+{
+    NotNull<Scope> scope = stack.back();
+
+    struct Returned
+    {
+        AstStatReturn* ret;
+        std::vector<TypeId> values;
+    };
+    std::vector<Returned> candidates;
+    for (AstStatReturn* ret : returns)
+    {
+        if (std::any_of(ret->list.begin(), ret->list.end(), isAnyCast))
+            continue;
+
+        auto [values, tail] = flatten(returnedPack(ret));
+        if (tail || std::all_of(values.begin(), values.end(), isAbsence))
+            continue;
+
+        for (TypeId& value : values)
+            value = widenLiteral(builtinTypes, value);
+        candidates.push_back(Returned{ret, std::move(values)});
+    }
+
+    if (candidates.size() < kMinAgreeingReturns + 1)
+        return;
+
+    auto isSubtype = [&](TypeId sub, TypeId super)
+    {
+        return subtyping->isSubtype(sub, super, scope).isSubtype;
+    };
+    auto agree = [&](const std::vector<TypeId>& a, const std::vector<TypeId>& b)
+    {
+        if (a.size() != b.size())
+            return false;
+        for (size_t i = 0; i < a.size(); ++i)
+        {
+            if (!isSubtype(a[i], b[i]) || !isSubtype(b[i], a[i]))
+                return false;
+        }
+        return true;
+    };
+
+    // With at most one return differing, two of the first three agree with each other and with the rest.
+    const Returned* reference = nullptr;
+    if (agree(candidates[0].values, candidates[1].values) || agree(candidates[0].values, candidates[2].values))
+        reference = &candidates[0];
+    else if (agree(candidates[1].values, candidates[2].values))
+        reference = &candidates[1];
+    else
+        return;
+
+    const Returned* odd = nullptr;
+    for (const Returned& candidate : candidates)
+    {
+        if (agree(candidate.values, reference->values))
+            continue;
+        if (odd)
+            return;
+        odd = &candidate;
+    }
+    if (!odd)
+        return;
+
+    // A missing or extra value is a surprise. A value made optional (`return find(x)` giving `T?` among `T`s), a subtype
+    // of theirs or a supertype isn't.
+    bool surprising = odd->values.size() != reference->values.size();
+    for (size_t i = 0; !surprising && i < odd->values.size(); ++i)
+    {
+        TypeId value = stripNil(builtinTypes, *module->internalTypes, odd->values[i]);
+        TypeId theirs = reference->values[i];
+        surprising = !isAbsence(value) && !isSubtype(value, theirs) && !isSubtype(theirs, odd->values[i]);
+    }
+
+    if (surprising)
+    {
+        TypePackId othersReturn = module->internalTypes->addTypePack(reference->values);
+        TypePackId returned = module->internalTypes->addTypePack(odd->values);
+        reportError(InconsistentReturn{candidates.size() - 1, othersReturn, returned}, odd->ret->location);
+    }
+}
+
+// Luwu: returned table literals whose keys are the same but for one pair spelled almost alike (`type` and `tpye`). The
+// spelling fewer returns use is the typo. A key only one table has is an optional field, not a typo.
+void TypeChecker2::reportReturnedKeyTypos(const std::vector<AstStatReturn*>& returns)
+{
+    // The keys of the tables returned at each position, and how many of those tables use each key.
+    std::vector<std::vector<std::vector<Spelling>>> tables;
+    std::vector<std::unordered_map<std::string, size_t>> uses;
+    size_t order = 0;
+    for (AstStatReturn* ret : returns)
+    {
+        for (size_t i = 0; i < ret->list.size; ++i)
+        {
+            AstExprTable* literal = stripGroups(ret->list.data[i])->as<AstExprTable>();
+            if (!literal)
+                continue;
+            if (tables.size() <= i)
+            {
+                tables.resize(i + 1);
+                uses.resize(i + 1);
+            }
+            if (tables[i].size() >= kMaxComparedLiterals)
+                continue;
+
+            std::vector<Spelling> keys;
+            for (const AstExprTable::Item& item : literal->items)
+            {
+                if (std::optional<std::string> name = literalPropertyName(item))
+                {
+                    keys.push_back(Spelling{*name, order++, item.key->location});
+                    ++uses[i][*name];
+                }
+            }
+            tables[i].push_back(std::move(keys));
+        }
+    }
+
+    // The keys of `keys` that `from` doesn't have.
+    auto missingFrom = [](const std::vector<Spelling>& keys, const std::vector<Spelling>& from)
+    {
+        std::vector<const Spelling*> missing;
+        for (const Spelling& key : keys)
+        {
+            bool found = std::any_of(
+                from.begin(),
+                from.end(),
+                [&](const Spelling& other)
+                {
+                    return other.name == key.name;
+                }
+            );
+            if (!found)
+                missing.push_back(&key);
+        }
+        return missing;
+    };
+
+    std::unordered_set<size_t> reported;
+    for (size_t i = 0; i < tables.size(); ++i)
+    {
+        for (size_t a = 0; a < tables[i].size(); ++a)
+        {
+            for (size_t b = a + 1; b < tables[i].size(); ++b)
+            {
+                const std::vector<Spelling>& left = tables[i][a];
+                const std::vector<Spelling>& right = tables[i][b];
+                if (left.size() != right.size())
+                    continue;
+
+                std::vector<const Spelling*> onlyLeft = missingFrom(left, right);
+                std::vector<const Spelling*> onlyRight = missingFrom(right, left);
+                if (onlyLeft.size() != 1 || onlyRight.size() != 1)
+                    continue;
+
+                const Spelling* written = onlyLeft.front();
+                const Spelling* meant = onlyRight.front();
+                if (!isTheTypo(*written, *meant, uses[i]))
+                    std::swap(written, meant);
+
+                if (looksLikeTypo(written->name, meant->name) && reported.insert(written->order).second)
+                    reportError(Typo{written->name, meant->name}, written->location);
+            }
+        }
+    }
+}
+
+// Luwu: returned string literals one edit apart (`"sucess"` and `"success"`), each at least kMinTypoStringLength long. The
+// spelling fewer returns use is the typo.
+void TypeChecker2::reportReturnedStringTypos(const std::vector<AstStatReturn*>& returns)
+{
+    // Shorter strings one edit apart are as often different words (`"add"`, `"and"`).
+    constexpr size_t kMinTypoStringLength = 4;
+
+    std::vector<std::vector<Spelling>> literals;
+    std::vector<std::unordered_map<std::string, size_t>> uses;
+    size_t order = 0;
+    for (AstStatReturn* ret : returns)
+    {
+        for (size_t i = 0; i < ret->list.size; ++i)
+        {
+            AstExprConstantString* literal = stripGroups(ret->list.data[i])->as<AstExprConstantString>();
+            if (!literal || literal->value.size < kMinTypoStringLength)
+                continue;
+            if (literals.size() <= i)
+            {
+                literals.resize(i + 1);
+                uses.resize(i + 1);
+            }
+            if (literals[i].size() >= kMaxComparedLiterals)
+                continue;
+
+            std::string value(literal->value.data, literal->value.size);
+            literals[i].push_back(Spelling{value, order++, literal->location});
+            ++uses[i][value];
+        }
+    }
+
+    for (size_t i = 0; i < literals.size(); ++i)
+    {
+        for (const Spelling& written : literals[i])
+        {
+            for (const Spelling& meant : literals[i])
+            {
+                if (written.name == meant.name || !withinOneEdit(written.name, meant.name) || !isTheTypo(written, meant, uses[i]))
+                    continue;
+
+                reportError(Typo{written.name, meant.name}, written.location);
+                break;
+            }
+        }
+    }
+}
+
+// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): an instance of a generic class (`History<number>`) shares
+// its class's metatable, whose metamethods still mention the class's own generics, so they can't be checked against
+// the instance's type arguments.
+static bool hasUninstantiatedMetamethods(TypeId containerTy)
+{
+    const ExternType* externType = get<ExternType>(follow(containerTy));
+    return externType && (!externType->instantiatedTypeParams.empty() || !externType->instantiatedTypePackParams.empty());
+}
+
+// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): how push and pop errors name each operator
+struct PushPopOperator
+{
+    const char* op;
+    // what the operator does to the container: "push to" or "pop from"
+    const char* action;
+    const char* metamethod;
+};
+
+static const PushPopOperator kPush{"<+", "push to", "__push"};
+static const PushPopOperator kPop{"<-", "pop from", "__pop"};
+
+// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): the element type of a container `op` stores into or
+// removes from raw, which is an array. Reports why when the container isn't one, and returns nullopt.
+std::optional<TypeId> TypeChecker2::pushedOrPoppedElement(TypeId containerTy, const PushPopOperator& op, const Location& location)
+{
+    ErrorVec dummy;
+    TypeId tableTy = follow(containerTy);
+
+    if (const MetatableType* metatable = get<MetatableType>(tableTy))
+    {
+        if (findMetatableEntry(builtinTypes, dummy, containerTy, "__newindex", location))
+        {
+            reportError(
+                GenericError{format(
+                    "'%s' skips the '__newindex' metamethod of '%s'; give its metatable a '%s' to handle it",
+                    op.op,
+                    toString(containerTy).c_str(),
+                    op.metamethod
+                )},
+                location
+            );
+            return std::nullopt;
+        }
+
+        tableTy = follow(metatable->table);
+    }
+
+    if (const TableType* table = get<TableType>(tableTy))
+    {
+        if (std::optional<TypeId> element = rawArrayElement(*table, builtinTypes))
+            return element;
+
+        reportError(
+            GenericError{format(
+                "'%s' isn't an array; '%s' only works on arrays and on values with a '%s' metamethod",
+                toString(containerTy).c_str(),
+                op.op,
+                op.metamethod
+            )},
+            location
+        );
+        return std::nullopt;
+    }
+
+    // a union, an intersection or a generic could be anything; its uses say more than this one does
+    bool structureUnknown = get<UnionType>(tableTy) || get<IntersectionType>(tableTy) || get<GenericType>(tableTy);
+    if (structureUnknown && !isOptional(containerTy))
+        return std::nullopt;
+
+    if (isOptional(containerTy))
+        reportError(OptionalValueAccess{containerTy}, location);
+    else if (get<ExternType>(tableTy))
+        reportError(GenericError{format("'%s' has no '%s' metamethod for '%s' to call", toString(containerTy).c_str(), op.metamethod, op.op)}, location);
+    else
+        reportError(
+            GenericError{format("Expected '%s' to %s a container, got '%s' instead", op.op, op.action, toString(containerTy).c_str())}, location
+        );
+
+    return std::nullopt;
+}
+
+// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): a container with `__push` takes every value in one call,
+// and an array takes values of its element type. nil pushes nothing, so `T?` fits `{T}`.
+void TypeChecker2::visit(AstStatPush* stat)
+{
+    visit(stat->target, ValueContext::RValue);
+    for (AstExpr* value : stat->values)
+        visit(value, ValueContext::RValue);
+
+    TypeId containerTy = lookupType(stat->target);
+    if (isErrorSuppressing(stat->target->location, containerTy))
+        return;
+
+    // the values in order, with the expression each came from; a call or `...` last contributes its whole pack
+    struct PushedValue
+    {
+        TypeId type;
+        Location location;
+        AstExpr* expr = nullptr;
+    };
+    std::vector<PushedValue> values;
+    std::optional<TypePackId> tail;
+    for (size_t i = 0; i < stat->values.size; ++i)
+    {
+        AstExpr* value = stat->values.data[i];
+        bool multRet = i + 1 == stat->values.size && (value->is<AstExprCall>() || value->is<AstExprVarargs>());
+        if (!multRet)
+        {
+            values.push_back({lookupType(value), value->location, value});
+            continue;
+        }
+
+        auto [head, packTail] = flatten(lookupPack(value));
+        for (TypeId ty : head)
+            values.push_back({ty, value->location});
+        tail = packTail;
+    }
+
+    ErrorVec dummy;
+    if (std::optional<TypeId> pushFn = findMetatableEntry(builtinTypes, dummy, containerTy, kPush.metamethod, stat->location))
+    {
+        if (hasUninstantiatedMetamethods(containerTy))
+            return;
+
+        std::vector<TypeId> args{containerTy};
+        for (const PushedValue& value : values)
+            args.push_back(value.type);
+
+        TypePackId argsPack = module->internalTypes->addTypePack(TypePack{std::move(args), tail});
+        TypeId expectedFunction = module->internalTypes->addType(FunctionType{argsPack, builtinTypes->anyTypePack});
+        testIsSubtype(*pushFn, expectedFunction, stat->location);
+        return;
+    }
+
+    std::optional<TypeId> element = pushedOrPoppedElement(containerTy, kPush, stat->target->location);
+    if (!element)
+        return;
+
+    // nil pushes nothing, so only the rest of each value's type has to fit
+    auto checkValue = [&](TypeId ty, const Location& location, AstExpr* expr)
+    {
+        if (isNil(follow(ty)))
+            return;
+
+        // A table literal is checked the way an annotated local's value is, so it may leave out optional fields
+        if (expr && expr->is<AstExprTable>())
+        {
+            testPotentialLiteralIsSubtype(expr, *element);
+            return;
+        }
+
+        testIsSubtype(stripNil(builtinTypes, *module->internalTypes, ty), *element, location);
+    };
+
+    for (const PushedValue& value : values)
+        checkValue(value.type, value.location, value.expr);
+
+    if (tail)
+    {
+        if (const VariadicTypePack* variadic = get<VariadicTypePack>(follow(*tail)))
+            checkValue(variadic->ty, stat->values.data[stat->values.size - 1]->location, nullptr);
+    }
+}
+
+// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): see popTypeFunction for the result's type
+void TypeChecker2::visit(AstExprPop* expr)
+{
+    visit(expr->expr, ValueContext::RValue);
+
+    TypeId containerTy = lookupType(expr->expr);
+    if (isErrorSuppressing(expr->expr->location, containerTy))
+        return;
+
+    ErrorVec dummy;
+    if (std::optional<TypeId> popFn = findMetatableEntry(builtinTypes, dummy, containerTy, kPop.metamethod, expr->location))
+    {
+        if (hasUninstantiatedMetamethods(containerTy))
+            return;
+
+        TypePackId argsPack = module->internalTypes->addTypePack({containerTy});
+        TypeId expectedFunction = module->internalTypes->addType(FunctionType{argsPack, builtinTypes->anyTypePack});
+        testIsSubtype(*popFn, expectedFunction, expr->location);
+        return;
+    }
+
+    pushedOrPoppedElement(containerTy, kPop, expr->expr->location);
+}
+
+void TypeChecker2::visit(AstExprUnary* expr)
+{
+    std::optional<InConditionalContext> inContext;
+    if (expr->op != AstExprUnary::Op::Not)
+        inContext.emplace(&typeContext, TypeContext::Default);
+
+    visit(expr->expr, ValueContext::RValue);
+
+    TypeId operandType = lookupType(expr->expr);
+    TypeId resultType = lookupType(expr);
+
+    if (isErrorSuppressing(expr->expr->location, operandType))
+        return;
+
+    if (auto it = kUnaryOpMetamethods.find(expr->op); it != kUnaryOpMetamethods.end())
+    {
+        std::optional<TypeId> mm = findMetatableEntry(builtinTypes, module->errors, operandType, it->second, expr->location);
+        if (mm)
+        {
+            if (const FunctionType* ftv = get<FunctionType>(follow(*mm)))
+            {
+                if (std::optional<TypeId> ret = first(ftv->retTypes))
+                {
+                    if (expr->op == AstExprUnary::Op::Len)
+                    {
+                        testIsSubtype(follow(*ret), builtinTypes->numberType, expr->location);
+                    }
+                }
+                else
+                {
+                    reportError(GenericError{format("Metamethod '%s' must return a value", it->second)}, expr->location);
+                }
+
+                std::optional<TypeId> firstArg = first(ftv->argTypes);
+                if (!firstArg)
+                {
+                    reportError(GenericError{"__unm metamethod must accept one argument"}, expr->location);
+                    return;
+                }
+
+                TypePackId expectedArgs = module->internalTypes->addTypePack({operandType});
+                TypePackId expectedRet = module->internalTypes->addTypePack({resultType});
+
+                TypeId expectedFunction = module->internalTypes->addType(FunctionType{expectedArgs, expectedRet});
+
+                bool success = testIsSubtype(*mm, expectedFunction, expr->location);
+                if (!success)
+                    return;
+            }
+
+            return;
+        }
+    }
+
+    if (expr->op == AstExprUnary::Op::Len)
+    {
+        DenseHashSet<TypeId> seen{nullptr};
+        int recursionCount = 0;
+        std::shared_ptr<const NormalizedType> nty = normalizer.normalize(operandType);
+
+        if (nty && nty->shouldSuppressErrors())
+            return;
+
+        switch (normalizer.isInhabited(nty.get()))
+        {
+        case NormalizationResult::True:
+            break;
+        case NormalizationResult::False:
+            return;
+        case NormalizationResult::HitLimits:
+            reportError(NormalizationTooComplex{}, expr->location);
+            return;
+        }
+
+        if (!hasLength(operandType, seen, &recursionCount))
+        {
+            if (isOptional(operandType))
+                reportError(OptionalValueAccess{operandType}, expr->location);
+            else
+                reportError(NotATable{operandType}, expr->location);
+        }
+    }
+    else if (expr->op == AstExprUnary::Op::Minus)
+    {
+        testIsSubtype(operandType, builtinTypes->numberType, expr->location);
+    }
+    else if (expr->op == AstExprUnary::Op::Not)
+    {
+    }
+    else
+    {
+        LUAU_ASSERT(!"Unhandled unary operator");
+    }
+}
+
+// Comparisons between disjoint typeArguments is usually something we warn on, but there are some special exceptions.
+static bool isOkToCompare(
+    Normalizer& normalizer,
+    NormalizationResult typesHaveIntersection,
+    const std::shared_ptr<const NormalizedType>& normLeft,
+    const std::shared_ptr<const NormalizedType>& normRight
+)
+{
+    // We only consider warning if we know that the typeArguments are disjoint. If
+    // normalization fails here, it should have also failed elsewhere and will
+    // already have been reported.
+    if (NormalizationResult::False != typesHaveIntersection)
+        return true;
+
+    // We allow anything to be compared to nil or none.
+    if (normLeft->isNil() || normRight->isNil() || normLeft->isNone() || normRight->isNone())
+        return true;
+
+    // Comparison with never is always ok.
+    else if (NormalizationResult::True != normalizer.isInhabited(normLeft.get()) ||
+             NormalizationResult::True != normalizer.isInhabited(normRight.get()))
+        return true;
+
+    // Comparisons between different string singleton typeArguments is allowed even
+    // if their intersection is technically uninhabited.
+    else if (!normLeft->strings.isNever() && !normRight->strings.isNever())
+        return true;
+
+    return false;
+};
+
+static bool isComparisonOp(AstExprBinary::Op op)
+{
+    return op == AstExprBinary::CompareNe || op == AstExprBinary::CompareEq || op == AstExprBinary::CompareGe || op == AstExprBinary::CompareGt ||
+           op == AstExprBinary::CompareLe || op == AstExprBinary::CompareLt;
+}
+
+struct TypeQuery
+{
+    std::string_view function; // "type" or "typeof"
+    AstExpr* argument;
+};
+
+// `type(x)` or `typeof(x)`, where `type`/`typeof` is the global
+static std::optional<TypeQuery> matchTypeQuery(AstExpr* expr)
+{
+    AstExprCall* call = expr->as<AstExprCall>();
+    if (!call || call->self || call->args.size != 1)
+        return std::nullopt;
+
+    AstExprGlobal* global = call->func->as<AstExprGlobal>();
+    if (!global)
+        return std::nullopt;
+
+    std::string_view name = global->name.value;
+    if (name != "type" && name != "typeof")
+        return std::nullopt;
+
+    return TypeQuery{name, call->args.data[0]};
+}
+
+// What to check instead, for a value of type `queriedTy` (an object, class or trait value): its class, or the trait its
+// declared type names.
+static std::optional<std::string> luwuNominalCheckHint(TypeId queriedTy)
+{
+    const ExternType* etv = get<ExternType>(follow(queriedTy));
+    if (!etv || !etv->relation)
+        return std::nullopt;
+
+    const Klass* klass = etv->relation->get_if<Klass>();
+    if (!klass)
+        return std::nullopt;
+
+    const char* declarationKind = luwuNominalKind(klass->ty);
+    bool isTrait = declarationKind && std::string_view(declarationKind) == "trait";
+    return luwuNominalCheckSuggestion(etv->name, isTrait);
+}
+
+static std::string luwuNominalTypeComparisonMessage(
+    std::string_view queryFunction,
+    std::string_view compared,
+    TypeId queriedTy,
+    const char* kind,
+    bool comparesEqual
+)
+{
+    std::string_view result = comparesEqual ? "false" : "true";
+    std::string message = "'" + std::string(queryFunction) + "' of " + describeLuwuNominalValue(queriedTy) + " is always \"" + kind +
+                          "\", so comparing it with \"" + std::string(compared) + "\" is always " + std::string(result);
+
+    if (std::optional<std::string> hint = luwuNominalCheckHint(queriedTy))
+        message += "; " + *hint;
+
+    return message;
+}
+
+void TypeChecker2::checkLuwuNominalTypeComparison(AstExprBinary* expr)
+{
+    std::optional<TypeQuery> query = matchTypeQuery(expr->left);
+    AstExpr* other = expr->right;
+    if (!query)
+    {
+        query = matchTypeQuery(expr->right);
+        other = expr->left;
+    }
+
+    AstExprConstantString* compared = other->as<AstExprConstantString>();
+    if (!query || !compared)
+        return;
+
+    TypeId queriedTy = lookupType(query->argument);
+    const char* kind = luwuNominalKind(queriedTy);
+    std::string_view comparedName{compared->value.data, compared->value.size};
+    if (!kind || comparedName == kind)
+        return;
+
+    bool comparesEqual = expr->op == AstExprBinary::Op::CompareEq;
+    reportError(GenericError{luwuNominalTypeComparisonMessage(query->function, comparedName, queriedTy, kind, comparesEqual)}, expr->location);
+}
+
+TypeId TypeChecker2::visit(AstExprBinary* expr, AstNode* overrideKey)
+{
+    std::optional<InConditionalContext> inContext;
+    if (expr->op != AstExprBinary::And && expr->op != AstExprBinary::Or && expr->op != AstExprBinary::CompareEq &&
+        expr->op != AstExprBinary::CompareNe)
+        inContext.emplace(&typeContext, TypeContext::Default);
+
+    // In compound assignments, the left side is both read-from and written-to, so we have to visit it in both contexts.
+    if (overrideKey && overrideKey->is<AstStatCompoundAssign>())
+        visit(expr->left, ValueContext::LValue);
+
+    visit(expr->left, ValueContext::RValue);
+    visit(expr->right, ValueContext::RValue);
+
+    NotNull<Scope> scope = stack.back();
+
+    bool isEquality = expr->op == AstExprBinary::Op::CompareEq || expr->op == AstExprBinary::Op::CompareNe;
+    bool isComparison = isComparisonOp(expr->op);
+    bool isLogical = expr->op == AstExprBinary::Op::And || expr->op == AstExprBinary::Op::Or;
+
+    if (isEquality)
+        checkLuwuNominalTypeComparison(expr);
+
+    TypeId leftType = follow(lookupType(expr->left));
+    TypeId rightType = follow(lookupType(expr->right));
+    TypeId expectedResult = follow(lookupType(expr));
+
+    if (get<TypeFunctionInstanceType>(expectedResult))
+    {
+        checkForInternalTypeFunction(expectedResult, expr->location);
+        return expectedResult;
+    }
+
+    if (expr->op == AstExprBinary::Op::Or)
+    {
+        leftType = stripNil(builtinTypes, *module->internalTypes, leftType);
+    }
+
+    std::shared_ptr<const NormalizedType> normLeft = normalizer.normalize(leftType);
+    std::shared_ptr<const NormalizedType> normRight = normalizer.normalize(rightType);
+
+    bool isStringOperation =
+        (normLeft ? normLeft->isSubtypeOfString() : isString(leftType)) && (normRight ? normRight->isSubtypeOfString() : isString(rightType));
+    leftType = follow(leftType);
+    if (get<AnyType>(leftType) || get<ErrorType>(leftType) || get<NeverType>(leftType))
+        return leftType;
+    else if (get<AnyType>(rightType) || get<ErrorType>(rightType) || get<NeverType>(rightType))
+        return rightType;
+    else if ((normLeft && normLeft->shouldSuppressErrors()) || (normRight && normRight->shouldSuppressErrors()))
+        return builtinTypes->anyType; // we can't say anything better if it's error suppressing but not any or error alone.
+
+    if ((get<BlockedType>(leftType) || get<FreeType>(leftType) || get<GenericType>(leftType)) && !isEquality && !isLogical)
+    {
+        auto name = getIdentifierOfBaseVar(expr->left);
+        reportError(
+            CannotInferBinaryOperation{
+                expr->op,
+                std::move(name),
+                isComparison ? CannotInferBinaryOperation::OpKind::Comparison : CannotInferBinaryOperation::OpKind::Operation
+            },
+            expr->location
+        );
+        return leftType;
+    }
+
+    NormalizationResult typesHaveIntersection = normalizer.isIntersectionInhabited(leftType, rightType);
+
+    if (isEquality || isComparison)
+    {
+        if (!isOkToCompare(normalizer, typesHaveIntersection, normLeft, normRight))
+        {
+            CannotCompareUnrelatedTypes error{leftType, rightType, expr->op, bindingName(expr->left), bindingName(expr->right)};
+            reportError(std::move(error), expr->location);
+            return builtinTypes->errorType;
+        }
+
+        auto eitherExprIsNil = (normLeft && (normLeft->isNil() || normLeft->hasNones())) || (normRight && (normRight->isNil() || normRight->hasNones()));
+
+        // For equality operations, if either operand is nil, we should allow this comparison through
+        if (isEquality && eitherExprIsNil)
+            return builtinTypes->booleanType;
+    }
+    if (auto it = kBinaryOpMetamethods.find(expr->op); it != kBinaryOpMetamethods.end())
+    {
+        std::optional<TypeId> leftMt = getMetatable(leftType, builtinTypes);
+        std::optional<TypeId> rightMt = getMetatable(rightType, builtinTypes);
+        bool matches = leftMt == rightMt;
+
+
+        if (isEquality && !matches)
+        {
+            auto testUnion = [&matches, builtinTypes = this->builtinTypes](const UnionType* utv, std::optional<TypeId> otherMt)
+            {
+                for (TypeId option : utv)
+                {
+                    if (getMetatable(follow(option), builtinTypes) == otherMt)
+                    {
+                        matches = true;
+                        break;
+                    }
+                }
+            };
+
+            if (const UnionType* utv = get<UnionType>(leftType); utv && rightMt)
+            {
+                testUnion(utv, rightMt);
+            }
+
+            if (const UnionType* utv = get<UnionType>(rightType); utv && leftMt && !matches)
+            {
+                testUnion(utv, leftMt);
+            }
+        }
+
+        // If we're working with things that are not tables, the metatable comparisons above are a little excessive
+        // It's ok for one type to have a meta table and the other to not. In that case, we should fall back on
+        // checking if the intersection of the typeArguments is inhabited. If `typesHaveIntersection` failed due to limits,
+        // TODO: Maybe add more checks here (e.g. for functions, extern typeArguments, etc)
+        if (!(get<TableType>(leftType) || get<TableType>(rightType)))
+            if (!leftMt.has_value() || !rightMt.has_value())
+                matches = matches || typesHaveIntersection != NormalizationResult::False;
+
+        if (!matches && isComparison)
+        {
+            reportError(
+                GenericError{format(
+                    "Types %s and %s cannot be compared with %s because they do not have the same metatable",
+                    toString(leftType).c_str(),
+                    toString(rightType).c_str(),
+                    toString(expr->op).c_str()
+                )},
+                expr->location
+            );
+
+            return builtinTypes->errorType;
+        }
+
+        std::optional<TypeId> mm;
+        if (std::optional<TypeId> leftMm = findMetatableEntry(builtinTypes, module->errors, leftType, it->second, expr->left->location))
+            mm = leftMm;
+        else if (std::optional<TypeId> rightMm = findMetatableEntry(builtinTypes, module->errors, rightType, it->second, expr->right->location))
+        {
+            mm = rightMm;
+            std::swap(leftType, rightType);
+        }
+
+        if (mm)
+        {
+            AstNode* key = expr;
+            if (overrideKey != nullptr)
+                key = overrideKey;
+
+            TypeId* selectedOverloadTy = module->astOverloadResolvedTypes.find(key);
+            if (!selectedOverloadTy)
+            {
+                // reportError(CodeTooComplex{}, expr->location);
+                // was handled by a type function
+                return expectedResult;
+            }
+
+            else if (const FunctionType* ftv = get<FunctionType>(follow(*selectedOverloadTy)))
+            {
+                TypePackId expectedArgs;
+                // For >= and > we invoke __lt and __le respectively with
+                // swapped argument ordering.
+                if (expr->op == AstExprBinary::Op::CompareGe || expr->op == AstExprBinary::Op::CompareGt)
+                {
+                    expectedArgs = module->internalTypes->addTypePack({rightType, leftType});
+                }
+                else
+                {
+                    expectedArgs = module->internalTypes->addTypePack({leftType, rightType});
+                }
+
+                TypePackId expectedRets;
+                if (expr->op == AstExprBinary::CompareEq || expr->op == AstExprBinary::CompareNe || expr->op == AstExprBinary::CompareGe ||
+                    expr->op == AstExprBinary::CompareGt || expr->op == AstExprBinary::Op::CompareLe || expr->op == AstExprBinary::Op::CompareLt)
+                {
+                    expectedRets = module->internalTypes->addTypePack({builtinTypes->booleanType});
+                }
+                else
+                {
+                    expectedRets = module->internalTypes->addTypePack({module->internalTypes->freshType(builtinTypes, scope, TypeLevel{})});
+                }
+
+                TypeId expectedTy = module->internalTypes->addType(FunctionType(expectedArgs, expectedRets));
+
+                testIsSubtype(follow(*mm), expectedTy, expr->location);
+
+                std::optional<TypeId> ret = first(ftv->retTypes);
+                if (ret)
+                {
+                    if (isComparison)
+                    {
+                        if (!isBoolean(follow(*ret)))
+                        {
+                            reportError(GenericError{format("Metamethod '%s' must return a boolean", it->second)}, expr->location);
+                        }
+
+                        return builtinTypes->booleanType;
+                    }
+                    else
+                    {
+                        return follow(*ret);
+                    }
+                }
+                else
+                {
+                    if (isComparison)
+                    {
+                        reportError(GenericError{format("Metamethod '%s' must return a boolean", it->second)}, expr->location);
+                    }
+                    else
+                    {
+                        reportError(GenericError{format("Metamethod '%s' must return a value", it->second)}, expr->location);
+                    }
+
+                    return builtinTypes->errorType;
+                }
+            }
+            else
+            {
+                reportError(CannotCallNonFunction{*mm}, expr->location);
+            }
+
+            return builtinTypes->errorType;
+        }
+        // If this is a string comparison, or a concatenation of strings, we
+        // want to fall through to primitive behavior.
+        else if (!isEquality && !(isStringOperation && (expr->op == AstExprBinary::Op::Concat || isComparison)))
+        {
+            if ((leftMt && !isString(leftType)) || (rightMt && !isString(rightType)))
+            {
+                if (isComparison)
+                {
+                    reportError(CannotCompareUnrelatedTypes{leftType, rightType, expr->op}, expr->location);
+                }
+                else
+                {
+                    reportError(
+                        GenericError{format(
+                            "Operator %s is not applicable for '%s' and '%s' because neither type's metatable has a '%s' metamethod",
+                            toString(expr->op).c_str(),
+                            toString(leftType).c_str(),
+                            toString(rightType).c_str(),
+                            it->second
+                        )},
+                        expr->location
+                    );
+                }
+
+                return builtinTypes->errorType;
+            }
+            else if (!leftMt && !rightMt && (get<TableType>(leftType) || get<TableType>(rightType)))
+            {
+                if (isComparison)
+                {
+                    reportError(CannotCompareUnrelatedTypes{leftType, rightType, expr->op}, expr->location);
+                }
+                else
+                {
+                    reportError(
+                        GenericError{format(
+                            "Operator %s is not applicable for '%s' and '%s' because neither type has a metatable",
+                            toString(expr->op).c_str(),
+                            toString(leftType).c_str(),
+                            toString(rightType).c_str()
+                        )},
+                        expr->location
+                    );
+                }
+
+                return builtinTypes->errorType;
+            }
+        }
+    }
+
+    switch (expr->op)
+    {
+    case AstExprBinary::Op::Add:
+    case AstExprBinary::Op::Sub:
+    case AstExprBinary::Op::Mul:
+    case AstExprBinary::Op::Div:
+    case AstExprBinary::Op::FloorDiv:
+    case AstExprBinary::Op::Pow:
+    case AstExprBinary::Op::Mod:
+        testIsSubtype(leftType, builtinTypes->numberType, expr->left->location);
+        testIsSubtype(rightType, builtinTypes->numberType, expr->right->location);
+
+        return builtinTypes->numberType;
+    case AstExprBinary::Op::Concat:
+    {
+        const TypeId numberOrString = module->internalTypes->addType(UnionType{{builtinTypes->numberType, builtinTypes->stringType}});
+        testIsSubtype(leftType, numberOrString, expr->left->location);
+        testIsSubtype(rightType, numberOrString, expr->right->location);
+        return builtinTypes->stringType;
+    }
+    case AstExprBinary::Op::CompareGe:
+    case AstExprBinary::Op::CompareGt:
+    case AstExprBinary::Op::CompareLe:
+    case AstExprBinary::Op::CompareLt:
+    {
+        if (normLeft && normLeft->shouldSuppressErrors())
+            return builtinTypes->booleanType;
+
+        // if we're comparing against an uninhabited type, it's unobservable that the comparison did not run
+        if (normLeft && normalizer.isInhabited(normLeft.get()) == NormalizationResult::False)
+            return builtinTypes->booleanType;
+
+        // This could be a little wasteful, as we already have normalized
+        // types, but correctly handles cases like `_: (T & number) <= _: (T & number)`.
+        if (subtyping->isSubtype(leftType, builtinTypes->numberType, scope).isSubtype)
+        {
+            testIsSubtype(rightType, builtinTypes->numberType, expr->right->location);
+            return builtinTypes->booleanType;
+        }
+
+        if (subtyping->isSubtype(leftType, builtinTypes->stringType, scope).isSubtype)
+        {
+            testIsSubtype(rightType, builtinTypes->stringType, expr->right->location);
+            return builtinTypes->booleanType;
+        }
+
+        // A relational operator on an optional fails because of the `nil`, not because the two types
+        // are unrelated to each other; say which operand it is. See describeOptionalOperands.
+        std::string comparisonError = format(
+            "Types '%s' and '%s' cannot be compared with relational operator %s",
+            toString(leftType).c_str(),
+            toString(rightType).c_str(),
+            toString(expr->op).c_str()
+        );
+
+        if (std::optional<std::string> nilClause = describeOptionalOperands(leftType, rightType))
+            comparisonError += "; " + *nilClause;
+
+        reportError(GenericError{std::move(comparisonError)}, expr->location);
+        return builtinTypes->errorType;
+    }
+
+    case AstExprBinary::Op::And:
+    case AstExprBinary::Op::Or:
+    case AstExprBinary::Op::CompareEq:
+    case AstExprBinary::Op::CompareNe:
+        // Ugly case: we don't care about this possibility, because a
+        // compound assignment will never exist with one of these operators.
+        return builtinTypes->anyType;
+    default:
+        // Unhandled AstExprBinary::Op possibility.
+        LUAU_ASSERT(false);
+        return builtinTypes->errorType;
+    }
+}
+
+void TypeChecker2::visit(AstExprTypeAssertion* expr)
+{
+    AstExpr* operand = expr->expr;
+    while (AstExprGroup* group = operand->as<AstExprGroup>())
+        operand = group->expr;
+    if (AstExprLocal* local = operand->as<AstExprLocal>())
+        noTypeUsesCast.insert(local);
+
+    visit(expr->expr, ValueContext::RValue);
+    visit(expr->annotation);
+
+    TypeId annotationType = lookupAnnotation(expr->annotation);
+    TypeId computedType = lookupType(expr->expr);
+
+    switch (shouldSuppressErrors(NotNull{&normalizer}, computedType).orElse(shouldSuppressErrors(NotNull{&normalizer}, annotationType)))
+    {
+    case ErrorSuppression::Suppress:
+        return;
+    case ErrorSuppression::NormalizationFailed:
+        reportError(NormalizationTooComplex{}, expr->location);
+        return;
+    case ErrorSuppression::DoNotSuppress:
+        break;
+    }
+
+    switch (normalizer.isInhabited(computedType))
+    {
+    case NormalizationResult::True:
+        break;
+    case NormalizationResult::False:
+        return;
+    case NormalizationResult::HitLimits:
+        reportError(NormalizationTooComplex{}, expr->location);
+        return;
+    }
+
+    switch (normalizer.isIntersectionInhabited(computedType, annotationType))
+    {
+    case NormalizationResult::True:
+        return;
+    case NormalizationResult::False:
+        reportError(TypesAreUnrelated{computedType, annotationType}, expr->location);
+        break;
+    case NormalizationResult::HitLimits:
+        reportError(NormalizationTooComplex{}, expr->location);
+        break;
+    }
+}
+
+void TypeChecker2::visit(AstExprIfElse* expr)
+{
+    InConditionalContext inContext(&typeContext, TypeContext::Default);
+    visitIfCondition(expr->condition, expr->clauses);
+    visit(expr->trueExpr, ValueContext::RValue);
+    visit(expr->falseExpr, ValueContext::RValue);
+}
+
+// Luwu Do Expressions (rfcs/do-expressions.md)
+void TypeChecker2::visit(AstExprDo* expr)
+{
+    InConditionalContext inContext(&typeContext, TypeContext::Default);
+    visit(expr->body);
+}
+
+// Luwu Do Expressions (rfcs/do-expressions.md)
+void TypeChecker2::visit(AstStatGive* give)
+{
+    visit(give->value, ValueContext::RValue);
+}
+
+// Luwu Table Comprehensions (rfcs/table-comprehensions.md): the loop is checked like any loop, then the item against the
+// table's indexer, which an annotation may have decided. A nil value adds nothing, so the value may be nil even when
+// the element type isn't.
+void TypeChecker2::visit(AstExprTableComprehension* expr)
+{
+    InConditionalContext inContext(&typeContext, TypeContext::Default);
+    visit(expr->loop);
+
+    const TableType* ttv = get<TableType>(follow(lookupType(expr)));
+    if (!ttv || !ttv->indexer)
+        return;
+
+    AstStatComprehensionItem* item = expr->item;
+
+    if (item->key)
+        testIsSubtype(lookupType(item->key), ttv->indexer->indexType, item->key->location);
+
+    // Accepted against `element | nil`, but reported against the element type, which is what the reader wrote. Checked as
+    // a literal like a list literal's items, so `tags = {}` fits a `{ string }` property.
+    TypeId valueType = lookupType(item->value);
+    TypeId elementOrNil = module->internalTypes->addType(UnionType{{ttv->indexer->indexResultType, builtinTypes->nilType}});
+    NotNull<Scope> scope{findInnermostScope(item->value->location)};
+
+    if (!subtyping->isSubtype(valueType, elementOrNil, scope).isSubtype)
+        testPotentialLiteralIsSubtype(item->value, ttv->indexer->indexResultType);
+}
+
+// Luwu Table Comprehensions (rfcs/table-comprehensions.md): see visit(AstExprTableComprehension*)
+void TypeChecker2::visit(AstStatComprehensionItem* item)
+{
+    if (item->key)
+        visit(item->key, ValueContext::RValue);
+
+    visit(item->value, ValueContext::RValue);
+}
+
+void TypeChecker2::visit(AstExprInstantiate* explicitTypeInstantiation)
+{
+    visit(explicitTypeInstantiation->expr, ValueContext::RValue);
+
+    // Luwu Classes (rfcs/classes): `Box<<string>>` instantiates the constructor (a trait's `__create`)
+    TypeId instantiated = lookupType(explicitTypeInstantiation->expr);
+    if (FFlag::LuwuClasses)
+        instantiated = classValueCallType(builtinTypes, instantiated).value_or(instantiated);
+
+    checkTypeInstantiation(
+        explicitTypeInstantiation->expr,
+        instantiated,
+        explicitTypeInstantiation->location,
+        explicitTypeInstantiation->typeArguments
+    );
+}
+
+void TypeChecker2::visit(AstExprInterpString* interpString)
+{
+    InConditionalContext inContext(&typeContext, TypeContext::Default);
+
+    for (AstExpr* expr : interpString->expressions)
+        visit(expr, ValueContext::RValue);
+}
+
+void TypeChecker2::visit(AstExprError* expr)
+{
+    // TODO!
+    for (AstExpr* e : expr->expressions)
+        visit(e, ValueContext::RValue);
+}
+
+TypeId TypeChecker2::flattenPack(TypePackId pack)
+{
+    pack = follow(pack);
+
+    if (auto fst = first(pack, /*ignoreHiddenVariadics*/ false))
+        return *fst;
+    else if (auto ftp = get<FreeTypePack>(pack))
+    {
+        TypeId result = module->internalTypes->freshType(builtinTypes, ftp->scope);
+        TypePackId freeTail = module->internalTypes->addTypePack(FreeTypePack{ftp->scope});
+
+        TypePack* resultPack = emplaceTypePack<TypePack>(asMutable(pack));
+        resultPack->head.assign(1, result);
+        resultPack->tail = freeTail;
+
+        return result;
+    }
+    else if (get<ErrorTypePack>(pack))
+        return builtinTypes->errorType;
+    else if (finite(pack) && size(pack) == 0)
+        return builtinTypes->nilType; // `(f())` where `f()` returns no values is coerced into `nil`
+    else
+    {
+        reportError(InternalError{"flattenPack got a weird pack!"}, Location{});
+        return builtinTypes->errorType; // todo test this
+    }
+}
+
+void TypeChecker2::visitGenerics(AstArray<AstGenericType*> generics, AstArray<AstGenericTypePack*> genericPacks)
+{
+    DenseHashSet<AstName> seen{AstName{}};
+
+    for (const auto* g : generics)
+    {
+        if (seen.contains(g->name))
+            reportError(DuplicateGenericParameter{g->name.value}, g->location);
+        else
+            seen.insert(g->name);
+
+        if (g->defaultValue)
+            visit(g->defaultValue);
+    }
+
+    for (const auto* g : genericPacks)
+    {
+        if (seen.contains(g->name))
+            reportError(DuplicateGenericParameter{g->name.value}, g->location);
+        else
+            seen.insert(g->name);
+
+        if (g->defaultValue)
+            visit(g->defaultValue);
+    }
+}
+
+void TypeChecker2::visit(AstType* ty)
+{
+    TypeId* resolvedTy = module->astResolvedTypes.find(ty);
+    if (resolvedTy)
+        checkForTypeFunctionInhabitance(follow(*resolvedTy), ty->location);
+
+    if (auto t = ty->as<AstTypeReference>())
+        return visit(t);
+    else if (auto t = ty->as<AstTypeTable>())
+        return visit(t);
+    else if (auto t = ty->as<AstTypeFunction>())
+        return visit(t);
+    else if (auto t = ty->as<AstTypeTypeof>())
+        return visit(t);
+    else if (auto t = ty->as<AstTypeUnion>())
+        return visit(t);
+    else if (auto t = ty->as<AstTypeIntersection>())
+        return visit(t);
+    else if (auto t = ty->as<AstTypeGroup>())
+        return visit(t->type);
+}
+
+void TypeChecker2::visit(AstTypeReference* ty)
+{
+    // No further validation is necessary in this case. The main logic for
+    // _luau_print is contained in lookupAnnotation.
+    if (FFlag::DebugLuauMagicTypes && (ty->name == kLuauPrint || ty->name == kLuauForceConstraintSolvingIncomplete || ty->name == kLuauBlockedType))
+        return;
+
+    Scope* scope = findInnermostScope(ty->location);
+    LUAU_ASSERT(scope);
+
+    // `class<T>` and `object<C>` are routed to type functions by ConstraintGenerator rather than resolved through
+    // the `class` and `object` aliases, which are zero-parameter top types; checking their arity against those
+    // aliases would always report a spurious mismatch.
+    const bool namesClass = ty->name == "class";
+    const bool routedToTypeFunction = !ty->prefix.has_value() && ty->hasParameterList && (namesClass || ty->name == "object");
+    if (FFlag::LuwuClasses && routedToTypeFunction)
+    {
+        for (const AstTypeOrPack& param : ty->parameters)
+        {
+            // `class<List>` names a generic class without its type arguments on purpose: it is the generic class
+            bool namesGenericClass = namesClass && scope && param.type && genericClassValueType(*scope, param.type);
+            if (namesGenericClass)
+                continue;
+
+            if (param.type)
+                visit(param.type);
+            else
+                visit(param.typePack);
+        }
+        return;
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md): `trait<T>` is resolved by ConstraintGenerator (resolveReferenceType), which
+    // reports a misuse; there is no `trait` alias to check it against
+    // Luwu literal types: `literal<B>` is resolved by ConstraintGenerator (resolveReferenceType), which also reports a
+    // misuse; there is no `literal` alias to check it against
+    bool isLiteralParameter = scope && isLiteralTypeReference(*scope, ty);
+    bool isTraitValue = FFlag::LuwuTraits && !ty->prefix.has_value() && ty->name == "trait" && ty->hasParameterList;
+    if (isLiteralParameter || isTraitValue)
+    {
+        // Unresolved when `literal<B>` is misused outside a parameter, which ConstraintGenerator reported
+        AstType* base = isLiteralParameter && ty->parameters.size == 1 ? ty->parameters.data[0].type : nullptr;
+        TypeId* baseTy = base ? module->astResolvedTypes.find(base) : nullptr;
+        if (baseTy && !hasLiterals(*baseTy))
+            reportError(GenericError{noLiteralsMessage(follow(*baseTy))}, base->location);
+
+        for (const AstTypeOrPack& param : ty->parameters)
+        {
+            if (param.type)
+                visit(param.type);
+            else
+                visit(param.typePack);
+        }
+        return;
+    }
+
+    for (const AstTypeOrPack& param : ty->parameters)
+    {
+        if (param.type)
+            visit(param.type);
+        else
+            visit(param.typePack);
+    }
+
+    std::optional<TypeFun> alias = (ty->prefix) ? scope->lookupImportedType(ty->prefix->value, ty->name.value) : scope->lookupType(ty->name.value);
+
+    if (alias.has_value())
+    {
+        size_t typesRequired = alias->typeParams.size();
+        size_t packsRequired = alias->typePackParams.size();
+
+        size_t typesProvided = 0;
+        size_t extraTypes = 0;
+        size_t packsProvided = 0;
+
+        for (const AstTypeOrPack& p : ty->parameters)
+        {
+            if (p.type)
+            {
+                if (packsProvided != 0)
+                {
+                    reportError(GenericError{"Type parameters must come before type pack parameters"}, ty->location);
+                    continue;
+                }
+
+                if (typesProvided < typesRequired)
+                {
+                    typesProvided += 1;
+                }
+                else
+                {
+                    extraTypes += 1;
+                }
+            }
+            else if (p.typePack)
+            {
+                std::optional<TypePackId> tp = lookupPackAnnotation(p.typePack);
+                if (!tp.has_value())
+                    continue;
+
+                if (typesProvided < typesRequired && size(*tp) == 1 && finite(*tp) && first(*tp))
+                {
+                    typesProvided += 1;
+                }
+                else
+                {
+                    packsProvided += 1;
+                }
+            }
+        }
+
+        // If we require type parameters, but no typeArguments are provided and only packs are provided, we report an error.
+        if (typesRequired != 0 && typesProvided == 0 && packsProvided != 0)
+        {
+            reportError(GenericError{"Type parameters must come before type pack parameters"}, ty->location);
+        }
+
+        if (extraTypes != 0 && packsProvided == 0)
+        {
+            // Extra typeArguments are only collected into a pack if a pack is expected
+            if (packsRequired != 0)
+                packsProvided += 1;
+            else
+                typesProvided += extraTypes;
+        }
+
+        for (size_t i = typesProvided; i < typesRequired; ++i)
+        {
+            if (alias->typeParams[i].defaultValue)
+            {
+                typesProvided += 1;
+            }
+        }
+
+        for (size_t i = packsProvided; i < packsRequired; ++i)
+        {
+            if (alias->typePackParams[i].defaultValue)
+            {
+                packsProvided += 1;
+            }
+        }
+
+        // If the type parameter list is explicitly provided, allow an empty type pack to satisfy the expected pack count.
+        if (extraTypes == 0 && packsProvided + 1 == packsRequired && ty->hasParameterList)
+            packsProvided += 1;
+
+        if (typesProvided != typesRequired || packsProvided != packsRequired)
+        {
+            reportError(
+                IncorrectGenericParameterCount{
+                    /* name */ ty->name.value,
+                    /* typeFun */ *alias,
+                    /* actualParameters */ typesProvided,
+                    /* actualPackParameters */ packsProvided,
+                },
+                ty->location
+            );
+        }
+    }
+    else
+    {
+        if (scope->lookupPack(ty->name.value))
+        {
+            reportError(
+                SwappedGenericTypeParameter{
+                    ty->name.value,
+                    SwappedGenericTypeParameter::Kind::Type,
+                },
+                ty->location
+            );
+        }
+        else
+        {
+            reportError(unknownTypeReference(*scope, *ty), ty->location);
+        }
+    }
+}
+
+void TypeChecker2::visit(AstTypeTable* table)
+{
+    // TODO!
+
+    for (const AstTableProp& prop : table->props)
+        visit(prop.type);
+
+    if (table->indexer)
+    {
+        visit(table->indexer->indexType);
+        visit(table->indexer->resultType);
+    }
+}
+
+void TypeChecker2::visit(AstTypeFunction* ty)
+{
+    visitGenerics(ty->generics, ty->genericPacks);
+    visit(ty->argTypes);
+    visit(ty->returnTypes);
+    // Luwu try expressions
+    if (ty->errorHint)
+        visit(ty->errorHint);
+}
+
+// The source spelling of a name or a chain of field reads (`Cat`, `a.Node`).
+static std::optional<std::string> spellNameExpr(const AstExpr* expr)
+{
+    if (const AstExprLocal* local = expr->as<AstExprLocal>())
+        return std::string(local->local->name.value);
+
+    if (const AstExprGlobal* global = expr->as<AstExprGlobal>())
+        return std::string(global->name.value);
+
+    if (const AstExprIndexName* index = expr->as<AstExprIndexName>())
+    {
+        if (std::optional<std::string> prefix = spellNameExpr(index->expr))
+            return *prefix + "." + index->index.value;
+    }
+
+    return std::nullopt;
+}
+
+// `valueKind` is "class", or "trait" for a trait's value
+void TypeChecker2::reportClassTypeofSpelling(AstTypeTypeof* ty, const std::string& className, TypeId objectTy, const char* valueKind)
+{
+    // The suggestion names the class's type only where that name resolves to it: an imported class
+    // or a shadowed name has no bare spelling here.
+    const Scope* scope = findInnermostScope(ty->location);
+    std::optional<TypeFun> named = scope ? scope->lookupType(className) : std::nullopt;
+    const bool nameable = named && follow(named->type) == follow(objectTy);
+
+    const std::string typeofText = "'typeof(" + spellNameExpr(ty->expr).value_or("...") + ")'";
+    const std::string kind = valueKind;
+    const std::string classText =
+        nameable ? "'" + kind + "<" + className + ">'" : "'" + kind + "<T>', where T is the type of '" + className + "' objects,";
+
+    const std::string target = kind == "trait" ? "the trait '" + className + "'" : "the class of '" + className + "'";
+    reportError(GenericError{"Use " + classText + " instead of " + typeofText + " to get " + target}, ty->location);
+}
+
+void TypeChecker2::visit(AstTypeTypeof* ty)
+{
+    visit(ty->expr, ValueContext::RValue);
+
+    // `typeof(Cat)` and `class<Cat>` name the same type, but only the latter says so at a glance:
+    // an ExternType stringifies as its bare name, so `typeof(Cat)` reads as the object type in
+    // every hover and error message. Steer users to the spelling that doesn't.
+    if (FFlag::LuwuClasses)
+    {
+        if (auto resolved = module->astResolvedTypes.find(ty))
+        {
+            const ExternType* klass = get<ExternType>(follow(*resolved));
+            const bool isClassValue = klass && klass->root == builtinTypes->classType;
+            const bool isTraitValue = klass && klass->root == builtinTypes->traitType;
+            if ((isClassValue || isTraitValue) && klass->relation)
+            {
+                if (const Obj* obj = klass->relation->get_if<Obj>())
+                    reportClassTypeofSpelling(ty, klass->name, obj->ty, isTraitValue ? "trait" : "class");
+            }
+        }
+    }
+}
+
+void TypeChecker2::visit(AstTypeUnion* ty)
+{
+    // TODO!
+    for (AstType* type : ty->types)
+        visit(type);
+}
+
+void TypeChecker2::visit(AstTypeIntersection* ty)
+{
+    // TODO!
+    for (AstType* type : ty->types)
+        visit(type);
+}
+
+void TypeChecker2::visit(AstTypePack* pack)
+{
+    if (auto p = pack->as<AstTypePackExplicit>())
+        return visit(p);
+    else if (auto p = pack->as<AstTypePackVariadic>())
+        return visit(p);
+    else if (auto p = pack->as<AstTypePackGeneric>())
+        return visit(p);
+}
+
+void TypeChecker2::visit(AstTypePackExplicit* tp)
+{
+    // TODO!
+    for (AstType* type : tp->typeList.types)
+        visit(type);
+
+    if (tp->typeList.tailType)
+        visit(tp->typeList.tailType);
+}
+
+void TypeChecker2::visit(AstTypePackVariadic* tp)
+{
+    // TODO!
+    visit(tp->variadicType);
+}
+
+void TypeChecker2::visit(AstTypePackGeneric* tp)
+{
+    Scope* scope = findInnermostScope(tp->location);
+    LUAU_ASSERT(scope);
+
+    if (std::optional<TypePackId> alias = scope->lookupPack(tp->genericName.value))
+        return;
+
+    if (scope->lookupType(tp->genericName.value))
+        return reportError(
+            SwappedGenericTypeParameter{
+                tp->genericName.value,
+                SwappedGenericTypeParameter::Kind::Pack,
+            },
+            tp->location
+        );
+
+    reportError(UnknownSymbol{tp->genericName.value, UnknownSymbol::Context::Type}, tp->location);
+}
+
+// Returns true if `prefix`'s components are a (possibly empty, possibly complete) prefix of
+// `whole`'s components. Used to detect when a subPath/superPath pair share a common lead-in
+// (e.g. both drill into "the 1st entry in the type pack") so that lead-in doesn't get printed
+// twice back-to-back in a mismatch explanation.
+static bool isPrefixPath(const TypePath::Path& prefix, const TypePath::Path& whole)
+{
+    if (prefix.components.size() > whole.components.size())
+        return false;
+
+    TypePath::Path wholePrefix{std::vector<TypePath::Component>(whole.components.begin(), whole.components.begin() + prefix.components.size())};
+    return prefix == wholePrefix;
+}
+
+// If every non-empty subPath/superPath among `reasonings` begins with the same recognized
+// PackField (Returns or Arguments), returns it. This tells us the whole mismatch is fundamentally
+// about one specific, nameable aspect of the type (e.g. "its return type"), which we can fold
+// into a short preamble instead of repeating jargon like "it returns" inside every reason.
+static std::optional<TypePath::PackField> commonLeadingPackField(const SubtypingReasonings& reasonings)
+{
+    std::optional<TypePath::PackField> common;
+
+    auto consider = [&](const TypePath::Path& path) -> bool
+    {
+        if (path.empty())
+            return true;
+
+        const TypePath::PackField* pf = get_if<TypePath::PackField>(&path.components[0]);
+        if (!pf || (*pf != TypePath::PackField::Returns && *pf != TypePath::PackField::Arguments))
+            return false;
+
+        if (!common)
+            common = *pf;
+        return *pf == *common;
+    };
+
+    for (const SubtypingReasoning& reasoning : reasonings)
+    {
+        if (!consider(reasoning.subPath) || !consider(reasoning.superPath))
+            return std::nullopt;
+    }
+
+    return common;
+}
+
+static std::optional<std::string> contextVerbForPackField(TypePath::PackField field)
+{
+    switch (field)
+    {
+    case TypePath::PackField::Returns:
+        return mismatchContextFunctionReturns;
+    case TypePath::PackField::Arguments:
+        return mismatchContextFunctionTakes;
+    default:
+        return std::nullopt;
+    }
+}
+
+// Builds a trimmed-down path for human-readable narration: drops indices into packs/unions/
+// intersections (e.g. "the 1st component of the union"), since which member differs is already
+// obvious from comparing the printed wanted/got types side by side, and drops a leading PackField
+// component that matches `commonContext`, since that's already conveyed by the enclosing
+// preamble (e.g. "Expected this function to return..."). Property names and other structural
+// markers are preserved, since those aren't recoverable just by reading the printed types.
+static TypePath::Path narrationPath(const TypePath::Path& path, std::optional<TypePath::PackField> commonContext)
+{
+    std::vector<TypePath::Component> result;
+    for (size_t i = 0; i < path.components.size(); ++i)
+    {
+        const TypePath::Component& c = path.components[i];
+
+        if (i == 0 && commonContext)
+        {
+            if (const TypePath::PackField* pf = get_if<TypePath::PackField>(&c); pf && *pf == *commonContext)
+                continue;
+        }
+
+        if (get_if<TypePath::Index>(&c))
+            continue;
+
+        result.push_back(c);
+    }
+    return TypePath::Path{std::move(result)};
+}
+
+// Luwu Traits (rfcs/classes/traits.md): why `given` doesn't fit a trait function's `Self`
+static std::string traitSelfMismatchReason(const std::string& given)
+{
+    return "`Self` is the class this is called on, and a `" + given +
+           "` may be a different class, so this has to be `Self` too: `self`, or `class.of(self)(...)` for a new object of its class";
+}
+
+template<typename TID>
+Reasonings TypeChecker2::explainReasonings_(TID subTy, TID superTy, Location location, const SubtypingResult& r)
+{
+    if (r.reasoning.empty())
+        return {};
+
+    std::optional<TypePath::PackField> commonContext = commonLeadingPackField(r.reasoning);
+
+    std::vector<std::string> reasons;
+    bool suppressed = true;
+    for (const SubtypingReasoning& reasoning : r.reasoning)
+    {
+        if (reasoning.subPath.empty() && reasoning.superPath.empty())
+            continue;
+
+        std::optional<TypeOrPack> optSubLeaf = traverse(subTy, reasoning.subPath, builtinTypes, subtyping->arena);
+
+        std::optional<TypeOrPack> optSuperLeaf = traverse(superTy, reasoning.superPath, builtinTypes, subtyping->arena);
+
+        if (!optSubLeaf || !optSuperLeaf)
+        {
+            reportError(InternalError{"Subtyping test returned a reasoning with an invalid path"}, location);
+            return {};
+        }
+
+        const TypeOrPack& subLeaf = *optSubLeaf;
+        const TypeOrPack& superLeaf = *optSuperLeaf;
+
+        auto subLeafTy = get<TypeId>(subLeaf);
+        auto superLeafTy = get<TypeId>(superLeaf);
+
+        auto subLeafTp = get<TypePackId>(subLeaf);
+        auto superLeafTp = get<TypePackId>(superLeaf);
+
+        if (!subLeafTy && !superLeafTy && !subLeafTp && !superLeafTp)
+        {
+            reportError(InternalError{"Subtyping test returned a reasoning where one path ends at a type and the other ends at a pack."}, location);
+            return {};
+        }
+
+        std::string relation = "a subtype of";
+        if (reasoning.variance == SubtypingVariance::Invariant)
+            relation = "exactly";
+        else if (reasoning.variance == SubtypingVariance::Contravariant)
+            relation = "a supertype of";
+
+        std::string subLeafAsString = toString(subLeaf);
+        // if the string is empty, it must be an empty type pack
+        if (subLeafAsString.empty())
+            subLeafAsString = "()";
+
+        std::string superLeafAsString = toString(superLeaf);
+        // if the string is empty, it must be an empty type pack
+        if (superLeafAsString.empty())
+            superLeafAsString = "()";
+
+        // When the only thing wrong is that the given type might be `nil`, the subtyping test fails
+        // on the `nil` member of a union, and naming that member ("`nil` is not a subtype of
+        // `number`") makes the reader work backwards to figure out which type it came out of. Name
+        // the optional type they actually wrote instead, and say what is wrong with it.
+        std::optional<std::string> optionalSubLeaf;
+        if (subLeafTy && superLeafTy && isNil(*subLeafTy) && !isNil(*superLeafTy))
+        {
+            TypePath::Path enclosingPath = reasoning.subPath;
+            if (!enclosingPath.components.empty() && get_if<TypePath::Index>(&enclosingPath.components.back()))
+            {
+                enclosingPath.components.pop_back();
+
+                if (std::optional<TypeOrPack> optEnclosing = traverse(subTy, enclosingPath, builtinTypes, subtyping->arena))
+                {
+                    if (auto enclosingTy = get<TypeId>(*optEnclosing); enclosingTy && isOptional(*enclosingTy))
+                    {
+                        optionalSubLeaf = toString(*enclosingTy);
+                        subLeafAsString = *optionalSubLeaf;
+                    }
+                }
+            }
+        }
+
+        // Luwu Traits (rfcs/classes/traits.md): `Self` is the class of whatever the trait function is called on, which a
+        // value of the trait type (or any other class) may not be. Saying so beats "`X` is not a subtype of `Self`".
+        const GenericType* superGeneric = superLeafTy ? get<GenericType>(follow(*superLeafTy)) : nullptr;
+        const bool expectsTraitSelf = !optionalSubLeaf && superGeneric && superGeneric->traitSelf;
+
+        std::stringstream baseReasonBuilder;
+        if (optionalSubLeaf)
+            baseReasonBuilder << "`" << subLeafAsString << "` could be `nil`";
+        else if (expectsTraitSelf)
+            baseReasonBuilder << traitSelfMismatchReason(subLeafAsString);
+        else
+            baseReasonBuilder << "`" << subLeafAsString << "` is not " << relation << " `" << superLeafAsString << "`";
+        std::string baseReason = baseReasonBuilder.str();
+
+        // The same comparison as `baseReason`, phrased to follow a narrated path ("accessing `n`
+        // results in ...").
+        std::string subLeafNotSuper = optionalSubLeaf ? ("`" + subLeafAsString + "`, which could be `nil`")
+                                                      : ("`" + subLeafAsString + "`, which is not " + relation + " `" + superLeafAsString + "`");
+        std::string superLeafAndSubNot = optionalSubLeaf
+                                             ? ("`" + superLeafAsString + "`, and `" + subLeafAsString + "` could be `nil`")
+                                             : ("`" + superLeafAsString + "`, and `" + subLeafAsString + "` is not " + relation + " it");
+        if (expectsTraitSelf)
+        {
+            subLeafNotSuper = "`" + subLeafAsString + "`, which may be a different class than `Self`";
+            superLeafAndSubNot = "`Self`, and `" + subLeafAsString + "` may be a different class";
+        }
+
+        std::stringstream reason;
+
+        TypePath::Path subNarration = narrationPath(reasoning.subPath, commonContext);
+        TypePath::Path superNarration = narrationPath(reasoning.superPath, commonContext);
+
+        if ((FFlag::LuauPropertyModifierMismatchErrors || FFlag::LuauIndexerModifierMismatchErrors) && reasoning.isAccessModifierViolation)
+        {
+            if (FFlag::LuauPropertyModifierMismatchErrors && FFlag::LuauIndexerModifierMismatchErrors)
+            {
+                // The leaf types at the end of the paths are the same type, so a
+                // plain "X is not a subtype of X" message would be misleading.
+                // Instead, explain that the mismatch is about the access modifier.
+                auto last = reasoning.subPath.last();
+                bool isReadOnly = true;
+                std::string path = "something";
+
+                if (last)
+                {
+                    if (auto* prop = get_if<TypePath::Property>(&*last))
+                    {
+                        path = "`" + prop->name + "`";
+                        isReadOnly = prop->isRead;
+                    }
+                    else if (auto* field = get_if<TypePath::TypeField>(&*last); field && *field == TypePath::TypeField::IndexResult)
+                        path = "the indexer";
+                }
+
+                if (isReadOnly)
+                    reason << path << " is read-only in the latter type, but the former type requires it to be read-write";
+                else
+                    reason << path << " is write-only in the latter type, but the former type requires it to be read-write";
+            }
+            else
+            {
+                // The leaf types at the end of the paths are the same type, so a
+                // plain "X is not a subtype of X" message would be misleading.
+                // Instead, explain that the mismatch is about the property modifier.
+                std::string propName = "a property";
+                bool isReadOnly = true;
+                auto last = reasoning.subPath.last();
+                LUAU_ASSERT(last && get_if<TypePath::Property>(&*last));
+                if (last)
+                {
+                    if (auto* prop = get_if<TypePath::Property>(&*last))
+                    {
+                        propName = "`" + prop->name + "`";
+                        isReadOnly = prop->isRead;
+                    }
+                }
+
+                if (isReadOnly)
+                    reason << propName << " is a read-only property in the latter type, but the former type requires a read-write property";
+                else
+                    reason << propName << " is a write-only property in the latter type, but the former type requires a read-write property";
+            }
+        }
+        // If, once the shared context (e.g. "this function returns") and union/pack indices are
+        // stripped out, there's nothing left worth narrating (the common case -- most mismatches
+        // are just "the type here doesn't match the type there", and which union/pack slot is
+        // already obvious from comparing the printed wanted/got types), skip narration entirely
+        // and just state the comparison.
+        else if (subNarration.empty() && superNarration.empty())
+            reason << baseReason;
+        else if (subNarration == superNarration)
+            reason << toStringHuman(subNarration) << "`" << subLeafAsString << "` in the latter type and `" << superLeafAsString
+                   << "` in the former type, and " << baseReason;
+        // If one non-empty path is a strict prefix of the other, they share a common lead-in --
+        // printing both paths in full repeats that lead-in verbatim, which reads as a confusing
+        // double explanation. Describe only the more specific (longer) path in that case.
+        else if (!subNarration.empty() && !superNarration.empty() && isPrefixPath(superNarration, subNarration))
+            reason << toStringHuman(subNarration) << subLeafNotSuper;
+        else if (!subNarration.empty() && !superNarration.empty() && isPrefixPath(subNarration, superNarration))
+            reason << toStringHuman(superNarration) << superLeafAndSubNot;
+        else if (!subNarration.empty() && !superNarration.empty())
+            reason << toStringHuman(subNarration) << "`" << subLeafAsString << "` and " << toStringHuman(superNarration) << "`"
+                   << superLeafAsString << "`, and " << baseReason;
+        else if (!subNarration.empty())
+            reason << toStringHuman(subNarration) << subLeafNotSuper;
+        else
+            reason << toStringHuman(superNarration) << "`" << superLeafAsString << "`, and " << baseReason;
+
+        if (FFlag::LuauBetterPackAndVariadicMismatchErrors && reasoning.variance == SubtypingVariance::Contravariant && subLeafTp && superLeafTp)
+        {
+            const VariadicTypePack* vtp = get<VariadicTypePack>(*subLeafTp);
+            const GenericTypePack* gtp = get<GenericTypePack>(*superLeafTp);
+
+            if (gtp && vtp && gtp->explicitName && is<GenericType>(vtp->ty))
+            {
+                reason << "; the former type has a generic pack, and the latter type has a variadic, ";
+                reason << "consider changing the former generic to `" << gtp->name << "` or the latter generic to ";
+                reason << "`" << toString(vtp->ty) << "...`";
+            }
+        }
+
+        reasons.push_back(reason.str());
+
+        // if we haven't already proved this isn't suppressing, we have to keep checking.
+        if (suppressed)
+        {
+            if (subLeafTy && superLeafTy)
+                suppressed &= isErrorSuppressing(location, *subLeafTy) || isErrorSuppressing(location, *superLeafTy);
+            else
+                suppressed &= isErrorSuppressing(location, *subLeafTp) || isErrorSuppressing(location, *superLeafTp);
+        }
+    }
+
+    std::optional<std::string> contextVerb = commonContext ? contextVerbForPackField(*commonContext) : std::nullopt;
+
+    // The preamble built from `contextVerb` promises one part of the type ("Expected this function
+    // to return"), so hand the caller that part's stringification to print after it, rather than
+    // the whole function type.
+    std::optional<std::string> wantedDisplay;
+    std::optional<std::string> givenDisplay;
+    if (commonContext)
+    {
+        TypePath::Path contextPath{std::vector<TypePath::Component>{TypePath::Component{*commonContext}}};
+
+        std::optional<TypeOrPack> wantedPart = traverse(superTy, contextPath, builtinTypes, subtyping->arena);
+        std::optional<TypeOrPack> givenPart = traverse(subTy, contextPath, builtinTypes, subtyping->arena);
+
+        if (wantedPart && givenPart)
+        {
+            wantedDisplay = toString(*wantedPart);
+            givenDisplay = toString(*givenPart);
+
+            // An empty type pack stringifies to nothing at all, which would leave the message with
+            // a bare pair of quotes.
+            if (wantedDisplay->empty())
+                wantedDisplay = "()";
+            if (givenDisplay->empty())
+                givenDisplay = "()";
+        }
+    }
+
+    return {std::move(reasons), suppressed, std::move(contextVerb), std::move(wantedDisplay), std::move(givenDisplay)};
+}
+
+Reasonings TypeChecker2::explainReasonings(TypeId subTy, TypeId superTy, Location location, const SubtypingResult& r)
+{
+    return explainReasonings_(subTy, superTy, location, r);
+}
+
+Reasonings TypeChecker2::explainReasonings(TypePackId subTp, TypePackId superTp, Location location, const SubtypingResult& r)
+{
+    return explainReasonings_(subTp, superTp, location, r);
+}
+
+// Luwu: the message for an optional value used where its `none` isn't allowed
+static std::string mayBeNoneMessage(TypeId valueTy)
+{
+    return "this '" + toString(valueTy) + "' value is optional and may be 'none', use an if condition to check";
+}
+
+// True when the *only* reason `subTy` fails to be a subtype of `superTy` is that `subTy` is (or contains, as a
+// union member) `none` and `superTy` doesn't account for it. This happens when an optional value (`T | none`)
+// is used somewhere that expects a plain `T` without first being narrowed/checked.
+static bool isUncheckedNoneMismatch(TypeId subTy, TypeId superTy, const SubtypingResult& result, NotNull<BuiltinTypes> builtinTypes, NotNull<TypeArena> arena)
+{
+    const SubtypingReasoning* onlyReasoning = nullptr;
+    for (const SubtypingReasoning& reasoning : result.reasoning)
+    {
+        if (onlyReasoning)
+            return false;
+        onlyReasoning = &reasoning;
+    }
+
+    if (!onlyReasoning || !onlyReasoning->superPath.empty())
+        return false;
+
+    std::optional<TypeOrPack> subLeaf = traverse(subTy, onlyReasoning->subPath, builtinTypes, arena);
+    if (!subLeaf)
+        return false;
+
+    auto subLeafTy = get<TypeId>(*subLeaf);
+    return subLeafTy && Luau::isNone(*subLeafTy);
+}
+
+// True when `subTy` failed to be a subtype of `superTy` because `superTy` is a negated union
+// (e.g. `~(number | string)`) and `subTy` itself overlaps with one of that union's members.
+// The generic reasoning text for this case reads as "`number` is not a subtype of `number`",
+// which is confusing since disjointness, not subtyping, is what actually failed.
+static bool isSimpleNegatedUnionMismatch(TypeId subTy, TypeId superTy, const SubtypingResult& result)
+{
+    const NegationType* negation = get<NegationType>(follow(superTy));
+    if (!negation || !get<UnionType>(follow(negation->ty)))
+        return false;
+
+    const SubtypingReasoning* onlyReasoning = nullptr;
+    for (const SubtypingReasoning& reasoning : result.reasoning)
+    {
+        if (onlyReasoning)
+            return false;
+        onlyReasoning = &reasoning;
+    }
+
+    if (!onlyReasoning || !onlyReasoning->subPath.empty())
+        return false;
+
+    const std::vector<TypePath::Component>& components = onlyReasoning->superPath.components;
+    if (components.size() != 2)
+        return false;
+
+    const TypePath::TypeField* negated = get_if<TypePath::TypeField>(&components[0]);
+    return negated && *negated == TypePath::TypeField::Negated && get_if<TypePath::Index>(&components[1]);
+}
+
+// Returns the sole reasoning behind a failed subtyping test, or nullptr when the test failed for
+// more than one reason. The bespoke explanations below each describe one specific failure, so
+// speaking for a result that has several would hide the rest.
+static const SubtypingReasoning* soleReasoning(const SubtypingResult& result)
+{
+    const SubtypingReasoning* only = nullptr;
+    for (const SubtypingReasoning& reasoning : result.reasoning)
+    {
+        if (only)
+            return nullptr;
+        only = &reasoning;
+    }
+    return only;
+}
+
+// Luwu (helpful subtyping errors): the shape a read/write mismatch was found in. An array and a map differ
+// only in nouns and in the annotation that fixes them; a property is a different sentence entirely.
+enum class ReadWriteShape
+{
+    Array,
+    Map,
+    Property,
+};
+
+// Luwu (helpful subtyping errors): the explanation for a read/write mismatch, plus the one-line version that
+// goes on the parameter the value was passed to.
+struct ReadWriteExplanation
+{
+    std::string message;
+    std::string parameterHelp;
+
+    // The failing path on the expected side, which is the parameter's own type, so it lines up with what
+    // the user wrote there: `annotatedMemberLocation` follows it to the indexer or property to mark `read`.
+    TypePath::Path parameterHelpPath;
+
+    // `message` is the whole message. Otherwise it is the reason under the usual "Expected 'x' to be" header, which
+    // gets `kReadWriteNote` after the given type.
+    bool standalone = true;
+};
+
+// Luwu (helpful subtyping errors): both sides' types at the end of their paths, when both paths lead to a
+// type rather than a pack. Returned as {sub, super}.
+static std::optional<std::pair<TypeId, TypeId>> typesAtPaths(
+    TypeId subTy,
+    const TypePath::Path& subPath,
+    TypeId superTy,
+    const TypePath::Path& superPath,
+    NotNull<BuiltinTypes> builtinTypes,
+    NotNull<TypeArena> arena
+)
+{
+    std::optional<TypeOrPack> subPart = traverse(subTy, subPath, builtinTypes, arena);
+    std::optional<TypeOrPack> superPart = traverse(superTy, superPath, builtinTypes, arena);
+    if (!subPart || !superPart)
+        return std::nullopt;
+
+    const TypeId* subPartTy = get<TypeId>(*subPart);
+    const TypeId* superPartTy = get<TypeId>(*superPart);
+    if (!subPartTy || !superPartTy)
+        return std::nullopt;
+
+    return std::make_pair(*subPartTy, *superPartTy);
+}
+
+static AstType* withoutGroups(AstType* ty)
+{
+    while (AstTypeGroup* group = ty ? ty->as<AstTypeGroup>() : nullptr)
+        ty = group->type;
+
+    return ty;
+}
+
+// Luwu (helpful subtyping errors): what a written type resolves to for the purpose of finding a property or
+// an indexer in it. A parameter is as likely to be annotated `Box<Item>` as `{ value: Item }`, and
+// `read` is written in the alias either way, so a reference is followed to the type it names. Generic
+// arguments are ignored: only the place a modifier is typed matters, not what it is instantiated to.
+static AstType* resolveForMembers(AstType* ty, const TypeChecker2::DeclarationIndex& declarations)
+{
+    // Aliases can name each other; this is far more hops than real code needs, and stops a cyclic
+    // alias from spinning here.
+    constexpr int maxAliasHops = 8;
+
+    for (int hops = 0; hops < maxAliasHops; ++hops)
+    {
+        ty = withoutGroups(ty);
+
+        AstTypeReference* reference = ty ? ty->as<AstTypeReference>() : nullptr;
+        if (!reference || reference->prefix)
+            return ty;
+
+        AstStatTypeAlias* alias = declarations.aliasNamed(reference->name);
+        if (!alias)
+            return ty;
+
+        ty = alias->type;
+    }
+
+    return ty;
+}
+
+// Luwu (helpful subtyping errors): the part of a written type a read/write mismatch is about -- the indexer
+// of `{ [string]: T }` or the property of `{ x: T }` -- found by walking the subtyping path that failed
+// into the annotation the user typed. A path component with no counterpart in the annotation gives up
+// rather than guessing, since the whole point is to point at the exact place `read` is written.
+static std::optional<Location> annotatedMemberLocation(
+    AstType* annotation,
+    const TypePath::Path& path,
+    const TypeChecker2::DeclarationIndex& declarations
+)
+{
+    AstType* current = resolveForMembers(annotation, declarations);
+    std::optional<Location> found;
+
+    for (const TypePath::Component& component : path.components)
+    {
+        // A trailing index into a union is which member failed, not a place in the annotation; the
+        // indexer or property named just before it is still the thing to mark `read`.
+        if (get_if<TypePath::Index>(&component))
+            break;
+
+        AstTypeTable* table = current ? current->as<AstTypeTable>() : nullptr;
+        if (!table)
+            return std::nullopt;
+
+        if (const TypePath::Property* property = get_if<TypePath::Property>(&component))
+        {
+            const AstTableProp* match = nullptr;
+            for (const AstTableProp& prop : table->props)
+            {
+                if (prop.name.value && property->name == prop.name.value)
+                {
+                    match = &prop;
+                    break;
+                }
+            }
+
+            if (!match)
+                return std::nullopt;
+
+            found = match->location;
+            current = resolveForMembers(match->type, declarations);
+        }
+        else if (const TypePath::TypeField* field = get_if<TypePath::TypeField>(&component);
+                 field && *field == TypePath::TypeField::IndexResult)
+        {
+            if (!table->indexer)
+                return std::nullopt;
+
+            found = table->indexer->location;
+            current = resolveForMembers(table->indexer->resultType, declarations);
+        }
+        else
+            return std::nullopt;
+    }
+
+    return found;
+}
+
+// Luwu (helpful subtyping errors): what a read/write mismatch is about, found by `findReadWriteMismatch` and
+// put into words by `wordReadWriteMismatch`. Type names are unquoted.
+struct ReadWriteMismatch
+{
+    ReadWriteShape shape = ReadWriteShape::Property;
+    std::string propertyName;
+    std::string keyType;
+
+    std::string wantedLeaf;
+    std::string givenLeaf;
+    std::string wantedContainer;
+    std::string givenContainer;
+    // The whole expected type.
+    std::string wanted;
+
+    // The path from the given value to the container that holds the slot. Empty when it is the value itself.
+    TypePath::Path containerPath;
+
+    // The member of an expected union that the given side lacks, when that is the whole difference.
+    std::optional<std::string> widenedMember;
+    bool widenedWithNil = false;
+
+    bool isArgument = false;
+
+    // The callee, when the value is an argument and the callee has a name.
+    std::string functionName;
+    // The parameter the value is passed to, when it has a name.
+    std::optional<std::string> parameterName;
+    // The given value's name in the code, when it has one.
+    std::optional<std::string> givenName;
+
+    // See ReadWriteExplanation::parameterHelpPath.
+    TypePath::Path parameterHelpPath;
+};
+
+// Luwu (helpful subtyping errors): the longest type a read/write mismatch prints in its sentences.
+static constexpr size_t kMaxReadWriteTypeLength = 40;
+
+// Luwu (helpful subtyping errors): an indexer's element or a read property at the end of `path`.
+static bool endsInReadableSlot(const TypePath::Path& path)
+{
+    if (path.empty())
+        return false;
+    const TypePath::Component& last = path.components.back();
+    const TypePath::Property* property = get_if<TypePath::Property>(&last);
+    const TypePath::TypeField* typeField = get_if<TypePath::TypeField>(&last);
+    return (typeField && *typeField == TypePath::TypeField::IndexResult) || (property && property->isRead);
+}
+
+// Luwu (helpful subtyping errors): the outermost slot along `path` whose read half passes, which is where
+// `read` helps. Subtyping reports the deepest failure: `{ {string} }` against `{ {read unknown} }` fails
+// inside the inner arrays, but the fix is marking the outer array's elements `read`.
+static std::optional<TypePath::Path> outermostReadableSlot(
+    TypeId subTy,
+    TypeId superTy,
+    const TypePath::Path& path,
+    NotNull<Subtyping> subtyping,
+    NotNull<Scope> scope,
+    NotNull<BuiltinTypes> builtinTypes,
+    NotNull<TypeArena> arena
+)
+{
+    if (path.empty())
+        return std::nullopt;
+
+    for (size_t length = 1; length <= path.components.size(); ++length)
+    {
+        TypePath::Path prefix{std::vector<TypePath::Component>(path.components.begin(), path.components.begin() + length)};
+        if (!endsInReadableSlot(prefix))
+            continue;
+
+        std::optional<std::pair<TypeId, TypeId>> leaves = typesAtPaths(subTy, prefix, superTy, prefix, builtinTypes, arena);
+        if (!leaves)
+            return std::nullopt;
+        if (subtyping->isSubtype(leaves->first, leaves->second, scope).isSubtype)
+            return prefix;
+    }
+    return std::nullopt;
+}
+
+// Luwu (helpful subtyping errors): a property or indexer that is read *and* written has to match exactly, so
+// a perfectly good subtype is rejected wherever one is expected -- passing a `{Button}` to a `{Widget}`
+// parameter, say. Upstream reports this as "`Button` is not exactly `Widget`", which a reader can't act
+// on: the reason a smaller type is refused is that the callee can *replace* an element with one. So the
+// message spells out that mechanism and both ways out of it.
+//
+// The covariant direction is re-tested here rather than recorded during subtyping: this only runs
+// once an error is already being reported, and `{number}` against `{string}` fails invariantly too
+// without `read` helping it in the slightest.
+static std::optional<ReadWriteMismatch> findReadWriteMismatch(
+    TypeId subTy,
+    TypeId superTy,
+    const SubtypingResult& result,
+    NotNull<Subtyping> subtyping,
+    NotNull<Scope> scope,
+    NotNull<BuiltinTypes> builtinTypes,
+    NotNull<TypeArena> arena
+)
+{
+    // Every failure has to be under the same slot for the message to be able to point at one. A nested
+    // failure can come with several reasonings: `{ {string} }` against `{ {read unknown} }` also reports
+    // the inner arrays' access modifiers, from the half of the invariance check that runs backwards.
+    std::optional<TypePath::Path> slot;
+    const SubtypingReasoning* reasoning = nullptr;
+    for (const SubtypingReasoning& candidate : result.reasoning)
+    {
+        if (candidate.variance != SubtypingVariance::Invariant)
+            return std::nullopt;
+
+        // Inside a function's arguments the roles are reversed, and `read` belongs on whichever side the
+        // reader didn't write. The wording assumes the ordinary direction, so leave those alone.
+        for (const TypePath::Component& component : candidate.subPath.components)
+        {
+            if (const TypePath::PackField* pf = get_if<TypePath::PackField>(&component); pf && *pf == TypePath::PackField::Arguments)
+                return std::nullopt;
+        }
+
+        // Reading is the half that works somewhere along the path, or `read` has nothing to offer here.
+        std::optional<TypePath::Path> candidateSlot = outermostReadableSlot(subTy, superTy, candidate.subPath, subtyping, scope, builtinTypes, arena);
+        if (!candidateSlot || (slot && *slot != *candidateSlot))
+            return std::nullopt;
+
+        // A read-only element given where a read-write one is expected is the access modifier error's to explain.
+        if (candidate.isAccessModifierViolation && *candidateSlot == candidate.subPath)
+            return std::nullopt;
+
+        slot = std::move(candidateSlot);
+        reasoning = &candidate;
+    }
+    if (!slot || !reasoning)
+        return std::nullopt;
+
+    const TypePath::Path& path = *slot;
+
+    // When the failure is at the slot itself, both sides have to fail in the same place for the message to be
+    // able to point at one. When the expected side is wider -- `{string}` against `{string?}`, the single most
+    // common way to meet this error -- subtyping fails against one member of that union and the super path
+    // carries a trailing index into it. The slot compares against the whole union instead, or the message ends
+    // up reading "`string` is not exactly `nil`", which means nothing to anybody.
+    const bool failsAtSlot = result.reasoning.size() == 1 && path == reasoning->subPath;
+    const bool superPathIsWider = failsAtSlot && path != reasoning->superPath;
+    if (superPathIsWider)
+    {
+        const std::vector<TypePath::Component>& superComponents = reasoning->superPath.components;
+        if (superComponents.size() != path.components.size() + 1)
+            return std::nullopt;
+
+        const TypePath::Index* widened = get_if<TypePath::Index>(&superComponents.back());
+        if (!widened || widened->variant == TypePath::Index::Variant::Pack)
+            return std::nullopt;
+
+        if (!std::equal(path.components.begin(), path.components.end(), superComponents.begin()))
+            return std::nullopt;
+    }
+
+    const TypePath::Component& last = path.components.back();
+    const TypePath::Property* property = get_if<TypePath::Property>(&last);
+    const TypePath::TypeField* typeField = get_if<TypePath::TypeField>(&last);
+    const bool isIndexer = typeField && *typeField == TypePath::TypeField::IndexResult;
+
+    std::optional<std::pair<TypeId, TypeId>> leaves = typesAtPaths(subTy, path, superTy, path, builtinTypes, arena);
+    if (!leaves)
+        return std::nullopt;
+
+    const auto [subLeafTy, superLeafTy] = *leaves;
+
+    // The container that actually holds the read-write slot, which for an argument passed straight
+    // to a parameter is the whole type, and for a nested one is the inner table that owns it.
+    TypePath::Path containerPath{std::vector<TypePath::Component>(path.components.begin(), path.components.end() - 1)};
+
+    std::optional<std::pair<TypeId, TypeId>> containers = typesAtPaths(subTy, containerPath, superTy, containerPath, builtinTypes, arena);
+    if (!containers)
+        return std::nullopt;
+
+    const auto [subContainerTy, superContainerTy] = *containers;
+
+    ReadWriteMismatch mismatch;
+    mismatch.wantedLeaf = toString(superLeafTy);
+    mismatch.givenLeaf = toString(subLeafTy);
+
+    // Both leaf types are printed several times over, so a long expansion turns the whole
+    // explanation into a wall. Fall back to the terse form rather than print that.
+    if (mismatch.wantedLeaf.length() > kMaxReadWriteTypeLength || mismatch.givenLeaf.length() > kMaxReadWriteTypeLength)
+        return std::nullopt;
+
+    if (isIndexer)
+    {
+        mismatch.shape = ReadWriteShape::Array;
+        if (const TableType* superTable = get<TableType>(follow(superContainerTy)); superTable && superTable->indexer)
+        {
+            mismatch.keyType = toString(superTable->indexer->indexType);
+            if (mismatch.keyType != "number")
+                mismatch.shape = ReadWriteShape::Map;
+        }
+    }
+    else
+        mismatch.propertyName = property->name;
+
+    mismatch.wantedContainer = toString(superContainerTy);
+    mismatch.givenContainer = toString(subContainerTy);
+    mismatch.wanted = toString(superTy);
+    mismatch.containerPath = containerPath;
+
+    // The member of an expected union that the given side lacks names the difference concretely.
+    if (superPathIsWider)
+    {
+        if (std::optional<TypeOrPack> widenedMember = traverse(superTy, reasoning->superPath, builtinTypes, arena))
+        {
+            if (const TypeId* memberTy = get<TypeId>(*widenedMember))
+            {
+                mismatch.widenedWithNil = isNil(follow(*memberTy));
+                mismatch.widenedMember = toString(*memberTy);
+            }
+        }
+    }
+
+    mismatch.parameterHelpPath = failsAtSlot ? reasoning->superPath : path;
+    return mismatch;
+}
+
+// Luwu (helpful subtyping errors): printed after the given type of a read/write mismatch. `read` is the keyword.
+static constexpr const char* kReadWriteNote = "(read works, write doesn't)";
+
+// Luwu (helpful subtyping errors): where a writer would put a value in the given value, `config.columns`. Only a name
+// followed by property reads is something a reader can find.
+static std::optional<std::string> writtenPlace(const ReadWriteMismatch& mismatch)
+{
+    if (!mismatch.givenName)
+        return std::nullopt;
+
+    std::string place = *mismatch.givenName;
+    for (const TypePath::Component& component : mismatch.containerPath.components)
+    {
+        const TypePath::Property* property = get_if<TypePath::Property>(&component);
+        if (!property || !property->isRead)
+            return std::nullopt;
+        place += "." + property->name;
+    }
+    return place;
+}
+
+static ReadWriteExplanation wordReadWriteMismatch(const ReadWriteMismatch& mismatch, const Helpifier& helpifier)
+{
+    auto quote = [](const std::string& s)
+    {
+        return "'" + s + "'";
+    };
+
+    const bool isProperty = mismatch.shape == ReadWriteShape::Property;
+    const bool isMap = mismatch.shape == ReadWriteShape::Map;
+    const bool hasFunction = !mismatch.functionName.empty();
+    const std::string noun = isMap ? "map" : "array";
+    const std::string plural = isMap ? "values" : "elements";
+    const std::string property = quote(mismatch.propertyName);
+    const std::string wantedContainer = quote(mismatch.wantedContainer);
+    const std::string givenContainer = quote(mismatch.givenContainer);
+    const std::string wanted = quote(mismatch.wantedLeaf);
+    const std::string given = quote(mismatch.givenLeaf);
+    const std::string function = "the function " + quote(mismatch.functionName);
+
+    // The help goes on the parameter, where "it" would otherwise read as the indexer or the property
+    // being marked rather than as the thing doing the reading. This line is only ever reported for a
+    // call argument, so the reader is always the callee.
+    const std::string reader = hasFunction ? function : "the function";
+    std::string parameterHelp = helpifier(
+        "read/write mismatch",
+        {isProperty ? "Consider marking " + property + " as 'read' if " + reader + " only reads from it"
+                    : "Consider marking this as 'read' if " + reader + " only reads from the " + noun}
+    );
+
+    // A union member the given type never admitted -- `nil` most often, but any of them. Nothing is lost,
+    // one disallowed value could simply be written in, so the help is to mark it `read` or cast.
+    if (mismatch.widenedMember)
+    {
+        const std::string member = quote(*mismatch.widenedMember);
+        const std::string writtenValue = mismatch.widenedWithNil ? member : "a " + member;
+
+        std::string message;
+        if (!mismatch.widenedWithNil)
+        {
+            // Both types on their own lines, as every other expected/got mismatch prints them, so the
+            // one member that differs can be found by eye.
+            const std::string target = isProperty ? property : ("your " + noun);
+            message = "Expected this to be\n    " + wantedContainer + "\nbut got\n    " + givenContainer + "\nThis incorrectly allows a " + member +
+                      " to be written to " + target + ".";
+        }
+        else
+        {
+            // "passed" is right for an argument; an assignment or a return is merely a use.
+            const std::string verb = mismatch.isArgument ? "passed" : "used";
+            if (isProperty)
+                message = "Property " + property + " is non-optional, so this cannot be " + verb +
+                          " where it is allowed to be optional; doing so would allow 'nil' to be written into it.";
+            else
+                message = "This " + noun + " with non-optional " + plural + " cannot be " + verb + " where optional " + plural +
+                          " are allowed; doing so would allow 'nil' to be written into it.";
+        }
+
+        helpifier.appendTo(
+            message,
+            "read/write mismatch",
+            {"Annotate " + (isProperty ? property : std::string("the expected indexer")) + " as 'read' if nothing writes to it",
+             "Cast this " + (isProperty ? std::string() : noun + " ") + "to " + wantedContainer + " if you know " + writtenValue +
+                 " will not be written to it"}
+        );
+
+        return ReadWriteExplanation{std::move(message), std::move(parameterHelp), mismatch.parameterHelpPath};
+    }
+
+    // Only a wider *shape* reaches here: reading works and writing doesn't. The header says so, and the reason
+    // names what the writer could put in, at the place in the given value it would go.
+    const std::string container = isProperty ? "table" : noun;
+    const std::optional<std::string> place = writtenPlace(mismatch);
+
+    std::string message;
+    if (isProperty)
+    {
+        const std::string slot = place ? quote(*place + "." + mismatch.propertyName) : property;
+        const std::string mustHold = " (which must stay a " + given + ").";
+        if (hasFunction)
+            message = "Because " + quote(mismatch.functionName) + " expects a read/write " + container + ", it could set " + slot + " to any " +
+                      wanted + mustHold;
+        else
+            message = "Because a read/write " + container + " is expected here, " + slot + " could be set to any " + wanted + mustHold;
+    }
+    else
+    {
+        const std::string into = place ? quote(*place) : "the given " + noun;
+        const std::string mustHold = " (which must only hold " + given + ").";
+        if (hasFunction)
+            message = "Because " + quote(mismatch.functionName) + " expects a read/write " + container + ", it could write any " + wanted + " into " +
+                      into + mustHold;
+        else
+            message = "Because a read/write " + container + " is expected here, any " + wanted + " could be written into " + into + mustHold;
+    }
+
+    // `read` on the slot is the fix when nothing writes. At the parameter itself the whole annotation is short;
+    // deeper in, the container that changes is named instead.
+    std::string readFix;
+    if (isProperty)
+        readFix = "mark " + property + " as " + quote("read " + mismatch.propertyName + ": " + mismatch.wantedLeaf) + " in " + wantedContainer;
+    else
+    {
+        const std::string annotation =
+            isMap ? quote("{ read [" + mismatch.keyType + "]: " + mismatch.wantedLeaf + " }") : quote("{ read " + mismatch.wantedLeaf + " }");
+        if (mismatch.containerPath.empty())
+            readFix = hasFunction ? "expect " + annotation : "annotate it as " + annotation;
+        else
+            readFix = "write " + annotation + " in place of " + wantedContainer;
+    }
+
+    const std::string replacement = mismatch.wanted.length() <= kMaxReadWriteTypeLength ? "a " + quote(mismatch.wanted) : "a value of the expected type";
+    const std::string insteadOf = mismatch.givenName ? " instead of " + quote(*mismatch.givenName) : " instead";
+
+    std::string onlyReads;
+    std::string writesToo;
+    if (hasFunction)
+    {
+        const std::string reads = mismatch.parameterName ? quote(*mismatch.parameterName) : "it";
+        onlyReads = "If " + quote(mismatch.functionName) + " only reads " + reads + ", " + readFix;
+        writesToo = "If it also writes, pass it " + replacement + insteadOf;
+    }
+    else
+    {
+        onlyReads = "If nothing writes to it, " + readFix;
+        writesToo = "If something writes to it, use " + replacement + insteadOf;
+    }
+    helpifier.appendTo(message, "read/write mismatch", {onlyReads, writesToo});
+
+    // A reason starting on a new line is a paragraph under the header rather than a continuation of it.
+    ReadWriteExplanation explanation{"\n\n" + message, std::move(parameterHelp), mismatch.parameterHelpPath};
+    explanation.standalone = false;
+    return explanation;
+}
+
+static std::optional<ReadWriteExplanation> explainReadOnlyWouldSatisfy(
+    TypeId subTy,
+    TypeId superTy,
+    const SubtypingResult& result,
+    NotNull<Subtyping> subtyping,
+    NotNull<Scope> scope,
+    NotNull<BuiltinTypes> builtinTypes,
+    NotNull<TypeArena> arena,
+    bool isArgument,
+    const std::string& functionName,
+    const std::optional<std::string>& parameterName,
+    const std::optional<std::string>& givenName,
+    const Helpifier& helpifier
+)
+{
+    std::optional<ReadWriteMismatch> mismatch = findReadWriteMismatch(subTy, superTy, result, subtyping, scope, builtinTypes, arena);
+    if (!mismatch)
+        return std::nullopt;
+
+    mismatch->isArgument = isArgument;
+    mismatch->functionName = functionName;
+    mismatch->parameterName = parameterName;
+    mismatch->givenName = givenName;
+    return wordReadWriteMismatch(*mismatch, helpifier);
+}
+
+// Luwu (helpful subtyping errors): a callback is passed somewhere that will call it with any `Widget`, and it
+// only accepts `Button`. Upstream reports that as "`Button` is not a supertype of `Widget`", which is the
+// definition of contravariance and no help to a reader looking at a `Button` that plainly is a `Widget`.
+// Say what the callback will actually be handed instead.
+static std::optional<std::string> explainContravariantArgument(
+    TypeId subTy,
+    TypeId superTy,
+    const SubtypingResult& result,
+    NotNull<Subtyping> subtyping,
+    NotNull<Scope> scope,
+    NotNull<BuiltinTypes> builtinTypes,
+    NotNull<TypeArena> arena
+)
+{
+    const SubtypingReasoning* reasoning = soleReasoning(result);
+    if (!reasoning || reasoning->variance != SubtypingVariance::Contravariant)
+        return std::nullopt;
+
+    if (reasoning->subPath != reasoning->superPath)
+        return std::nullopt;
+
+    const std::vector<TypePath::Component>& components = reasoning->subPath.components;
+    if (components.size() != 2)
+        return std::nullopt;
+
+    const TypePath::PackField* arguments = get_if<TypePath::PackField>(&components[0]);
+    const TypePath::Index* index = get_if<TypePath::Index>(&components[1]);
+    const bool isArgumentsField = arguments && *arguments == TypePath::PackField::Arguments;
+    const bool isPackIndex = index && index->variant == TypePath::Index::Variant::Pack;
+    if (!isArgumentsField || !isPackIndex)
+        return std::nullopt;
+
+    std::optional<std::pair<TypeId, TypeId>> leaves = typesAtPaths(subTy, reasoning->subPath, superTy, reasoning->superPath, builtinTypes, arena);
+    if (!leaves)
+        return std::nullopt;
+
+    const auto [subLeafTy, superLeafTy] = *leaves;
+
+    // "Not just 'Button'" says the callback handles part of what it will be handed. When the two types
+    // don't nest (a `string` parameter handed a `number`), that is false.
+    if (!subtyping->isSubtype(subLeafTy, superLeafTy, scope).isSubtype)
+        return std::nullopt;
+
+    std::string message = "Expected this to be callable with any '" + toString(superLeafTy) + "'";
+
+    // Naming the parameter is only worth the words when there is more than one to tell apart, and
+    // the name the reader recognizes is the one on the function they wrote -- the side being passed.
+    // Every function defined in Luwu carries an implicit `...any` tail, so only the head counts as
+    // parameters the reader wrote and could tell apart by name.
+    const FunctionType* subFunction = get<FunctionType>(follow(subTy));
+    size_t parameterCount = 0;
+    if (subFunction)
+        parameterCount = flatten(subFunction->argTypes).first.size();
+
+    if (parameterCount > 1)
+    {
+        std::optional<std::string> name;
+        if (subFunction && index->index < subFunction->argNames.size())
+        {
+            if (const std::optional<FunctionArgument>& argument = subFunction->argNames[index->index])
+                name = argument->name;
+        }
+
+        if (name)
+            message += " as parameter '" + *name + "'";
+        else
+            message += " as parameter " + std::to_string(index->index + 1);
+    }
+
+    message += ", not just '" + toString(subLeafTy) + "'.";
+
+    return message;
+}
+
+// Luwu (helpful subtyping errors): where `value` is in the table literal `table`: `.name` for a `name = value` item,
+// `[2]` for the 2nd list item, else nullopt.
+static std::optional<std::string> placeInTableLiteral(const AstExprTable* table, const AstExpr* value)
+{
+    size_t listPosition = 0;
+    for (const AstExprTable::Item& item : table->items)
+    {
+        if (item.kind == AstExprTable::Item::Kind::List)
+            ++listPosition;
+        if (item.value != value)
+            continue;
+        if (item.kind == AstExprTable::Item::Kind::List)
+            return "[" + std::to_string(listPosition) + "]";
+        if (const AstExprConstantString* key = item.kind == AstExprTable::Item::Kind::Record ? item.key->as<AstExprConstantString>() : nullptr)
+            return "." + std::string(key->value.data, key->value.size);
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+// Luwu (helpful subtyping errors): where the value at `location` is being put, when it's a name: the target of
+// `sprite.tint = { ... }`, the local of `local cfg: Config = { ... }`, or a place inside one of those literals
+// (`bus.handlers.craft[1]` for a function in `local bus = { handlers = { craft = { function() end } } }`). A place
+// inside a literal passed to a call is named after the function (`Button.onClick` in `Button({ onClick = ... })`);
+// the literal itself isn't, since the function isn't what it is. A literal has no name of its own, so this names the
+// root of its paths in place of the generic `given`.
+static std::optional<std::string> destinationName(const SourceModule& sourceModule, Location location)
+{
+    std::vector<AstNode*> ancestry = findAstAncestryOfPosition(sourceModule, location.begin);
+
+    // The value is the outermost expression spanning exactly `location`.
+    size_t at = 0;
+    while (at < ancestry.size() && !(ancestry[at]->asExpr() && ancestry[at]->location == location))
+        ++at;
+    if (at == ancestry.size())
+        return std::nullopt;
+
+    // Walks out through the table literals around the value, collecting its place in each, to the statement
+    // that names the outermost one.
+    const AstExpr* value = ancestry[at]->asExpr();
+    std::string place;
+    for (size_t i = at; i > 0; --i)
+    {
+        AstNode* parent = ancestry[i - 1];
+        if (AstExprTable* table = parent->as<AstExprTable>())
+        {
+            std::optional<std::string> step = placeInTableLiteral(table, value);
+            if (!step)
+                return std::nullopt;
+            place = *step + place;
+            value = table;
+            continue;
+        }
+        if (AstExprGroup* group = parent->as<AstExprGroup>())
+        {
+            value = group;
+            continue;
+        }
+        if (AstExprCall* call = parent->as<AstExprCall>())
+        {
+            bool isArgument = std::find(call->args.begin(), call->args.end(), value) != call->args.end();
+            std::string callee = calleeDisplayName(call->func);
+            if (!isArgument || callee.empty() || place.empty())
+                return std::nullopt;
+            return callee + place;
+        }
+        if (AstStatAssign* assign = parent->as<AstStatAssign>())
+        {
+            for (size_t j = 0; j < assign->values.size && j < assign->vars.size; ++j)
+            {
+                if (assign->values.data[j] != value)
+                    continue;
+                std::optional<std::string> target = bindingName(assign->vars.data[j]);
+                return target ? std::optional<std::string>{*target + place} : std::nullopt;
+            }
+            return std::nullopt;
+        }
+        if (AstStatLocal* local = parent->as<AstStatLocal>())
+        {
+            for (size_t j = 0; j < local->values.size && j < local->vars.size; ++j)
+            {
+                if (local->values.data[j] == value)
+                    return std::string{local->vars.data[j]->name.value} + place;
+            }
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+void TypeChecker2::explainError(
+    TypeId subTy,
+    TypeId superTy,
+    Location location,
+    const SubtypingResult& result,
+    std::optional<std::string> contextVerb
+)
+{
+    if (result.isErrorSuppressing)
+        return;
+
+    switch (shouldSuppressErrors(NotNull{&normalizer}, subTy).orElse(shouldSuppressErrors(NotNull{&normalizer}, superTy)))
+    {
+    case ErrorSuppression::Suppress:
+        return;
+    case ErrorSuppression::NormalizationFailed:
+        reportError(NormalizationTooComplex{}, location);
+        break;
+    case ErrorSuppression::DoNotSuppress:
+        break;
+    }
+
+    if (isUncheckedNoneMismatch(subTy, superTy, result, builtinTypes, subtyping->arena))
+    {
+        reportError(GenericError{mayBeNoneMessage(superTy)}, location);
+        return;
+    }
+
+    // Still a TypeMismatch, so `wantedType` and `givenType` survive for anything reading the error rather
+    // than the message; only the rendering is replaced.
+    auto reportWithMessage = [&](std::string message)
+    {
+        TypeMismatch tm{superTy, subTy};
+        tm.overrideMessage = std::move(message);
+        reportError(std::move(tm), location);
+    };
+
+    NotNull<Scope> scope{findInnermostScope(location)};
+    const std::string calleeName = argumentContext ? calleeDisplayName(argumentContext->callee) : std::string{};
+
+    // The value's own name, when the mismatched expression is a variable or a chain of plain
+    // property reads off one (`registry.recipes`), so paths read `leaving.kind`, not `given.kind`.
+    // The expression spanning exactly the error: the innermost one at its start (`req` of
+    // `req.user`) is usually a piece of it.
+    std::optional<std::string> variable;
+    // The mismatched expression, when it spans exactly the error.
+    const AstExpr* mismatched = nullptr;
+    for (AstNode* node : findAstAncestryOfPosition(*sourceModule, location.begin))
+    {
+        if (AstExpr* expr = node->asExpr(); expr && expr->location == location)
+        {
+            variable = bindingName(expr);
+            if (variable && namesItsOwnDeclaration(*variable, subTy))
+                variable = std::nullopt;
+            mismatched = expr;
+            break;
+        }
+    }
+    // A read/write mismatch names where a writer would put a value, which is in the given value, not where it goes.
+    const std::optional<std::string> givenBinding = variable;
+    if (!variable)
+        variable = destinationName(*sourceModule, location);
+
+    std::optional<std::string> parameterName;
+    if (argumentContext && argumentContext->calleeType && argumentContext->parameterIndex < argumentContext->calleeType->argNames.size())
+    {
+        if (const std::optional<FunctionArgument>& argument = argumentContext->calleeType->argNames[argumentContext->parameterIndex])
+            parameterName = argument->name;
+    }
+
+    if (std::optional<ReadWriteExplanation> readWrite = explainReadOnlyWouldSatisfy(
+            subTy,
+            superTy,
+            result,
+            subtyping,
+            scope,
+            builtinTypes,
+            subtyping->arena,
+            argumentContext.has_value(),
+            calleeName,
+            parameterName,
+            givenBinding,
+            helpifier
+        ))
+    {
+        if (readWrite->standalone)
+            reportWithMessage(std::move(readWrite->message));
+        else
+        {
+            TypeMismatch tm{superTy, subTy, std::move(readWrite->message)};
+            tm.givenVariable = variable;
+            tm.givenNote = kReadWriteNote;
+            tm.explained = TypeMismatch::Explained{};
+            reportError(std::move(tm), location);
+        }
+
+        // The value is at the call, but the annotation to change is at the parameter, which can be pages
+        // away. Say so where the edit actually happens, or nowhere if that place can't be found or help is off.
+        if (argumentContext && !readWrite->parameterHelp.empty())
+        {
+            const DeclarationIndex& declarations = getDeclarationIndex();
+            AstType* annotation = parameterAnnotation(argumentContext->calleeType, argumentContext->parameterIndex, module->name, declarations);
+            if (std::optional<Location> helpLocation = annotatedMemberLocation(annotation, readWrite->parameterHelpPath, declarations))
+                reportError(GenericError{std::move(readWrite->parameterHelp)}, *helpLocation);
+        }
+
+        return;
+    }
+
+    if (std::optional<std::string> contravariant = explainContravariantArgument(subTy, superTy, result, subtyping, scope, builtinTypes, subtyping->arena))
+    {
+        reportWithMessage(std::move(*contravariant));
+        return;
+    }
+
+    if (isSimpleNegatedUnionMismatch(subTy, superTy, result))
+    {
+        const NegationType* negation = get<NegationType>(follow(superTy));
+        reportError(
+            GenericError{"Expected this to be anything but '" + toString(negation->ty) + "', got '" + toString(subTy) + "'"},
+            location
+        );
+        return;
+    }
+
+    // Luwu (helpful subtyping errors): a structural diff of the two types, with a path to each place they
+    // disagree, instead of a sentence per subtyping reasoning. It declines types it can't take apart,
+    // which then fall through to the reasonings below.
+    std::optional<MismatchExplanation> explanation;
+    if (FFlag::LuwuHelpfulSubtypingErrors)
+    {
+        std::optional<std::string> callee;
+        if (!calleeName.empty())
+            callee = calleeName;
+        const char* arrival = argumentContext ? "passed" : checkingReturnStatement ? "returned" : "given";
+
+        TypeId given = mismatched ? withWrittenStrings(subTy, mismatched, superTy, *module->internalTypes) : subTy;
+        explanation = explainMismatch(given, superTy, subtyping, scope, builtinTypes, callee, arrival, variable, helpifier);
+    }
+
+    if (explanation && explanation->typo)
+    {
+        // A misspelled value inside a table is reported at the string, when the table is written here.
+        std::optional<Location> typoLocation = location;
+        if (!explanation->typoProperties.empty())
+            typoLocation = mismatched ? literalValueLocation(mismatched, explanation->typoProperties) : std::nullopt;
+        if (typoLocation)
+        {
+            reportError(Typo{explanation->typo->first, explanation->typo->second}, *typoLocation);
+            return;
+        }
+    }
+
+    if (explanation)
+    {
+        TypeMismatch tm{superTy, subTy, explanation->standalone ? std::string() : std::move(explanation->reason)};
+        if (explanation->standalone)
+            tm.overrideMessage = std::move(explanation->reason);
+        tm.wantedName = std::move(explanation->wantedName);
+        tm.givenName = std::move(explanation->givenName);
+        // Paths may be rooted somewhere else, but the value is still called by its name.
+        tm.givenVariable = explanation->givenVariable ? std::move(explanation->givenVariable) : variable;
+        tm.whereDeclarations = std::move(explanation->whereDeclarations);
+        tm.explained = TypeMismatch::Explained{
+            std::move(explanation->wantedExpansion),
+            std::move(explanation->givenExpansion),
+            explanation->notation,
+        };
+        tm.contextVerb = contextVerb;
+        reportError(std::move(tm), location);
+
+        // Where the mismatched properties are declared in this module, unless that's inside the error's own span
+        for (MismatchNote& note : explanation->notes)
+        {
+            if (note.module == module->name && !location.encloses(note.location))
+                module->notes.push_back({note.location, std::move(note.message), location});
+        }
+        return;
+    }
+
+    Reasonings reasonings = explainReasonings(subTy, superTy, location, result);
+
+    if (!reasonings.suppressed)
+    {
+        TypeMismatch tm{superTy, subTy, reasonings.toString()};
+        if (FFlag::LuwuHelpfulSubtypingErrors)
+            tm.givenVariable = variable;
+        tm.contextVerb = reasonings.contextVerb ? reasonings.contextVerb : contextVerb;
+        tm.contextWantedDisplay = reasonings.contextWantedDisplay;
+        tm.contextGivenDisplay = reasonings.contextGivenDisplay;
+        reportError(std::move(tm), location);
+    }
+}
+
+void TypeChecker2::explainError(TypePackId subTy, TypePackId superTy, Location location, const SubtypingResult& result)
+{
+    if (result.isErrorSuppressing)
+        return;
+
+    switch (shouldSuppressErrors(NotNull{&normalizer}, subTy).orElse(shouldSuppressErrors(NotNull{&normalizer}, superTy)))
+    {
+    case ErrorSuppression::Suppress:
+        return;
+    case ErrorSuppression::NormalizationFailed:
+        reportError(NormalizationTooComplex{}, location);
+        break;
+    case ErrorSuppression::DoNotSuppress:
+        break;
+    }
+
+    if (checkingReturnStatement)
+    {
+        if (std::optional<std::string> explanation = explainReturnCountMismatch(subTy, superTy))
+        {
+            TypePackMismatch tpm{superTy, subTy};
+            tpm.overrideMessage = std::move(*explanation);
+            reportError(std::move(tpm), location);
+            return;
+        }
+    }
+
+    // Luwu (helpful subtyping errors): one value against one value (`return x` where one is declared) is a
+    // type mismatch in all but name, and gets the same structural explanation.
+    if (FFlag::LuwuHelpfulSubtypingErrors)
+    {
+        auto [subHead, subTail] = flatten(subTy);
+        auto [superHead, superTail] = flatten(superTy);
+        const bool isOneValueEach = subHead.size() == 1 && superHead.size() == 1 && !subTail && !superTail;
+        if (isOneValueEach)
+        {
+            SubtypingResult single = subtyping->isSubtype(subHead[0], superHead[0], NotNull<Scope>{findInnermostScope(location)});
+            if (!single.isSubtype)
+            {
+                explainError(subHead[0], superHead[0], location, single);
+                return;
+            }
+        }
+    }
+
+    Reasonings reasonings = explainReasonings(subTy, superTy, location, result);
+    if (reasonings.suppressed)
+        return;
+
+    // Luwu (helpful subtyping errors): `...T` against `...U` is about every value, one at a time. Upstream narrates it
+    // as "a tail of the variadic `T` in the latter type and `U` in the former type".
+    if (FFlag::LuwuHelpfulSubtypingErrors)
+    {
+        auto [subHead, subTail] = flatten(subTy);
+        auto [superHead, superTail] = flatten(superTy);
+        const VariadicTypePack* subVariadic = subTail ? get<VariadicTypePack>(follow(*subTail)) : nullptr;
+        const VariadicTypePack* superVariadic = superTail ? get<VariadicTypePack>(follow(*superTail)) : nullptr;
+        const bool onlyVariadics = subHead.empty() && superHead.empty() && subVariadic && superVariadic;
+        if (onlyVariadics)
+        {
+            SubtypingResult each = subtyping->isSubtype(subVariadic->ty, superVariadic->ty, NotNull<Scope>{findInnermostScope(location)});
+            if (!each.isSubtype)
+            {
+                explainError(subVariadic->ty, superVariadic->ty, location, each, checkingReturnStatement ? "every returned value to be" : "every value to be");
+                return;
+            }
+        }
+    }
+
+    reportError(TypePackMismatch{superTy, subTy, reasonings.toString()}, location);
+}
+
+bool TypeChecker2::testLiteralOrAstTypeIsSubtype(AstExpr* expr, TypeId expectedType)
+{
+    NotNull<Scope> scope{findInnermostScope(expr->location)};
+    auto exprTy = lookupType(expr);
+
+    SubtypingResult r;
+
+    if (FFlag::LuauImproveUniqueTableWidthSubtyping && !FFlag::LuauBidirectionalInferenceSimplifyTables)
+    {
+        DenseHashSet<TypeId> uniqueTypes{nullptr};
+        findUniqueTypes(NotNull{&uniqueTypes}, std::vector{expr}, NotNull{&module->astTypes});
+
+        // We create a separate `Subtyping` instance here because, in this
+        // particular context, we have knowledge that any table literals are
+        // unique references to their types.  Because we know that no other
+        // references to those values can exist, we can safely test those table
+        // types covariantly.
+        //
+        // These same TypeIds must _not_ be considered to be unique references
+        // if they occur in any other context, and so we need to separate the
+        // caches.
+
+        Subtyping st{builtinTypes, NotNull{module->internalTypes.get()}, NotNull{&normalizer}, typeFunctionRuntime, ice};
+        st.uniqueTypes = &uniqueTypes;
+
+        r = st.isSubtype(exprTy, expectedType, scope);
+    }
+    else
+    {
+        r = subtyping->isSubtype(exprTy, expectedType, scope);
+    }
+
+    if (r.isSubtype)
+        return true;
+
+    return testPotentialLiteralIsSubtype(expr, expectedType);
+}
+
+// Luwu (helpful subtyping errors): the name a union was written under, or, for an optional one
+// (`GameEvent?`), the name of the one union inside it.
+static std::optional<std::string> unionDisplayName(const UnionType* utv)
+{
+    if (utv->name)
+        return utv->name;
+
+    const UnionType* inner = nullptr;
+    size_t nonNilCount = 0;
+    for (TypeId option : utv->options)
+    {
+        if (isNil(follow(option)))
+            continue;
+
+        ++nonNilCount;
+        inner = get<UnionType>(follow(option));
+    }
+
+    if (nonNilCount == 1 && inner)
+        return inner->name;
+
+    return std::nullopt;
+}
+
+const std::vector<std::string>& TypeChecker2::requiredProperties(const TableType* table)
+{
+    if (const std::vector<std::string>* cached = requiredPropertiesCache.find(table))
+        return *cached;
+
+    std::vector<std::string> required;
+    for (const auto& [name, prop] : table->props)
+    {
+        if (prop.readTy && !isOptional(*prop.readTy))
+            required.push_back(name);
+    }
+    return requiredPropertiesCache[table] = std::move(required);
+}
+
+/// Luwu: `Fields & (A | B)` rewritten as `(Fields & A) | (Fields & B)`, or nullopt unless the intersection has exactly one
+/// union part and every variant simplifies to a single table. The simplifier doesn't distribute an intersection over a
+/// union, and `Fields & oneof<A, B>` always has this shape.
+static std::optional<TypeId> distributeOverTableUnion(
+    NotNull<BuiltinTypes> builtinTypes,
+    NotNull<TypeArena> arena,
+    const IntersectionType* intersection
+)
+{
+    const UnionType* unionPart = nullptr;
+    TypeIds rest;
+    for (TypeId part : intersection)
+    {
+        if (const UnionType* utv = get<UnionType>(part))
+        {
+            if (unionPart)
+                return std::nullopt;
+            unionPart = utv;
+        }
+        else
+            rest.insert(part);
+    }
+
+    if (!unionPart)
+        return std::nullopt;
+
+    std::vector<TypeId> variants;
+    for (TypeId option : unionPart)
+    {
+        TypeIds parts = rest;
+        parts.insert(option);
+        TypeId variant = simplifyIntersection(builtinTypes, arena, std::move(parts)).result;
+        if (!is<TableType>(variant))
+            return std::nullopt;
+        variants.push_back(variant);
+    }
+
+    return arena->addType(UnionType{std::move(variants)});
+}
+
+bool TypeChecker2::testPotentialLiteralIsSubtype(AstExpr* expr, TypeId expectedType)
+{
+    auto exprType = follow(lookupType(expr));
+    expectedType = follow(expectedType);
+
+    if (auto group = expr->as<AstExprGroup>())
+    {
+        return testPotentialLiteralIsSubtype(group->expr, expectedType);
+    }
+    else if (auto ifElse = expr->as<AstExprIfElse>())
+    {
+        bool passes = testPotentialLiteralIsSubtype(ifElse->trueExpr, expectedType);
+        passes &= testPotentialLiteralIsSubtype(ifElse->falseExpr, expectedType);
+        return passes;
+    }
+    else if (auto binExpr = expr->as<AstExprBinary>(); binExpr && binExpr->op == AstExprBinary::Or)
+    {
+        // In this case: `{ ... } or { ... }` is literal _enough_ that
+        // we should do this covariant check.
+        auto relaxedExpectedLhs = module->internalTypes->addType(UnionType{{builtinTypes->falsyType, expectedType}});
+        bool passes = testPotentialLiteralIsSubtype(binExpr->left, relaxedExpectedLhs);
+        passes &= testPotentialLiteralIsSubtype(binExpr->right, expectedType);
+        return passes;
+    }
+    // FIXME: We probably should do a check for `and` here.
+
+    auto exprTable = expr->as<AstExprTable>();
+    auto exprTableType = get<TableType>(exprType);
+    auto expectedTableType = get<TableType>(expectedType);
+
+    // If we don't have a table or the type of the expression isn't a
+    // table, then do a normal subtype test.
+    if (!exprTableType || !exprTable)
+        return testIsSubtype(exprType, expectedType, expr->location);
+
+    // At this point we *know* that the expression is a table and has a specific
+    // table type, but if there isn't an expected table type we should do something
+    // slightly different.
+    if (!expectedTableType)
+    {
+        if (auto utv = get<UnionType>(expectedType))
+        {
+            std::optional<TypeId> matching;
+            if (FFlag::LuauBidirectionalInferenceSimplifyTables)
+                matching = extractMatchingTableType(utv, exprType, builtinTypes, NotNull{module->internalTypes.get()});
+            else
+                matching = extractMatchingTableType_DEPRECATED(utv, exprType, builtinTypes);
+
+            if (matching)
+            {
+                ScopedMemberValue<std::optional<NarrowedLiteral>> narrowed{narrowedLiteralUnion, NarrowedLiteral{expr, utv}};
+                return testLiteralOrAstTypeIsSubtype(expr, *matching);
+            }
+        }
+
+        if (auto itv = get<IntersectionType>(expectedType))
+        {
+            // If we _happen_ to have an intersection of tables, let's try to
+            // construct it and use it as the input to this algorithm.
+            TypeIds parts;
+            parts.insert(begin(itv), end(itv));
+            TypeId simplified = simplifyIntersection(builtinTypes, NotNull{module->internalTypes.get()}, std::move(parts)).result;
+            if (is<TableType>(simplified))
+                return testPotentialLiteralIsSubtype(expr, simplified);
+
+            // Luwu: a table intersected with a union of tables (`Fields & oneof<A, B>`) is checked against the variant the
+            // literal matches, field by field, the way a single table is. Upstream's plain subtyping check rejects a mutable
+            // field `version: Semver` given a `SemanticVersion`. Without a match, the error below names the type as written.
+            NotNull<TypeArena> arena{module->internalTypes.get()};
+            if (std::optional<TypeId> variants = distributeOverTableUnion(builtinTypes, arena, itv))
+            {
+                if (std::optional<TypeId> matching = extractMatchingTableType(get<UnionType>(*variants), exprType, builtinTypes, arena))
+                    return testPotentialLiteralIsSubtype(expr, *matching);
+            }
+        }
+
+        return testIsSubtype(exprType, expectedType, expr->location);
+    }
+
+    Set<std::optional<std::string>> missingKeys{{}};
+    for (const std::string& name : requiredProperties(expectedTableType))
+        missingKeys.insert(name);
+
+    bool isArrayLike = false;
+    if (expectedTableType->indexer)
+    {
+        NotNull<Scope> scope{findInnermostScope(expr->location)};
+
+        auto result = subtyping->isSubtype(/* subTy */ builtinTypes->numberType, /* superTy */ expectedTableType->indexer->indexType, scope);
+        isArrayLike = result.isSubtype || isErrorSuppressing(expr->location, expectedTableType->indexer->indexType);
+    }
+
+    bool isSubtype = true;
+
+    for (const auto& item : exprTable->items)
+    {
+        if (isRecord(item))
+        {
+            const AstArray<char>& s = item.key->as<AstExprConstantString>()->value;
+            std::string keyStr{s.data, s.data + s.size};
+
+            missingKeys.erase(keyStr);
+            auto expectedIt = expectedTableType->props.find(keyStr);
+            if (expectedIt == expectedTableType->props.end())
+            {
+                if (expectedTableType->indexer)
+                {
+                    module->astExpectedTypes[item.key] = expectedTableType->indexer->indexType;
+                    module->astExpectedTypes[item.value] = expectedTableType->indexer->indexResultType;
+                    auto inferredKeyType = module->internalTypes->addType(SingletonType{StringSingleton{keyStr}});
+                    isSubtype &= testIsSubtype(inferredKeyType, expectedTableType->indexer->indexType, item.key->location);
+                    isSubtype &= testPotentialLiteralIsSubtype(item.value, expectedTableType->indexer->indexResultType);
+                }
+                // If there's not an indexer, then by width subtyping we can just do nothing :)
+            }
+            else
+            {
+                // If the type has a read type, then we have an expected type for it, otherwise, we actually don't
+                // care what's assigned to it because the only allowed behavior is writing to that property.
+
+                if (expectedIt->second.readTy)
+                {
+                    module->astExpectedTypes[item.value] = *expectedIt->second.readTy;
+                    isSubtype &= testPotentialLiteralIsSubtype(item.value, *expectedIt->second.readTy);
+                }
+            }
+        }
+        else if (item.kind == AstExprTable::Item::Kind::List)
+        {
+            if (!isArrayLike)
+            {
+                isSubtype = false;
+                reportError(UnexpectedArrayLikeTableItem{}, item.value->location);
+            }
+            // if the indexer index type is not exactly `number`.
+            if (expectedTableType->indexer)
+            {
+                module->astExpectedTypes[item.value] = expectedTableType->indexer->indexResultType;
+                isSubtype &= testPotentialLiteralIsSubtype(item.value, expectedTableType->indexer->indexResultType);
+            }
+        }
+        else if (item.kind == AstExprTable::Item::Kind::General && expectedTableType->indexer)
+        {
+            module->astExpectedTypes[item.key] = expectedTableType->indexer->indexType;
+            module->astExpectedTypes[item.value] = expectedTableType->indexer->indexResultType;
+            isSubtype &= testPotentialLiteralIsSubtype(item.key, expectedTableType->indexer->indexType);
+            isSubtype &= testPotentialLiteralIsSubtype(item.value, expectedTableType->indexer->indexResultType);
+        }
+    }
+
+    if (!missingKeys.empty())
+    {
+        std::vector<Name> temp;
+        temp.reserve(missingKeys.size());
+        for (const auto& key : missingKeys)
+            if (key)
+                temp.push_back(*key);
+        if (FFlag::LuwuHelpfulSubtypingErrors)
+        {
+            // In the order they were declared, which is how the reader will go looking for them; the set
+            // holding them is unordered.
+            auto declaredAt = [&](const Name& name) -> std::optional<Position>
+            {
+                auto it = expectedTableType->props.find(name);
+                if (it == expectedTableType->props.end())
+                    return std::nullopt;
+                if (it->second.typeLocation)
+                    return it->second.typeLocation->begin;
+                if (it->second.location)
+                    return it->second.location->begin;
+                return std::nullopt;
+            };
+            std::sort(temp.begin(), temp.end());
+            std::stable_sort(
+                temp.begin(),
+                temp.end(),
+                [&](const Name& a, const Name& b)
+                {
+                    std::optional<Position> pa = declaredAt(a);
+                    std::optional<Position> pb = declaredAt(b);
+                    if (pa && pb)
+                        return *pa < *pb;
+                    return pa.has_value() && !pb.has_value();
+                }
+            );
+        }
+        MissingProperties missing{expectedType, exprType, std::move(temp)};
+        if (FFlag::LuwuHelpfulSubtypingErrors)
+        {
+            missing.fromTableLiteral = true;
+            missing.givenName = destinationName(*sourceModule, expr->location);
+            const bool isNarrowedFromUnion = narrowedLiteralUnion && narrowedLiteralUnion->literal == expr;
+            const bool isUninstantiatedAlias = expectedTableType->name && expectedTableType->instantiatedTypeParams.empty() &&
+                                               expectedTableType->instantiatedTypePackParams.empty();
+            if (isNarrowedFromUnion)
+                missing.wantedName = unionDisplayName(narrowedLiteralUnion->narrowedFrom);
+            if (!missing.wantedName && isUninstantiatedAlias)
+                missing.wantedName = expectedTableType->name;
+        }
+        reportError(std::move(missing), expr->location);
+        return false;
+    }
+
+    return isSubtype;
+}
+
+bool TypeChecker2::testIsSubtype(TypeId subTy, TypeId superTy, Location location)
+{
+    NotNull<Scope> scope{findInnermostScope(location)};
+    SubtypingResult r = subtyping->isSubtype(subTy, superTy, scope);
+
+    if (r.isErrorSuppressing)
+        return r.isSubtype;
+
+    for (auto& e : r.errors)
+        e.location = location;
+
+    reportErrors(std::move(r.errors));
+    if (r.normalizationTooComplex)
+        reportError(NormalizationTooComplex{}, location);
+
+    if (!r.isSubtype)
+        explainError(subTy, superTy, location, r);
+
+    return r.isSubtype;
+}
+
+bool TypeChecker2::testIsSubtype(TypePackId subTy, TypePackId superTy, Location location)
+{
+    NotNull<Scope> scope{findInnermostScope(location)};
+    SubtypingResult r = subtyping->isSubtype(subTy, superTy, scope, {});
+
+    if (!isErrorSuppressing(location, subTy))
+    {
+        for (auto& e : r.errors)
+            e.location = location;
+    }
+    reportErrors(std::move(r.errors));
+    if (r.normalizationTooComplex)
+        reportError(NormalizationTooComplex{}, location);
+
+    if (!r.isSubtype)
+        explainError(subTy, superTy, location, r);
+
+    return r.isSubtype;
+}
+
+void TypeChecker2::maybeReportSubtypingError(const TypeId subTy, const TypeId superTy, const Location& location)
+{
+    switch (shouldSuppressErrors(NotNull{&normalizer}, subTy).orElse(shouldSuppressErrors(NotNull{&normalizer}, superTy)))
+    {
+    case ErrorSuppression::Suppress:
+        return;
+    case ErrorSuppression::NormalizationFailed:
+        reportError(NormalizationTooComplex{}, location);
+        break;
+    case ErrorSuppression::DoNotSuppress:
+        break;
+    default:
+        break;
+    }
+
+    reportError(TypeMismatch{superTy, subTy}, location);
+}
+
+void TypeChecker2::testIsSubtypeForInStat(const TypeId iterFunc, const TypeId prospectiveFunc, const AstStatForIn& forInStat)
+{
+    LUAU_ASSERT(get<FunctionType>(follow(iterFunc)));
+    LUAU_ASSERT(get<FunctionType>(follow(prospectiveFunc)));
+
+    const Location& iterFuncLocation = forInStat.values.data[0]->location;
+
+    const NotNull<Scope> scope{findInnermostScope(iterFuncLocation)};
+    SubtypingResult r = subtyping->isSubtype(iterFunc, prospectiveFunc, scope);
+
+    if (!isErrorSuppressing(iterFuncLocation, iterFunc))
+    {
+        for (auto& e : r.errors)
+            e.location = iterFuncLocation;
+    }
+    reportErrors(std::move(r.errors));
+
+    if (r.normalizationTooComplex)
+        reportError(NormalizationTooComplex{}, iterFuncLocation);
+
+    if (r.isSubtype)
+        return;
+
+    // TODO, CLI-177651: We do not get amazing errors from this, we probably
+    // want to do something more bidirectional here.
+    explainError(iterFunc, prospectiveFunc, iterFuncLocation, r);
+}
+
+void TypeChecker2::reportError(TypeErrorData data, const Location& location)
+{
+    if (auto utk = get_if<UnknownProperty>(&data))
+    {
+        utk->language = module->language;
+        diagnoseMissingTableKey(utk, data);
+    }
+
+    // Luwu (helpful subtyping errors): an expected/got error names the long types it would print twice.
+    if (FFlag::LuwuHelpfulSubtypingErrors)
+        nameRepeatedTypesInError(data, findInnermostScope(location));
+
+    module->errors.emplace_back(location, module->name, std::move(data));
+
+    if (logger)
+        logger->captureTypeCheckError(module->errors.back());
+}
+
+void TypeChecker2::reportError(TypeError e)
+{
+    reportError(std::move(e.data), e.location);
+}
+
+void TypeChecker2::reportErrors(ErrorVec errors)
+{
+    for (TypeError e : errors)
+        reportError(std::move(e));
+}
+
+/* A helper for checkIndexTypeFromType.
+ *
+ * Returns a pair:
+ * * A boolean indicating that at least one of the constituent typeArguments
+ *     contains the prop, and
+ * * A vector of typeArguments that do not contain the prop.
+ */
+PropertyTypes TypeChecker2::lookupProp(
+    const NormalizedType* norm,
+    const std::string& prop,
+    ValueContext context,
+    const Location& location,
+    TypeId astIndexExprType,
+    std::vector<TypeError>& errors
+)
+{
+    std::vector<TypeId> typesOfProp;
+    std::vector<TypeId> typesMissingTheProp;
+
+    // this is `false` if we ever hit the resource limits during any of our uses of `fetch`.
+    bool normValid = true;
+
+    auto fetch = [&](TypeId ty)
+    {
+        NormalizationResult result = normalizer.isInhabited(ty);
+        if (result == NormalizationResult::HitLimits)
+            normValid = false;
+        if (result != NormalizationResult::True)
+            return;
+
+        DenseHashSet<TypeId> seen{nullptr};
+        PropertyType res = hasIndexTypeFromType(ty, prop, context, location, seen, astIndexExprType, errors);
+
+        if (res.present == NormalizationResult::HitLimits)
+        {
+            normValid = false;
+            return;
+        }
+
+        if (res.present == NormalizationResult::True && res.result)
+            typesOfProp.emplace_back(*res.result);
+
+        if (res.present == NormalizationResult::False)
+            typesMissingTheProp.push_back(ty);
+    };
+
+    if (normValid)
+        fetch(norm->tops);
+    if (normValid)
+        fetch(norm->booleans);
+
+    if (FFlag::LuwuClasses)
+    {
+        // Luwu Classes (rfcs/classes): upstream checks each extern type part on its own here, so that a union of
+        // objects needs the property on every member. It skips the table shapes intersected with those parts, so
+        // upstream reports `Instance` as missing `brushes` in `Instance & { brushes: Instance }`. A shape that has the
+        // property gives it to every part; the shape-aware lookup below adds its type.
+        bool shapeHasProp = false;
+        for (TypeId shape : norm->externTypes.shapeExtensions)
+        {
+            DenseHashSet<TypeId> seen{nullptr};
+            // The shape-aware lookup below reports this shape's errors; don't report them twice.
+            std::vector<TypeError> shapeErrors;
+            PropertyType res = hasIndexTypeFromType(shape, prop, context, location, seen, astIndexExprType, shapeErrors);
+
+            if (res.present == NormalizationResult::HitLimits)
+                normValid = false;
+
+            if (res.present == NormalizationResult::True)
+            {
+                shapeHasProp = true;
+                break;
+            }
+        }
+
+        if (normValid && !shapeHasProp)
+        {
+            for (const auto& partTy : norm->externTypes.ordering)
+            {
+                fetch(partTy);
+                if (!normValid)
+                    break;
+            }
+        }
+    }
+
+    // TODO: the subsequent code here is basically proof that this broader approach to doing indexing isn't quite right.
+    // we _should_ be leveraging one unified implementation of indexing here, shared with e.g. the `index` type function.
+    if (normValid)
+    {
+        // each individual extern type consists of a collection of extern types in a normal form, and a collection of table types describing the
+        // shapes further. extern types and tables are both open to extension in general, and therefore, we need to consider the possibility that a
+        // subset of these types might not be contributing to the type of the index, but that the index should nevertheless be valid still. towards
+        // that end, we want to look through all of the components to see if any of them have the index before making a judgment if the extern types
+        // portion as a whole has the index.
+
+        std::vector<TypeId> localTypesOfProp;
+
+        for (const auto& [ty, _negations] : norm->externTypes.externTypes)
+        {
+            NormalizationResult result = normalizer.isInhabited(ty);
+            if (result == NormalizationResult::HitLimits)
+                normValid = false;
+            if (result != NormalizationResult::True)
+                continue;
+
+            DenseHashSet<TypeId> seen{nullptr};
+            PropertyType res = hasIndexTypeFromType(ty, prop, context, location, seen, astIndexExprType, errors);
+
+            if (res.present == NormalizationResult::HitLimits)
+            {
+                normValid = false;
+                continue;
+            }
+
+            if (res.present == NormalizationResult::True && res.result)
+                localTypesOfProp.emplace_back(*res.result);
+        }
+
+        for (TypeId ty : norm->externTypes.shapeExtensions)
+        {
+            NormalizationResult result = normalizer.isInhabited(ty);
+            if (result == NormalizationResult::HitLimits)
+                normValid = false;
+            if (result != NormalizationResult::True)
+                continue;
+
+            DenseHashSet<TypeId> seen{nullptr};
+            PropertyType res = hasIndexTypeFromType(ty, prop, context, location, seen, astIndexExprType, errors);
+
+            if (res.present == NormalizationResult::HitLimits)
+            {
+                normValid = false;
+                continue;
+            }
+
+            if (res.present == NormalizationResult::True && res.result)
+                localTypesOfProp.emplace_back(*res.result);
+        }
+
+        if (!localTypesOfProp.empty())
+            typesOfProp.insert(typesOfProp.end(), localTypesOfProp.begin(), localTypesOfProp.end());
+        else
+        {
+            typesMissingTheProp.insert(typesMissingTheProp.end(), norm->externTypes.ordering.begin(), norm->externTypes.ordering.end());
+            typesMissingTheProp.insert(typesMissingTheProp.end(), norm->externTypes.shapeExtensions.begin(), norm->externTypes.shapeExtensions.end());
+        }
+    }
+    else if (normValid)
+    {
+        for (const auto& [ty, _negations] : norm->externTypes.externTypes)
+        {
+            fetch(ty);
+
+            if (!normValid)
+                break;
+        }
+    }
+
+    if (normValid)
+        fetch(norm->errors);
+    if (normValid)
+        fetch(norm->nils);
+    if (normValid)
+        fetch(norm->nones);
+    if (normValid)
+        fetch(norm->numbers);
+    if (normValid && !norm->strings.isNever())
+        fetch(builtinTypes->stringType);
+    if (normValid)
+        fetch(norm->threads);
+    if (normValid)
+        fetch(norm->buffers);
+
+    if (normValid)
+    {
+        for (TypeId ty : norm->tables)
+        {
+            fetch(ty);
+
+            if (!normValid)
+                break;
+        }
+    }
+
+    if (normValid && norm->functions.isTop)
+        fetch(builtinTypes->functionType);
+    else if (normValid && !norm->functions.isNever())
+    {
+        if (norm->functions.parts.size() == 1)
+            fetch(norm->functions.parts.front());
+        else
+        {
+            std::vector<TypeId> parts;
+            parts.insert(parts.end(), norm->functions.parts.begin(), norm->functions.parts.end());
+            fetch(module->internalTypes->addType(IntersectionType{std::move(parts)}));
+        }
+    }
+
+    if (normValid)
+    {
+        for (const auto& [tyvar, intersect] : norm->tyvars)
+        {
+            if (get<NeverType>(intersect->tops))
+            {
+                TypeId ty = normalizer.typeFromNormal(*intersect);
+                fetch(module->internalTypes->addType(IntersectionType{{tyvar, ty}}));
+            }
+            else
+                fetch(follow(tyvar));
+
+            if (!normValid)
+                break;
+        }
+    }
+
+    return {std::move(typesOfProp), std::move(typesMissingTheProp)};
+}
+
+// Luwu: `(Ok | Err) & { methods }` read as the union in it, when only the union decides whether `prop` is there. The
+// missing members are the union's own ('Err') instead of the normalized intersections, which print in full.
+static std::optional<MissingUnionProperty> missingFromIntersectedUnion(TypeId ty, const std::string& prop, bool showHelp)
+{
+    const IntersectionType* intersection = get<IntersectionType>(follow(ty));
+    if (!intersection)
+        return std::nullopt;
+
+    TypeId unionTy = nullptr;
+    for (TypeId part : intersection->parts)
+    {
+        const TableType* table = get<TableType>(follow(part));
+        if (table && !table->props.count(prop))
+            continue;
+        if (unionTy || !get<UnionType>(follow(part)))
+            return std::nullopt;
+        unionTy = part;
+    }
+    if (!unionTy)
+        return std::nullopt;
+
+    std::vector<TypeId> missing;
+    for (TypeId option : get<UnionType>(follow(unionTy))->options)
+    {
+        const TableType* table = get<TableType>(follow(option));
+        if (!table)
+            return std::nullopt;
+        if (!table->props.count(prop))
+            missing.push_back(option);
+    }
+    if (missing.empty())
+        return std::nullopt;
+    return MissingUnionProperty{ty, std::move(missing), prop, showHelp};
+}
+
+// Luwu: `T` for an optional `T | none` whose `none` is the only member missing a key
+static std::optional<TypeId> withoutMissingNone(TypeId tableTy, const std::vector<TypeId>& missing, TypeArena& arena)
+{
+    const UnionType* options = get<UnionType>(follow(tableTy));
+    if (!options || !std::all_of(missing.begin(), missing.end(), isNone))
+        return std::nullopt;
+
+    std::vector<TypeId> rest;
+    for (TypeId option : options)
+    {
+        if (!isNone(option))
+            rest.push_back(option);
+    }
+
+    if (rest.empty())
+        return std::nullopt;
+    if (rest.size() == 1)
+        return rest[0];
+    return arena.addType(UnionType{std::move(rest)});
+}
+
+bool TypeChecker2::checkIndexTypeFromType(
+    TypeId tableTy,
+    const std::string& prop,
+    ValueContext context,
+    const Location& location,
+    TypeId astIndexExprType,
+    const std::string& receiver,
+    bool methodCall
+)
+{
+    std::shared_ptr<const NormalizedType> norm = normalizer.normalize(tableTy);
+    if (!norm)
+    {
+        reportError(NormalizationTooComplex{}, location);
+        return false;
+    }
+
+    // if the type is error suppressing, we don't actually have any work left to do.
+    if (norm->shouldSuppressErrors())
+        return false;
+
+    std::vector<TypeError> dummy;
+    const auto propTypes = lookupProp(norm.get(), prop, context, location, astIndexExprType, module->errors);
+
+    // Luwu: nothing in the type has the property or lacks it, which happens when there's nothing in the type at all
+    bool foundNothing = !propTypes.foundOneProp() && !propTypes.foundMissingProp();
+    if (foundNothing && isUninhabited(norm.get()))
+        return true;
+
+    if (propTypes.foundMissingProp())
+    {
+        std::optional<TypeId> withoutNone = withoutMissingNone(tableTy, propTypes.missingProp, *module->internalTypes);
+        if (propTypes.foundOneProp() && withoutNone)
+        {
+            // A method call's self argument reports the same mistake
+            if (!methodCall)
+                reportError(GenericError{mayBeNoneMessage(*withoutNone)}, location);
+        }
+        else if (propTypes.foundOneProp())
+        {
+            std::optional<MissingUnionProperty> fromUnion = missingFromIntersectedUnion(tableTy, prop, helpifier.enabled);
+            MissingUnionProperty error = fromUnion.value_or(MissingUnionProperty{tableTy, propTypes.missingProp, prop, helpifier.enabled});
+            // `receiver` ends in the `.` or `:` it was read with
+            error.receiver = receiver.empty() ? "" : receiver.substr(0, receiver.size() - 1);
+            error.membersDeclaredHere = std::all_of(
+                error.missing.begin(),
+                error.missing.end(),
+                [&](TypeId member)
+                {
+                    const TableType* table = get<TableType>(follow(member));
+                    return table && table->definitionModuleName == module->name;
+                }
+            );
+            reportError(std::move(error), location);
+        }
+        // For class LValues, we don't want to report an extension error,
+        // because extern typeArguments come into being with full knowledge of their
+        // shape. We instead want to report the unknown property error of
+        // the `else` branch.
+        else if (context == ValueContext::LValue)
+        {
+            const auto lvPropTypes = lookupProp(norm.get(), prop, ValueContext::RValue, location, astIndexExprType, dummy);
+            if (lvPropTypes.foundOneProp() && lvPropTypes.noneMissingProp())
+                reportError(PropertyAccessViolation{tableTy, prop, PropertyAccessViolation::CannotWrite}, location);
+            else if (get<PrimitiveType>(tableTy) || get<FunctionType>(tableTy))
+                reportError(NotATable{tableTy}, location);
+            else if (auto et = get<ExternType>(tableTy))
+            {
+                // Luwu Classes (rfcs/classes): upstream calls a write to a missing property of an extern type
+                // "read-only", since an embedder's type can't grow new properties. For an object, class or trait
+                // that hides a misspelled field name, so report the field as not found.
+                bool reportAsUnknown = et->indexer || luwuNominalKind(tableTy);
+                if (reportAsUnknown)
+                    reportMissingProperty(UnknownProperty{tableTy, prop}, tableTy, prop, receiver, location);
+                else
+                    reportMissingProperty(PropertyAccessViolation{tableTy, prop, PropertyAccessViolation::CannotWrite}, tableTy, prop, receiver, location);
+            }
+            else
+                reportMissingProperty(CannotExtendTable{tableTy, CannotExtendTable::Property, prop}, tableTy, prop, receiver, location);
+        }
+        else if (context == ValueContext::RValue)
+        {
+            const auto rvPropTypes = lookupProp(norm.get(), prop, ValueContext::LValue, location, astIndexExprType, dummy);
+            if (rvPropTypes.foundOneProp() && rvPropTypes.noneMissingProp())
+                reportError(PropertyAccessViolation{tableTy, prop, PropertyAccessViolation::CannotRead}, location);
+            else
+                reportMissingProperty(UnknownProperty{tableTy, prop}, tableTy, prop, receiver, location);
+        }
+        else
+            reportMissingProperty(UnknownProperty{tableTy, prop}, tableTy, prop, receiver, location);
+    }
+
+    return false;
+}
+
+// Luwu collections: the table of methods `none` has while the library exists (`get` and `expect`, from makeNoneMetatable)
+static std::optional<TypeId> noneMethods(TypeId ty)
+{
+    const PrimitiveType* none = get<PrimitiveType>(ty);
+    if (!none || none->type != PrimitiveType::NoneType || !none->metatable)
+        return std::nullopt;
+
+    const TableType* metatable = get<TableType>(follow(*none->metatable));
+    if (!metatable)
+        return std::nullopt;
+
+    auto index = metatable->props.find("__index");
+    if (index == metatable->props.end() || !index->second.readTy)
+        return std::nullopt;
+
+    return follow(*index->second.readTy);
+}
+
+PropertyType TypeChecker2::hasIndexTypeFromType(
+    TypeId ty,
+    const std::string& prop,
+    ValueContext context,
+    const Location& location,
+    DenseHashSet<TypeId>& seen,
+    TypeId astIndexExprType,
+    std::vector<TypeError>& errors
+)
+{
+    // If we have already encountered this type, we must assume that some
+    // other codepath will do the right thing and signal false if the
+    // property is not present.
+    if (seen.contains(ty))
+        return {NormalizationResult::True, {}};
+    seen.insert(ty);
+
+    if (get<ErrorType>(ty) || get<AnyType>(ty) || get<NeverType>(ty))
+        return {NormalizationResult::True, {ty}};
+
+    if (isString(ty))
+    {
+        std::optional<TypeId> mtIndex = Luau::findMetatableEntry(builtinTypes, errors, builtinTypes->stringType, "__index", location);
+        LUAU_ASSERT(mtIndex);
+        ty = *mtIndex;
+    }
+    else if (std::optional<TypeId> methods = noneMethods(ty); methods && context == ValueContext::RValue)
+        ty = *methods;
+
+    if (auto tt = getTableType(ty))
+    {
+        if (auto resTy = findTablePropertyRespectingMeta(builtinTypes, errors, ty, prop, context, location, /* useNewSolver */ true))
+            return {NormalizationResult::True, resTy};
+
+        if (tt->indexer)
+        {
+            TypeId indexType = follow(tt->indexer->indexType);
+            TypeId givenType = module->internalTypes->addType(SingletonType{StringSingleton{prop}});
+            bool keyMatches = subtyping->isSubtype(givenType, indexType, NotNull{module->getModuleScope().get()}).isSubtype;
+
+            if (keyMatches)
+            {
+                if (context == ValueContext::LValue && tt->indexer->isReadOnly)
+                    return {NormalizationResult::False, {}};
+                return {NormalizationResult::True, {tt->indexer->indexResultType}};
+            }
+        }
+
+        return {NormalizationResult::False, {builtinTypes->unknownType}};
+    }
+    else if (const ExternType* cls = get<ExternType>(ty))
+    {
+        // If the property doesn't exist on the class, we consult the indexer
+        // We need to check if the type of the index expression foo (x[foo])
+        // is compatible with the indexer's indexType
+        // Construct the intersection and test inhabitedness!
+        if (auto property = lookupExternTypeProp(cls, prop))
+        {
+            if ((context == ValueContext::LValue && !property->writeTy) || (context == ValueContext::RValue && !property->readTy))
+                return {NormalizationResult::False, {}};
+            else
+                return {NormalizationResult::True, context == ValueContext::LValue ? property->writeTy : property->readTy};
+        }
+        if (cls->indexer)
+        {
+            TypeId inhabitedTestType = module->internalTypes->addType(IntersectionType{{cls->indexer->indexType, astIndexExprType}});
+            return {normalizer.isInhabited(inhabitedTestType), {cls->indexer->indexResultType}};
+        }
+
+        if (FFlag::LuwuClasses)
+        {
+            if (cls->metatable)
+            {
+                // For user-defined classes, the object metatable holds metamethods (e.g. __add)
+                // directly in its props rather than under an __index table.
+                if (const TableType* mtt = get<TableType>(follow(*cls->metatable)))
+                {
+                    if (auto mtProp = mtt->props.find(prop); mtProp != mtt->props.end())
+                    {
+                        if ((context == ValueContext::LValue && !mtProp->second.writeTy) ||
+                            (context == ValueContext::RValue && !mtProp->second.readTy))
+                            return {NormalizationResult::False, {}};
+                        return {NormalizationResult::True, context == ValueContext::LValue ? mtProp->second.writeTy : mtProp->second.readTy};
+                    }
+                }
+            }
+        }
+
+        return {NormalizationResult::False, {}};
+    }
+    else if (const UnionType* utv = get<UnionType>(ty))
+    {
+        std::vector<TypeId> parts;
+        parts.reserve(utv->options.size());
+
+        for (TypeId part : utv)
+        {
+            PropertyType result = hasIndexTypeFromType(part, prop, context, location, seen, astIndexExprType, errors);
+
+            if (result.present != NormalizationResult::True)
+                return {result.present, {}};
+            if (result.result)
+                parts.emplace_back(*result.result);
+        }
+
+        if (parts.size() == 0)
+            return {NormalizationResult::False, {}};
+
+        if (parts.size() == 1)
+            return {NormalizationResult::True, {parts[0]}};
+
+        TypeId propTy;
+        if (context == ValueContext::LValue)
+            propTy = module->internalTypes->addType(IntersectionType{std::move(parts)});
+        else
+            propTy = module->internalTypes->addType(UnionType{std::move(parts)});
+
+        return {NormalizationResult::True, propTy};
+    }
+    else if (const IntersectionType* itv = get<IntersectionType>(ty))
+    {
+        for (TypeId part : itv)
+        {
+            PropertyType result = hasIndexTypeFromType(part, prop, context, location, seen, astIndexExprType, errors);
+            if (result.present != NormalizationResult::False)
+                return result;
+        }
+
+        return {NormalizationResult::False, {}};
+    }
+    else if (const PrimitiveType* pt = get<PrimitiveType>(ty))
+        return {(inConditional(typeContext) && pt->type == PrimitiveType::Table) ? NormalizationResult::True : NormalizationResult::False, {ty}};
+    else
+        return {NormalizationResult::False, {}};
+}
+
+void TypeChecker2::suggestAnnotations(AstExprFunction* expr, TypeId ty)
+{
+    const FunctionType* inferredFtv = get<FunctionType>(ty);
+    LUAU_ASSERT(inferredFtv);
+
+    VecDeque<TypeId> workList;
+    DenseHashSet<TypeId> seen{nullptr};
+
+    TypeFunctionReductionGuesser guesser{NotNull{module->internalTypes.get()}, builtinTypes, NotNull{&normalizer}};
+    for (TypeId retTy : inferredFtv->retTypes)
+        workList.push_back(retTy);
+
+    while (!workList.empty())
+    {
+        TypeId t = follow(workList.front());
+        workList.pop_front();
+
+        if (seen.contains(t))
+            continue;
+        seen.insert(t);
+
+        if (auto ut = get<UnionType>(t))
+        {
+            for (TypeId t : ut)
+                workList.push_back(t);
+        }
+        else if (auto it = get<IntersectionType>(t))
+        {
+            for (TypeId t : it)
+                workList.push_back(t);
+        }
+        else if (get<TypeFunctionInstanceType>(t))
+        {
+            TypeFunctionReductionGuessResult result = guesser.guessTypeFunctionReductionForFunctionExpr(*expr, inferredFtv, t);
+            if (result.shouldRecommendAnnotation && !get<UnknownType>(result.guessedReturnType))
+                reportError(
+                    ExplicitFunctionAnnotationRecommended{std::move(result.guessedFunctionAnnotations), result.guessedReturnType}, expr->location
+                );
+        }
+    }
+}
+
+void TypeChecker2::checkTypeInstantiation(
+    AstExpr* baseFunctionExpr,
+    TypeId fnType,
+    const Location& location,
+    const AstArray<AstTypeOrPack>& typeArguments
+)
+{
+    const FunctionType* ftv = get<FunctionType>(follow(fnType));
+    if (!ftv)
+    {
+        InstantiateGenericsOnNonFunction::InterestingEdgeCase interestingEdgeCase = InstantiateGenericsOnNonFunction::InterestingEdgeCase::None;
+
+        if (findMetatableEntry(builtinTypes, module->errors, fnType, "__call", location).has_value())
+        {
+            interestingEdgeCase = InstantiateGenericsOnNonFunction::InterestingEdgeCase::MetatableCall;
+        }
+        else if (get<IntersectionType>(follow(fnType)))
+        {
+            interestingEdgeCase = InstantiateGenericsOnNonFunction::InterestingEdgeCase::Intersection;
+        }
+
+        reportError(
+            InstantiateGenericsOnNonFunction{
+                interestingEdgeCase,
+            },
+            location
+        );
+
+        return;
+    }
+
+    size_t typeCount = 0;
+    size_t typePackCount = 0;
+
+    for (const AstTypeOrPack& typeOrPack : typeArguments)
+    {
+        if (typeOrPack.type)
+        {
+            visit(typeOrPack.type);
+            ++typeCount;
+        }
+        else
+        {
+            LUAU_ASSERT(typeOrPack.typePack);
+            visit(typeOrPack.typePack);
+            ++typePackCount;
+        }
+    }
+
+    if (ftv->generics.size() < typeCount || ftv->genericPacks.size() < typePackCount)
+    {
+        reportError(
+            TypeInstantiationCountMismatch{
+                getIdentifierOfBaseVar(baseFunctionExpr), fnType, typeCount, ftv->generics.size(), typePackCount, ftv->genericPacks.size()
+            },
+            location
+        );
+    }
+}
+
+
+// Luwu (helpful subtyping errors): a chain of `__index` tables (or of parent classes) longer than this isn't searched
+// for a name a property was misspelled from. Metatables can point at themselves.
+constexpr int kMaxIndexChain = 8;
+
+// Luwu (helpful subtyping errors): the names a value of type `ty` can be indexed with: a table's properties and its
+// metatable's `__index`, a string's methods, an object's fields and methods.
+static void collectIndexableNames(TypeId ty, std::vector<std::string>& names, int depth)
+{
+    if (depth > kMaxIndexChain)
+        return;
+    ty = follow(ty);
+
+    auto indexOf = [&](TypeId metatable)
+    {
+        const TableType* table = get<TableType>(follow(metatable));
+        if (!table)
+            return;
+        auto index = table->props.find("__index");
+        if (index != table->props.end() && index->second.readTy)
+            collectIndexableNames(*index->second.readTy, names, depth + 1);
+    };
+
+    if (const TableType* table = get<TableType>(ty))
+    {
+        for (const auto& [name, _] : table->props)
+            names.push_back(name);
+    }
+    else if (const MetatableType* metatable = get<MetatableType>(ty))
+    {
+        collectIndexableNames(metatable->table, names, depth + 1);
+        indexOf(metatable->metatable);
+    }
+    else if (const PrimitiveType* primitive = get<PrimitiveType>(ty); primitive && primitive->metatable)
+        indexOf(*primitive->metatable);
+    else if (const ExternType* extern_ = get<ExternType>(ty))
+    {
+        for (const auto& [name, _] : extern_->props())
+            names.push_back(name);
+        if (extern_->parent)
+            collectIndexableNames(*extern_->parent, names, depth + 1);
+    }
+}
+
+// Luwu Classes (rfcs/classes): whether `tableTy` is a class value whose objects have a field named `prop` (`Paint.gloss`)
+static bool isFieldOfItsObjects(TypeId tableTy, const std::string& prop)
+{
+    const ExternType* classValue = get<ExternType>(follow(tableTy));
+    const char* kind = classValue ? nominalValueKind(*classValue) : nullptr;
+    if (!kind || std::string_view(kind) != "class")
+        return false;
+
+    const Obj* obj = classValue->relation->get_if<Obj>();
+    const ExternType* object = obj ? get<ExternType>(follow(obj->ty)) : nullptr;
+    return object && object->props().count(prop) > 0;
+}
+
+void TypeChecker2::reportMissingProperty(TypeErrorData error, TypeId tableTy, const std::string& prop, const std::string& receiver, const Location& location)
+{
+    // A field read off its class is spelled right, so it's never a typo
+    if (UnknownProperty* unknown = get_if<UnknownProperty>(&error); unknown && isFieldOfItsObjects(tableTy, prop))
+    {
+        unknown->fieldOfItsObjects = true;
+        unknown->showHelp = helpifier.enabled;
+        reportError(std::move(error), location);
+        return;
+    }
+
+    std::optional<std::string> meant;
+    if (FFlag::LuwuHelpfulSubtypingErrors)
+    {
+        std::vector<std::string> names;
+        collectIndexableNames(tableTy, names, 0);
+        // Upstream suggests a property that differs only in case (UnknownPropButFoundLikeProp), which says more
+        bool differsInCase = std::any_of(
+            names.begin(),
+            names.end(),
+            [&](const std::string& name)
+            {
+                return name != prop && equalsLower(name, prop);
+            }
+        );
+        if (!differsInCase)
+            meant = closestSpelling(prop, names);
+    }
+    if (!meant)
+    {
+        reportError(std::move(error), location);
+        return;
+    }
+
+    Typo typo{receiver + prop, receiver + *meant};
+    // A compound assignment checks its target twice, as a write and then as a read
+    const TypeError* last = module->errors.empty() ? nullptr : &module->errors.back();
+    const Typo* lastTypo = last && last->location == location ? get<Typo>(*last) : nullptr;
+    if (!lastTypo || !(*lastTypo == typo))
+        reportError(std::move(typo), location);
+}
+
+void TypeChecker2::diagnoseMissingTableKey(UnknownProperty* utk, TypeErrorData& data) const
+{
+    std::string_view sv(utk->key);
+    std::set<Name> candidates;
+
+    auto accumulate = [&](const TableType::Props& props)
+    {
+        for (const auto& [name, ty] : props)
+        {
+            if (sv != name && equalsLower(sv, name))
+                candidates.insert(name);
+        }
+    };
+
+    if (auto ttv = getTableType(utk->table))
+        accumulate(ttv->props);
+    else if (auto etv = get<ExternType>(follow(utk->table)))
+    {
+        while (etv)
+        {
+            accumulate(etv->props());
+
+            if (!etv->parent)
+                break;
+
+            etv = get<ExternType>(*etv->parent);
+            LUAU_ASSERT(etv);
+        }
+    }
+
+    if (!candidates.empty())
+        data = TypeErrorData(UnknownPropButFoundLikeProp{utk->table, utk->key, std::move(candidates)});
+}
+
+// Luwu: `x` for `x`, `(x)` and `x.y.z`, `x[k]` or `x.f()`: the expression a use is read through
+static const AstExpr* rootOf(AstExpr* expr)
+{
+    while (true)
+    {
+        if (AstExprGroup* group = expr->as<AstExprGroup>())
+            expr = group->expr;
+        else if (AstExprIndexName* indexName = expr->as<AstExprIndexName>())
+            expr = indexName->expr;
+        else if (AstExprIndexExpr* indexExpr = expr->as<AstExprIndexExpr>())
+            expr = indexExpr->expr;
+        else if (AstExprCall* call = expr->as<AstExprCall>())
+            expr = call->func;
+        else
+            return expr;
+    }
+}
+
+// Luwu: the local a use is read through, if it's one
+static const AstExprLocal* rootLocal(AstExpr* expr)
+{
+    return rootOf(expr)->as<AstExprLocal>();
+}
+
+// Luwu: `x` for `x` and `(x)`
+static const AstExprLocal* asLocal(AstExpr* expr)
+{
+    return unwrapGroup(expr)->as<AstExprLocal>();
+}
+
+bool TypeChecker2::isUninhabited(const NormalizedType* norm)
+{
+    return normalizer.isInhabited(norm) == NormalizationResult::False;
+}
+
+bool TypeChecker2::reportImproperUse(AstExpr* subject, TypeId subjectType, ImproperUse use)
+{
+    TypeId ty = follow(subjectType);
+    bool noType = get<ErrorType>(ty) != nullptr;
+    if (!noType && !get<NeverType>(ty))
+        return false;
+
+    if (!noType)
+    {
+        reportUnreachableUse(subject, use);
+        return true;
+    }
+
+    // An error type that isn't a local's comes from an error in the expression itself (`require("missing").x`), which
+    // is already reported. A use through a local that was reported (`stdio.write()` after `stdio.write`) is the same
+    // mistake.
+    const AstExprLocal* local = asLocal(subject);
+    const AstExprLocal* root = rootLocal(subject);
+    bool alreadyReported = root && improperlyUsedLocals.contains(root->local);
+    if (!local || alreadyReported)
+        return true;
+
+    improperlyUsedLocals.insert(local->local);
+
+    // Locals with no type because of the same one are one cascade: the rest of their uses get notes
+    NoTypeCause cause = noTypeCause(local->local);
+    if (noTypeRootsReported.contains(cause.root))
+        return true;
+    noTypeRootsReported.insert(cause.root);
+
+    noTypeUsesReported.insert(local);
+    std::string originMessage = cause.origin ? errorMessageAt(*cause.origin) : "";
+    reportError(NoTypeUse{use, local->local->name.value, cause.origin, std::move(originMessage), helpifier.enabled}, local->location);
+    return true;
+}
+
+void TypeChecker2::reportUnreachableUse(AstExpr* subject, ImproperUse use)
+{
+    if (inDefensiveBranch(*sourceModule, subject))
+        return;
+
+    // Each local is reported once, its first use and uses through it (`x.y` after `x`) alike: the code after the first
+    // is just as unreachable, or just as unchecked. Anything else is reported once per expression it's read through,
+    // so `dave:go()` is one error at `dave`.
+    const AstExprLocal* root = rootLocal(subject);
+    if (root && improperlyUsedLocals.contains(root->local))
+        return;
+    if (!root && improperlyUsedRoots.contains(rootOf(subject)))
+        return;
+    if (root)
+        improperlyUsedLocals.insert(root->local);
+    else
+        improperlyUsedRoots.insert(rootOf(subject));
+
+    // An error in its declaration (a parameter "reduced to never") already says why it's `never`
+    const AstExprLocal* local = asLocal(subject);
+    if (local && declarationError(local->local))
+        return;
+
+    // Only a local's declaration can say for sure that the code can't run; `self.dave` being `never` can't
+    std::optional<UnreachableCodeUse::Reason> reason = local ? unreachableReason(local) : std::nullopt;
+    std::string name = bindingName(subject).value_or("");
+    reportError(
+        UnreachableCodeUse{use, std::move(name), reason.value_or(UnreachableCodeUse::Reason::PossibleTypeBug), helpifier.enabled},
+        subject->location
+    );
+}
+
+std::optional<UnreachableCodeUse::Reason> TypeChecker2::unreachableReason(const AstExprLocal* use)
+{
+    const AstLocal* local = use->local;
+    std::optional<TypeId> declared;
+    AstExpr* value = nullptr;
+    if (local->annotation)
+    {
+        declared = follow(lookupAnnotation(local->annotation));
+    }
+    else
+    {
+        const DeclarationIndex& declarations = getDeclarationIndex();
+        auto it = declarations.locals.find(local);
+        value = it != declarations.locals.end() ? it->second.value : nullptr;
+        if (value)
+            declared = follow(lookupType(value));
+    }
+
+    if (!declared)
+        return std::nullopt;
+
+    // A `never` value that isn't a call's or a cast's comes from inference (an unannotated parameter used before), which
+    // the reader can't point at
+    if (get<NeverType>(*declared))
+    {
+        if (local->annotation)
+            return UnreachableCodeUse::Reason::DeclaredNever;
+        if (value && value->is<AstExprCall>())
+            return UnreachableCodeUse::Reason::NeverReturningCall;
+        if (value && value->is<AstExprTypeAssertion>())
+            return UnreachableCodeUse::Reason::CastToNever;
+        return std::nullopt;
+    }
+
+    if (local->annotation && normalizer.isInhabited(*declared) == NormalizationResult::False)
+        return UnreachableCodeUse::Reason::DeclaredUninhabited;
+
+    // Declared with a type that can exist, it's unreachable when the checks before the use rule out every member of
+    // that type on their own. When they don't, the solver's refinements made it `never`, which may be a bug.
+    if (provesUnreachable(*sourceModule, use, *declared))
+        return UnreachableCodeUse::Reason::NarrowedAway;
+    return std::nullopt;
+}
+
+// The earliest syntax or type error in `range`
+std::optional<Location> TypeChecker2::firstErrorIn(const Location& range)
+{
+    std::optional<Location> first;
+    auto consider = [&](const Location& location)
+    {
+        if (range.encloses(location) && (!first || location.begin < first->begin))
+            first = location;
+    };
+
+    for (const ParseError& error : sourceModule->parseErrors)
+        consider(error.getLocation());
+
+    for (const TypeError& error : module->errors)
+    {
+        bool isUse = get<NoTypeUse>(error) || get<UnreachableCodeUse>(error);
+        if (!isUse && error.moduleName == module->name)
+            consider(error.location);
+    }
+    return first;
+}
+
+static std::string firstLine(const std::string& message)
+{
+    return message.substr(0, message.find('\n'));
+}
+
+std::string TypeChecker2::errorMessageAt(const Location& location)
+{
+    for (const ParseError& error : sourceModule->parseErrors)
+    {
+        if (error.getLocation() == location)
+            return firstLine(error.getMessage());
+    }
+
+    for (const TypeError& error : module->errors)
+    {
+        bool isUse = get<NoTypeUse>(error) || get<UnreachableCodeUse>(error);
+        if (!isUse && error.moduleName == module->name && error.location == location)
+            return firstLine(toString(error));
+    }
+    return "";
+}
+
+// How many aliases deep an annotation's error is looked for (`type A = B`, `type B = Nope`)
+static constexpr size_t kMaxAliasChain = 8;
+
+std::optional<Location> TypeChecker2::annotationError(AstNode* annotation)
+{
+    // The names an annotation refers to without a module prefix
+    struct NameFinder : AstVisitor
+    {
+        std::vector<AstName> names;
+
+        bool visit(AstType*) override
+        {
+            return true;
+        }
+
+        bool visit(AstTypePack*) override
+        {
+            return true;
+        }
+
+        bool visit(AstTypeReference* reference) override
+        {
+            if (!reference->prefix)
+                names.push_back(reference->name);
+            return true;
+        }
+    };
+
+    if (std::optional<Location> origin = firstErrorIn(annotation->location))
+        return origin;
+
+    const DeclarationIndex& declarations = getDeclarationIndex();
+    std::vector<AstName> visited;
+    NameFinder finder;
+    annotation->visit(&finder);
+    for (size_t depth = 0; depth < kMaxAliasChain && !finder.names.empty(); ++depth)
+    {
+        std::vector<AstName> names = std::move(finder.names);
+        finder.names.clear();
+        for (AstName name : names)
+        {
+            AstStatTypeAlias* alias = declarations.aliasNamed(name);
+            if (!alias || std::find(visited.begin(), visited.end(), name) != visited.end())
+                continue;
+            visited.push_back(name);
+
+            if (std::optional<Location> origin = firstErrorIn(alias->location))
+                return origin;
+            alias->type->visit(&finder);
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<Location> TypeChecker2::declarationError(const AstLocal* local)
+{
+    if (std::optional<Location>* cached = declarationErrors.find(local))
+        return *cached;
+
+    std::optional<Location> origin;
+    const DeclarationIndex& declarations = getDeclarationIndex();
+    if (auto it = declarations.locals.find(local); it != declarations.locals.end())
+        origin = firstErrorIn(it->second.range);
+
+    declarationErrors[local] = origin;
+    return origin;
+}
+
+// How many locals with no type a cause is followed through (`local b = a.x`, `local c = b.y`, ...)
+static constexpr size_t kMaxNoTypeChain = 16;
+
+TypeChecker2::NoTypeCause TypeChecker2::noTypeCause(const AstLocal* local, size_t depth)
+{
+    if (NoTypeCause* cached = noTypeCauses.find(local))
+        return *cached;
+
+    NoTypeCause cause{declarationError(local), local};
+    const DeclarationIndex& declarations = getDeclarationIndex();
+    auto it = declarations.locals.find(local);
+    bool searchUses = !cause.origin && depth < kMaxNoTypeChain && it != declarations.locals.end();
+    if (searchUses)
+    {
+        // Its declaration was checked before its uses, so a use of another local with no type there is already recorded
+        for (const AstExprLocal* use : noTypeUses)
+        {
+            if (use->local != local && it->second.range.encloses(use->location))
+            {
+                cause = noTypeCause(use->local, depth + 1);
+                break;
+            }
+        }
+    }
+
+    // `local x: Result`, or `local x = get()` with `get(): Result`, where the error is in `Result`'s declaration
+    if (searchUses && !cause.origin && local->annotation)
+        cause.origin = annotationError(local->annotation);
+
+    AstExprCall* call = searchUses && !cause.origin && it->second.value ? it->second.value->as<AstExprCall>() : nullptr;
+    AstExprLocal* callee = call ? call->func->as<AstExprLocal>() : nullptr;
+    auto returnAnnotation = callee ? declarations.returnAnnotations.find(callee->local) : declarations.returnAnnotations.end();
+    if (returnAnnotation != declarations.returnAnnotations.end())
+    {
+        if (std::optional<Location> origin = annotationError(returnAnnotation->second))
+            cause = {origin, callee->local};
+    }
+
+    noTypeCauses[local] = cause;
+    return cause;
+}
+
+void TypeChecker2::reportNoTypeNotes()
+{
+    for (const AstExprLocal* use : noTypeUses)
+    {
+        if (noTypeUsesReported.contains(use) || noTypeUsesCast.contains(use))
+            continue;
+
+        // A note points at the error behind the missing type; with none found it would only say the type is missing
+        std::optional<Location> origin = noTypeCause(use->local).origin;
+        if (!origin)
+            continue;
+
+        module->notes.push_back({use->location, noTypeNote(use->local->name.value, origin), origin});
+    }
+}
+
+bool TypeChecker2::isErrorSuppressing(Location loc, TypeId ty)
+{
+    switch (shouldSuppressErrors(NotNull{&normalizer}, ty))
+    {
+    case ErrorSuppression::DoNotSuppress:
+        return false;
+    case ErrorSuppression::Suppress:
+        return true;
+    case ErrorSuppression::NormalizationFailed:
+        reportError(NormalizationTooComplex{}, loc);
+        return false;
+    };
+
+    LUAU_ASSERT(false);
+    return false; // UNREACHABLE
+}
+
+bool TypeChecker2::isErrorSuppressing(Location loc1, TypeId ty1, Location loc2, TypeId ty2)
+{
+    return isErrorSuppressing(loc1, ty1) || isErrorSuppressing(loc2, ty2);
+}
+
+bool TypeChecker2::isErrorSuppressing(Location loc, TypePackId tp)
+{
+    switch (shouldSuppressErrors(NotNull{&normalizer}, tp))
+    {
+    case ErrorSuppression::DoNotSuppress:
+        return false;
+    case ErrorSuppression::Suppress:
+        return true;
+    case ErrorSuppression::NormalizationFailed:
+        reportError(NormalizationTooComplex{}, loc);
+        return false;
+    };
+
+    LUAU_ASSERT(false);
+    return false; // UNREACHABLE
+}
+
+bool TypeChecker2::isErrorSuppressing(Location loc1, TypePackId tp1, Location loc2, TypePackId tp2)
+{
+    return isErrorSuppressing(loc1, tp1) || isErrorSuppressing(loc2, tp2);
+}
+
+bool TypeChecker2::reportNonviableOverloadErrors(
+    std::vector<std::pair<TypeId, ErrorVec>> nonviableOverloads,
+    Location callFuncLocation,
+    size_t argHeadSize,
+    Location callLocation
+)
+{
+    // If multiple overloads report errors, we want to return an error reporting that multiple overloads have errors.
+    // If only one overload has errors, we want to report those errors.
+    std::optional<ErrorVec> reportedErrors;
+    bool multipleOverloadsHaveErrors = false;
+    for (auto& [ty, errs] : nonviableOverloads)
+    {
+        if (!isErrorSuppressing(callFuncLocation, ty) && !errs.empty())
+        {
+            if (reportedErrors)
+            {
+                multipleOverloadsHaveErrors = true;
+                break;
+            }
+            reportedErrors.emplace(errs);
+        }
+    }
+    if (multipleOverloadsHaveErrors)
+    {
+        reportError(MultipleNonviableOverloads{argHeadSize}, callLocation);
+        return true;
+    }
+    else if (reportedErrors)
+    {
+        reportErrors(std::move(*reportedErrors));
+        return true;
+    }
+
+    return false;
+}
+
+
+} // namespace Luau

@@ -1,0 +1,3295 @@
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
+#include "Luau/ToString.h"
+
+#include "Luau/Common.h"
+#include "Luau/Constraint.h"
+#include "Luau/DenseHash.h"
+#include "Luau/DocRefs.h"
+#include "Luau/Location.h"
+#include "Luau/Scope.h"
+#include "Luau/Set.h"
+#include "Luau/TxnLog.h"
+#include "Luau/TypeInfer.h"
+#include "Luau/TypePack.h"
+#include "Luau/Type.h"
+#include "Luau/TypeFunction.h"
+#include "Luau/VisitType.h"
+#include "Luau/TypeOrPack.h"
+
+#include <algorithm>
+#include <array>
+#include <string>
+
+LUAU_FASTFLAG(LuauSolverV2)
+LUAU_FASTFLAG(LuauIntegerType2)
+LUAU_FASTFLAG(LuwuGenericNominals)
+LUAU_FASTFLAGVARIABLE(LuauTruthyFalsy)
+
+/*
+ * Enables increasing levels of verbosity for Luau type names when stringifying.
+ * After level 2, test cases will break unpredictably because a pointer to their
+ * scope will be included in the stringification of generic and free types.
+ *
+ * Supported values:
+ *
+ * 0: Disabled, no changes.
+ *
+ * 1: Prefix free/generic types with free- and gen-, respectively. Also reveal
+ * hidden variadic tails. Display block count for local types.
+ *
+ * 2: Suffix free/generic types with their scope depth.
+ *
+ * 3: Suffix free/generic types with their scope pointer, if present.
+ */
+LUAU_FASTINTVARIABLE(DebugLuauVerboseTypeNames, 0)
+LUAU_FASTFLAGVARIABLE(DebugLuauToStringNoLexicalSort)
+
+namespace Luau
+{
+
+namespace
+{
+
+struct FindCyclicTypes final : TypeVisitor
+{
+    FindCyclicTypes()
+        : TypeVisitor("FindCyclicTypes", /* skipBoundTypes */ true)
+    {
+    }
+
+    FindCyclicTypes(const FindCyclicTypes&) = delete;
+    FindCyclicTypes& operator=(const FindCyclicTypes&) = delete;
+
+    bool exhaustive = false;
+    Luau::Set<TypeId> visited{{}};
+    Luau::Set<TypePackId> visitedPacks{{}};
+    std::set<TypeId> cycles;
+    std::set<TypePackId> cycleTPs;
+
+    void cycle(TypeId ty) override
+    {
+        cycles.insert(ty);
+    }
+
+    void cycle(TypePackId tp) override
+    {
+        cycleTPs.insert(tp);
+    }
+
+    bool visit(TypeId ty) override
+    {
+        return visited.insert(ty);
+    }
+
+    bool visit(TypePackId tp) override
+    {
+        return visitedPacks.insert(tp);
+    }
+
+    bool visit(TypeId ty, const FreeType& ft) override
+    {
+        if (!visited.insert(ty))
+            return false;
+        LUAU_ASSERT(ft.lowerBound);
+        LUAU_ASSERT(ft.upperBound);
+        traverse(ft.lowerBound);
+        traverse(ft.upperBound);
+        return false;
+    }
+
+    bool visit(TypeId ty, const TableType& ttv) override
+    {
+        if (!visited.insert(ty))
+            return false;
+
+        if (ttv.name || ttv.syntheticName)
+        {
+            for (TypeId itp : ttv.instantiatedTypeParams)
+                traverse(itp);
+
+            for (TypePackId itp : ttv.instantiatedTypePackParams)
+                traverse(itp);
+
+            return exhaustive;
+        }
+
+        return true;
+    }
+
+    // Luwu: a named union prints as its name, like a named table, so a cycle through it is never seen and needs no `t1`.
+    // Upstream walks into it and names the cycle: `Content | nil` prints as `t1 where t1 = (string | {read t1})?`.
+    bool visit(TypeId ty, const UnionType& utv) override
+    {
+        if (!visited.insert(ty))
+            return false;
+
+        if (utv.name || utv.syntheticName)
+            return exhaustive;
+
+        return true;
+    }
+
+    bool visit(TypeId ty, const ExternType&) override
+    {
+        return false;
+    }
+
+    bool visit(TypeId, const PendingExpansionType&) override
+    {
+        return false;
+    }
+};
+
+template<typename TID>
+void findCyclicTypes(std::set<TypeId>& cycles, std::set<TypePackId>& cycleTPs, TID ty, bool exhaustive)
+{
+    FindCyclicTypes fct;
+    fct.exhaustive = exhaustive;
+    fct.traverse(ty);
+
+    cycles = std::move(fct.cycles);
+    cycleTPs = std::move(fct.cycleTPs);
+}
+
+} // namespace
+
+static std::pair<bool, std::optional<Luau::Name>> canUseTypeNameInScope(ScopePtr scope, const std::string& name)
+{
+    for (ScopePtr curr = std::move(scope); curr; curr = curr->parent)
+    {
+        for (const auto& [importName, nameTable] : curr->importedTypeBindings)
+        {
+            // Luwu Destructuring (rfcs/destructuring.md): `const .{ ... } = require(p)` imports the module's types under
+            // the hidden local it binds the module to, which no code can spell, so it can't qualify a name
+            bool isHiddenLocalPath = importName.rfind(kDestructuredLocalName, 0) == 0;
+            if (!isHiddenLocalPath && nameTable.count(name))
+                return {true, importName};
+        }
+
+        if (curr->exportedTypeBindings.count(name))
+            return {true, std::nullopt};
+    }
+
+    return {false, std::nullopt};
+}
+
+struct ElementResult
+{
+    std::string str;
+    std::vector<ToStringSpan> spans;
+};
+
+struct StringifierState
+{
+    ToStringOptions& opts;
+    ToStringResult& result;
+
+    DenseHashMap<TypeId, std::string> cycleNames{{}};
+    DenseHashMap<TypePackId, std::string> cycleTpNames{{}};
+    // Luwu: the subset of the two maps above that was actually emitted. A `where` clause defines only
+    // these names, the ones the reader can see. findCyclicTypes can find a cycle that is never
+    // printed: the root may short-circuit to its own name, or the occurrence may sit inside a
+    // truncated part. Upstream defines every cycle it named. That gives a `where` clause with
+    // bindings for names that appear nowhere, or, when none of them is used, a dangling
+    // `Request where ` with nothing after it.
+    DenseHashSet<TypeId> usedCycleNames{nullptr};
+    DenseHashSet<TypePackId> usedCycleTpNames{nullptr};
+    Set<void*> seen{{}};
+    // `$$$` was chosen as the tombstone for `usedNames` since it is not a valid name syntactically and is relatively short for string comparison
+    // reasons.
+    DenseHashSet<std::string> usedNames{"$$$"};
+    size_t indentation = 0;
+    // Luwu (helpful subtyping errors): whether `newline` breaks the line where it is being called:
+    // `opts.useLineBreaks`, except inside a small table under `opts.breakOnlyLargeTables`.
+    bool lineBreaks = false;
+
+    bool exhaustive;
+    bool ignoreSyntheticName = false;
+
+    // When set, the very next name-based short-circuit for exactly this TypeId is bypassed so its
+    // structure gets printed once instead of just its name. Used to expand a single alias's body
+    // for a `where` clause entry (see TypeStringifier::stringifyAliasBodyOnce).
+    std::optional<TypeId> suppressNameFor;
+
+    // False while expanding an alias body for a `where` clause entry, so alias references found
+    // *inside* that body are not themselves added to aliasReferences (this caps expansion at one
+    // level of nesting: referenced-from-root aliases get expanded, aliases they in turn reference
+    // are shown as bare names only).
+    bool collectingAliasRefs = true;
+
+    // Named types (table/union/intersection/function aliases) referenced anywhere in the printed
+    // type other than at the root, in first-seen order, deduplicated by name. Only populated when
+    // opts.includeWhereClauses is set.
+    std::vector<std::pair<std::string, TypeId>> aliasReferences;
+    DenseHashSet<std::string> aliasRefSeen{"$$$"};
+
+    void recordAliasReference(const std::string& name, TypeId ty)
+    {
+        if (!opts.includeWhereClauses || !collectingAliasRefs)
+            return;
+
+        if (aliasRefSeen.contains(name))
+            return;
+
+        aliasRefSeen.insert(name);
+        aliasReferences.emplace_back(name, ty);
+    }
+
+    StringifierState(ToStringOptions& opts, ToStringResult& result)
+        : opts(opts)
+        , result(result)
+        , exhaustive(opts.exhaustive)
+    {
+        // Luwu: expanding every alias means printing none of their names
+        ignoreSyntheticName = opts.ignoreSyntheticName || opts.expandAliases;
+        lineBreaks = opts.useLineBreaks;
+
+        for (const auto& [_, v] : opts.nameMap.types)
+            usedNames.insert(v);
+        for (const auto& [_, v] : opts.nameMap.typePacks)
+            usedNames.insert(v);
+    }
+
+    bool hasSeen(const void* tv)
+    {
+        void* ttv = const_cast<void*>(tv);
+        if (seen.contains(ttv))
+            return true;
+
+        seen.insert(ttv);
+        return false;
+    }
+
+    void unsee(const void* tv)
+    {
+        void* ttv = const_cast<void*>(tv);
+
+        if (seen.contains(ttv))
+            seen.erase(ttv);
+    }
+
+    // Luwu: whether `tv` is being printed further up, without marking it the way hasSeen does.
+    bool isBeingPrinted(const void* tv) const
+    {
+        return seen.contains(const_cast<void*>(tv));
+    }
+
+    std::string getName(TypeId ty)
+    {
+        const size_t s = opts.nameMap.types.size();
+        std::string& n = opts.nameMap.types[ty];
+        if (!n.empty())
+            return n;
+
+        for (int count = 0; count < 256; ++count)
+        {
+            std::string candidate = generateName(usedNames.size() + count);
+            if (!usedNames.contains(candidate))
+            {
+                usedNames.insert(candidate);
+                n = candidate;
+                return candidate;
+            }
+        }
+
+        return generateName(s);
+    }
+
+    int previousNameIndex = 0;
+
+    std::string getName(TypePackId ty)
+    {
+        const size_t s = opts.nameMap.typePacks.size();
+        std::string& n = opts.nameMap.typePacks[ty];
+        if (!n.empty())
+            return n;
+
+        for (int count = 0; count < 256; ++count)
+        {
+            std::string candidate = generateName(previousNameIndex + count);
+            if (!usedNames.contains(candidate))
+            {
+                previousNameIndex += count;
+                usedNames.insert(candidate);
+                n = candidate;
+                return candidate;
+            }
+        }
+
+        return generateName(s);
+    }
+
+    void emit(const std::string& s)
+    {
+        if (opts.maxTypeLength > 0 && result.name.length() > opts.maxTypeLength)
+            return;
+
+        result.name += s;
+    }
+
+    void emitLevel(Scope* scope)
+    {
+        size_t count = 0;
+        for (Scope* s = scope; s; s = s->parent.get())
+            ++count;
+
+        emit(count);
+
+        if (FInt::DebugLuauVerboseTypeNames >= 3)
+        {
+            emit("-");
+            char buffer[16];
+            uint32_t s = uint32_t(intptr_t(scope) & 0xFFFFFF);
+            snprintf(buffer, sizeof(buffer), "0x%x", s);
+            emit(buffer);
+        }
+    }
+
+    void emit(TypeLevel level)
+    {
+        emit(std::to_string(level.level));
+        emit("-");
+        emit(std::to_string(level.subLevel));
+    }
+
+    void emit(const char* s)
+    {
+        if (opts.maxTypeLength > 0 && result.name.length() > opts.maxTypeLength)
+            return;
+
+        result.name += s;
+    }
+
+    void emit(int i)
+    {
+        emit(std::to_string(i).c_str());
+    }
+
+    void emit(size_t i)
+    {
+        emit(std::to_string(i).c_str());
+    }
+
+    void emitAndRecordSpan(const std::string& s, TypeId ty)
+    {
+        size_t startPos = result.name.length();
+        emit(s);
+        size_t endPos = result.name.length();
+
+        if (endPos > startPos)
+            result.typeSpans.emplace_back(ToStringSpan{startPos, endPos, ty});
+    }
+
+    void emit(Polarity p)
+    {
+        switch (p)
+        {
+        case Polarity::None:
+            emit("  ");
+            break;
+        case Polarity::Negative:
+            emit(" -");
+            break;
+        case Polarity::Positive:
+            emit("+ ");
+            break;
+        case Polarity::Mixed:
+            emit("+-");
+            break;
+        default:
+            emit("!!");
+            break;
+        }
+    }
+
+    void indent()
+    {
+        indentation += opts.indentSize;
+    }
+
+    void dedent()
+    {
+        indentation -= opts.indentSize;
+    }
+
+    void newline()
+    {
+        if (!lineBreaks)
+            return emit(" ");
+
+        emit("\n");
+        emitIndentation();
+    }
+
+private:
+    void emitIndentation()
+    {
+        if (!lineBreaks)
+            return;
+
+        emit(std::string(indentation, ' '));
+    }
+};
+
+// Luwu: `line` cut to at most `width` characters (UTF-8 code points), ending in `…` when it was longer
+static std::string truncateDocLine(const std::string& line, size_t width)
+{
+    size_t chars = 0;
+    for (size_t i = 0; i < line.size(); ++i)
+    {
+        if ((static_cast<unsigned char>(line[i]) & 0xC0) == 0x80)
+            continue;
+        if (chars == width - 1)
+        {
+            // is there more than this last character?
+            size_t next = i + 1;
+            while (next < line.size() && (static_cast<unsigned char>(line[next]) & 0xC0) == 0x80)
+                ++next;
+            if (next >= line.size())
+                return line;
+            return line.substr(0, i) + "…";
+        }
+        ++chars;
+    }
+    return line;
+}
+
+// Structurally matches exactly `false | nil | none` (the canonical falsy union), independent of
+// member order, so it can be displayed as the single word "falsy" (and its negation as "truthy")
+// instead of expanding into its constituent parts.
+static bool isExactlyFalsyUnion(const UnionType& uv)
+{
+    if (uv.options.size() != 3)
+        return false;
+
+    bool hasFalse = false;
+    bool hasNil = false;
+    bool hasNone = false;
+
+    for (TypeId option : uv.options)
+    {
+        option = follow(option);
+
+        if (const PrimitiveType* pt = Luau::get<PrimitiveType>(option); pt && pt->type == PrimitiveType::NilType)
+            hasNil = true;
+        else if (const PrimitiveType* pt = Luau::get<PrimitiveType>(option); pt && pt->type == PrimitiveType::NoneType)
+            hasNone = true;
+        else if (const SingletonType* st = Luau::get<SingletonType>(option))
+        {
+            const BooleanSingleton* bs = Luau::get<BooleanSingleton>(st);
+            if (bs && !bs->value)
+                hasFalse = true;
+            else
+                return false;
+        }
+        else
+            return false;
+    }
+
+    return hasFalse && hasNil && hasNone;
+}
+
+// True for `~(false | nil | none)` (the "truthy" negation), independent of member order.
+static bool isTruthyNegation(TypeId ty)
+{
+    const NegationType* nt = Luau::get<NegationType>(follow(ty));
+    if (!nt)
+        return false;
+
+    const UnionType* ut = Luau::get<UnionType>(follow(nt->ty));
+    return ut && isExactlyFalsyUnion(*ut);
+}
+
+// True when `ty` can structurally never be falsy (false, nil, or none), so intersecting it with
+// "truthy" is a no-op. This is intentionally conservative: it only recognizes shapes where every
+// possible runtime value of the type is already truthy, and defers (returns false) on anything
+// that requires deeper analysis (unions, generics, free types, etc.).
+static bool isProvablyNeverFalsy(TypeId ty)
+{
+    ty = follow(ty);
+
+    if (const PrimitiveType* pt = Luau::get<PrimitiveType>(ty))
+        return pt->type != PrimitiveType::NilType && pt->type != PrimitiveType::Boolean && pt->type != PrimitiveType::NoneType;
+
+    if (const SingletonType* st = Luau::get<SingletonType>(ty))
+    {
+        if (const BooleanSingleton* bs = Luau::get<BooleanSingleton>(st))
+            return bs->value;
+        return true; // string singletons are never falsy
+    }
+
+    return Luau::get<TableType>(ty) || Luau::get<FunctionType>(ty) || Luau::get<ExternType>(ty) || Luau::get<MetatableType>(ty);
+}
+
+// True when `ty` is an IntersectionType that will render with more than one visible part after
+// dropping redundant `truthy` parts (see isProvablyNeverFalsy) -- used to decide whether a caller
+// needs to wrap it in parens. Without this, `string & truthy` collapsing to `string` would still
+// get wrapped as `(string)` by a surrounding union, since the underlying node is still structurally
+// an IntersectionType even though only one part is displayed.
+static bool intersectionRendersWithMultipleParts(TypeId ty)
+{
+    const IntersectionType* it = Luau::get<IntersectionType>(follow(ty));
+    if (!it)
+        return false;
+
+    if (!FFlag::LuauTruthyFalsy)
+        return it->parts.size() > 1;
+
+    bool hasProvablyNeverFalsyPart = false;
+    for (TypeId part : it->parts)
+    {
+        if (isProvablyNeverFalsy(follow(part)))
+        {
+            hasProvablyNeverFalsyPart = true;
+            break;
+        }
+    }
+
+    size_t visibleCount = 0;
+    for (TypeId part : it->parts)
+    {
+        if (hasProvablyNeverFalsyPart && isTruthyNegation(follow(part)))
+            continue;
+        ++visibleCount;
+    }
+    return visibleCount > 1;
+}
+
+// True when `ty` will short-circuit to a bare alias name (see the name checks at the top of the
+// UnionType/IntersectionType/FunctionType operator() overloads below) rather than being expanded
+// structurally. Callers use this to skip adding disambiguating parens around an element that will
+// only ever print as a plain identifier.
+static bool willPrintAsBareName(TypeId ty, const StringifierState& state)
+{
+    TypeId followed = follow(ty);
+
+    if (state.suppressNameFor == followed)
+        return false;
+
+    bool showName = (!state.exhaustive || state.opts.hideTableAliasExpansions) && !state.opts.expandAliases;
+
+    auto hasBareName = [&](const auto* variant) -> bool
+    {
+        if (!variant)
+            return false;
+        if (showName && variant->name)
+            return true;
+        if (!state.exhaustive && !state.ignoreSyntheticName && variant->syntheticName)
+            return true;
+        return false;
+    };
+
+    if (hasBareName(Luau::get<FunctionType>(followed)))
+        return true;
+    if (hasBareName(Luau::get<UnionType>(followed)))
+        return true;
+    if (hasBareName(Luau::get<IntersectionType>(followed)))
+        return true;
+
+    return false;
+}
+
+struct TypeStringifier
+{
+    StringifierState& state;
+
+    explicit TypeStringifier(StringifierState& state)
+        : state(state)
+    {
+    }
+
+    void stringify(TypeId tv)
+    {
+        if (state.opts.maxTypeLength > 0 && state.result.name.length() > state.opts.maxTypeLength)
+            return;
+
+        if (tv->ty.valueless_by_exception())
+        {
+            state.result.error = true;
+            state.emit("* VALUELESS BY EXCEPTION *");
+            return;
+        }
+
+        if (state.opts.repeatedTypeNames)
+        {
+            TypeId followed = follow(tv);
+            bool expandingRoot = state.opts.alwaysExpandRootAlias && state.suppressNameFor == followed;
+            if (const std::string* name = state.opts.repeatedTypeNames->find(followed); name && !expandingRoot)
+            {
+                state.emit(*name);
+                return;
+            }
+        }
+
+        if (auto p = state.cycleNames.find(tv))
+        {
+            state.usedCycleNames.insert(tv);
+            state.emit(*p);
+            return;
+        }
+
+        Luau::visit(
+            [this, tv](auto&& t)
+            {
+                return (*this)(tv, t);
+            },
+            tv->ty
+        );
+    }
+
+    // A named type reached again while its own structure is still being printed is a recursive
+    // reference to that alias. Normally the name short-circuit catches it first, but not when the
+    // name was bypassed to expand it (the root of a toStringDetailed call, or a `where` clause body
+    // -- see suppressNameFor), in which case it falls through to the cycle guard. Print the alias's
+    // name there instead of `*CYCLE*`, which doesn't say *which* type recursed -- ambiguous as soon
+    // as more than one property can. Returns false (leaving the `*CYCLE*` fallback to the caller)
+    // for unnamed types, and in exhaustive mode, where names are never used.
+    bool emitRecursiveAliasName(TypeId ty, const std::optional<std::string>& name, const std::optional<std::string>& syntheticName)
+    {
+        if (state.exhaustive)
+            return false;
+
+        if (name)
+        {
+            if (state.opts.scope)
+            {
+                auto [success, moduleName] = canUseTypeNameInScope(state.opts.scope, *name);
+
+                if (!success)
+                    state.result.invalid = true;
+
+                if (moduleName)
+                {
+                    state.emit(*moduleName);
+                    state.emit(".");
+                }
+            }
+
+            state.emitAndRecordSpan(*name, ty);
+            return true;
+        }
+
+        if (syntheticName && !state.ignoreSyntheticName)
+        {
+            state.emitAndRecordSpan(*syntheticName, ty);
+            return true;
+        }
+
+        return false;
+    }
+
+    // Expands `ty`'s structure exactly once, bypassing its own name short-circuit, for use as a
+    // `where` clause entry. Named types referenced *inside* that expansion are left as bare names
+    // (StringifierState::collectingAliasRefs is turned off for the duration), which is what caps
+    // this at one level of nesting.
+    std::string stringifyAliasBodyOnce(TypeId ty)
+    {
+        std::string saved = std::move(state.result.name);
+        state.result.name.clear();
+
+        std::optional<TypeId> savedSuppress = state.suppressNameFor;
+        bool savedCollecting = state.collectingAliasRefs;
+
+        state.suppressNameFor = ty;
+        state.collectingAliasRefs = false;
+
+        Luau::visit(
+            [this, ty](auto&& t)
+            {
+                return (*this)(ty, t);
+            },
+            ty->ty
+        );
+
+        state.suppressNameFor = savedSuppress;
+        state.collectingAliasRefs = savedCollecting;
+
+        std::string body = std::move(state.result.name);
+        state.result.name = std::move(saved);
+        return body;
+    }
+
+    void emitKey(const std::string& name)
+    {
+        if (isIdentifier(name))
+            state.emit(name);
+        else
+        {
+            state.emit("[\"");
+            state.emit(escape(name));
+            state.emit("\"]");
+        }
+        state.emit(": ");
+    }
+
+    void _newStringify(const std::string& name, const Property& prop)
+    {
+        bool comma = false;
+        if (prop.isShared())
+        {
+            emitKey(name);
+            stringify(*prop.readTy);
+            return;
+        }
+
+        if (prop.readTy)
+        {
+            state.emit("read ");
+            emitKey(name);
+            stringify(*prop.readTy);
+            comma = true;
+        }
+        if (prop.writeTy)
+        {
+            if (comma)
+            {
+                state.emit(",");
+                state.newline();
+            }
+
+            state.emit("write ");
+            emitKey(name);
+            stringify(*prop.writeTy);
+        }
+    }
+
+    void stringify(const std::string& name, const Property& prop)
+    {
+        return _newStringify(name, prop);
+    }
+
+    void stringify(TypePackId tp);
+    void stringify(TypePackId tpid, const std::vector<std::optional<FunctionArgument>>& names);
+
+    void stringify(const std::vector<TypeId>& types, const std::vector<TypePackId>& typePacks)
+    {
+        if (types.size() == 0 && typePacks.size() == 0)
+            return;
+
+        if (types.size() || typePacks.size())
+            state.emit("<");
+
+        bool first = true;
+
+        for (TypeId ty : types)
+        {
+            if (!first)
+                state.emit(", ");
+            first = false;
+
+            stringify(ty);
+        }
+
+        bool singleTp = typePacks.size() == 1;
+
+        for (TypePackId tp : typePacks)
+        {
+            if (isEmpty(tp) && singleTp)
+                continue;
+
+            if (!first)
+                state.emit(", ");
+            else
+                first = false;
+
+            bool wrap = !singleTp && get<TypePack>(follow(tp));
+
+            wrap &= !isEmpty(tp);
+
+            if (wrap)
+                state.emit("(");
+
+            stringify(tp);
+
+            if (wrap)
+                state.emit(")");
+        }
+
+        if (types.size() || typePacks.size())
+            state.emit(">");
+    }
+
+    void operator()(TypeId ty, const FreeType& ftv)
+    {
+        state.result.invalid = true;
+
+        // Free types are guaranteed to have upper and lower bounds now.
+        LUAU_ASSERT(ftv.lowerBound);
+        LUAU_ASSERT(ftv.upperBound);
+        const TypeId lowerBound = follow(ftv.lowerBound);
+        const TypeId upperBound = follow(ftv.upperBound);
+        if (get<NeverType>(lowerBound) && get<UnknownType>(upperBound))
+        {
+            state.emit("'");
+            state.emit(state.getName(ty));
+            if (FInt::DebugLuauVerboseTypeNames >= 1)
+                state.emit(ftv.polarity);
+        }
+        else
+        {
+            state.emit("(");
+            if (!get<NeverType>(lowerBound))
+            {
+                stringify(lowerBound);
+                state.emit(" <: ");
+            }
+            state.emit("'");
+            state.emit(state.getName(ty));
+
+            if (FInt::DebugLuauVerboseTypeNames >= 1)
+                state.emit(ftv.polarity);
+
+            if (!get<UnknownType>(upperBound))
+            {
+                state.emit(" <: ");
+                stringify(upperBound);
+            }
+            state.emit(")");
+        }
+        return;
+    }
+
+    void operator()(TypeId, const BoundType& btv)
+    {
+        stringify(btv.boundTo);
+    }
+
+    void operator()(TypeId ty, const GenericType& gtv)
+    {
+        if (FInt::DebugLuauVerboseTypeNames >= 1)
+            state.emit("gen-");
+
+        if (gtv.explicitName)
+        {
+            state.usedNames.insert(gtv.name);
+            state.opts.nameMap.types[ty] = gtv.name;
+            state.emit(gtv.name);
+        }
+        else
+            state.emit(state.getName(ty));
+
+        if (FInt::DebugLuauVerboseTypeNames >= 1)
+            state.emit(gtv.polarity);
+
+        if (FInt::DebugLuauVerboseTypeNames >= 2)
+        {
+            state.emit("-");
+            state.emitLevel(gtv.scope);
+        }
+    }
+
+    void operator()(TypeId, const BlockedType& btv)
+    {
+        state.emit("*blocked-");
+        state.emit(btv.index);
+        state.emit("*");
+    }
+
+    void operator()(TypeId ty, const PendingExpansionType& petv)
+    {
+        state.emit("*pending-expansion-");
+        state.emit(petv.index);
+        state.emit("*");
+    }
+
+    void operator()(TypeId, const PrimitiveType& ptv)
+    {
+        switch (ptv.type)
+        {
+        case PrimitiveType::NilType:
+            state.emit("nil");
+            return;
+        case PrimitiveType::Boolean:
+            state.emit("boolean");
+            return;
+        case PrimitiveType::Number:
+            state.emit("number");
+            return;
+        case PrimitiveType::String:
+            state.emit("string");
+            return;
+        case PrimitiveType::Thread:
+            state.emit("thread");
+            return;
+        case PrimitiveType::Buffer:
+            state.emit("buffer");
+            return;
+        case PrimitiveType::NoneType:
+            state.emit("none");
+            return;
+        case PrimitiveType::Function:
+            state.emit("function");
+            return;
+        case PrimitiveType::Table:
+            state.emit("table");
+            return;
+        case PrimitiveType::Integer:
+            if (FFlag::LuauIntegerType2)
+            {
+                state.emit("integer");
+                return;
+            }
+            [[fallthrough]];
+        default:
+            LUAU_ASSERT(!"Unknown primitive type");
+            throw InternalCompilerError("Unknown primitive type " + std::to_string(ptv.type));
+        }
+    }
+
+    void operator()(TypeId, const SingletonType& stv)
+    {
+        if (const BooleanSingleton* bs = Luau::get<BooleanSingleton>(&stv))
+            state.emit(bs->value ? "true" : "false");
+        else if (const StringSingleton* ss = Luau::get<StringSingleton>(&stv))
+        {
+            state.emit("\"");
+            state.emit(escape(ss->value));
+            state.emit("\"");
+        }
+        else
+        {
+            LUAU_ASSERT(!"Unknown singleton type");
+            throw InternalCompilerError("Unknown singleton type");
+        }
+    }
+
+    void operator()(TypeId ty, const FunctionType& ftv)
+    {
+        bool showName = (!state.exhaustive || state.opts.hideTableAliasExpansions) && !state.opts.expandAliases && state.suppressNameFor != ty;
+
+        if (showName && ftv.name)
+        {
+            if (state.opts.scope)
+            {
+                auto [success, moduleName] = canUseTypeNameInScope(state.opts.scope, *ftv.name);
+
+                if (!success)
+                    state.result.invalid = true;
+
+                if (moduleName)
+                {
+                    state.emit(*moduleName);
+                    state.emit(".");
+                }
+            }
+
+            state.recordAliasReference(*ftv.name, ty);
+            state.emitAndRecordSpan(*ftv.name, ty);
+            return;
+        }
+
+        if (!state.exhaustive && !state.ignoreSyntheticName && state.suppressNameFor != ty && ftv.syntheticName)
+        {
+            state.result.invalid = true;
+            state.recordAliasReference(*ftv.syntheticName, ty);
+            state.emitAndRecordSpan(*ftv.syntheticName, ty);
+            return;
+        }
+
+        if (state.hasSeen(&ftv))
+        {
+            if (emitRecursiveAliasName(ty, ftv.name, ftv.syntheticName))
+                return;
+
+            state.result.cycle = true;
+            state.emit("*CYCLE*");
+            return;
+        }
+
+        // Luwu Traits (rfcs/classes/traits.md): a trait function's `Self` isn't listed; it reads like the trait's own
+        std::vector<TypeId> listedGenerics;
+        for (TypeId generic : ftv.generics)
+        {
+            const GenericType* gt = get<GenericType>(follow(generic));
+            if (!gt || !gt->traitSelf)
+                listedGenerics.push_back(generic);
+        }
+
+        // We should not be respecting opts.hideNamedFunctionTypeParameters here.
+        if (listedGenerics.size() > 0 || ftv.genericPacks.size() > 0)
+        {
+            state.emit("<");
+            bool comma = false;
+            for (auto it = listedGenerics.begin(); it != listedGenerics.end(); ++it)
+            {
+                if (comma)
+                    state.emit(", ");
+                comma = true;
+                stringify(*it);
+            }
+            for (auto it = ftv.genericPacks.begin(); it != ftv.genericPacks.end(); ++it)
+            {
+                if (comma)
+                    state.emit(", ");
+                comma = true;
+                stringify(*it);
+            }
+            state.emit(">");
+        }
+
+        if (ftv.isCheckedFunction)
+            state.emit("@checked ");
+
+        state.emit("(");
+
+        if (isEmpty(ftv.argTypes))
+        {
+            // if we've got an empty argument pack, we're done.
+        }
+        else if (state.opts.functionTypeArguments)
+            stringify(ftv.argTypes, ftv.argNames);
+        else
+            stringify(ftv.argTypes);
+
+        state.emit(") -> ");
+
+        bool plural = !isEmpty(ftv.retTypes);
+
+        auto retBegin = begin(ftv.retTypes);
+        auto retEnd = end(ftv.retTypes);
+        if (retBegin != retEnd)
+        {
+            ++retBegin;
+            if (retBegin == retEnd && !retBegin.tail())
+                plural = false;
+        }
+
+        if (plural)
+            state.emit("(");
+
+        stringify(ftv.retTypes);
+
+        if (plural)
+            state.emit(")");
+
+        // Luwu try expressions
+        if (ftv.errorHint)
+        {
+            state.emit(" ! ");
+            stringify(*ftv.errorHint);
+        }
+
+        state.unsee(&ftv);
+    }
+
+    void operator()(TypeId ty, const TableType& ttv)
+    {
+        if (ttv.boundTo)
+            return stringify(*ttv.boundTo);
+
+        // if hide table alias expansions are enabled and there is a name found for the table, use it
+        bool showName = (!state.exhaustive || state.opts.hideTableAliasExpansions) && !state.opts.expandAliases && state.suppressNameFor != ty;
+
+        if (showName)
+        {
+            if (ttv.name)
+            {
+                // If scope if provided, add module name and check visibility
+                if (state.opts.scope)
+                {
+                    auto [success, moduleName] = canUseTypeNameInScope(state.opts.scope, *ttv.name);
+
+                    if (!success)
+                        state.result.invalid = true;
+
+                    if (moduleName)
+                    {
+                        state.emit(*moduleName);
+                        state.emit(".");
+                    }
+                }
+
+                state.recordAliasReference(*ttv.name, ty);
+                state.emitAndRecordSpan(*ttv.name, ty);
+                stringify(ttv.instantiatedTypeParams, ttv.instantiatedTypePackParams);
+                return;
+            }
+        }
+
+        if (!state.exhaustive && !state.ignoreSyntheticName && state.suppressNameFor != ty)
+        {
+            if (ttv.syntheticName)
+            {
+                state.result.invalid = true;
+                state.recordAliasReference(*ttv.syntheticName, ty);
+                state.emitAndRecordSpan(*ttv.syntheticName, ty);
+                stringify(ttv.instantiatedTypeParams, ttv.instantiatedTypePackParams);
+                return;
+            }
+        }
+
+        if (state.hasSeen(&ttv))
+        {
+            if (emitRecursiveAliasName(ty, ttv.name, ttv.syntheticName))
+            {
+                stringify(ttv.instantiatedTypeParams, ttv.instantiatedTypePackParams);
+                return;
+            }
+
+            state.result.cycle = true;
+            state.emit("*CYCLE*");
+            return;
+        }
+
+        std::string openbrace = "@@@";
+        std::string closedbrace = "@@@?!";
+        switch (state.opts.hideTableKind ? TableState::Sealed : ttv.state)
+        {
+        case TableState::Sealed:
+            openbrace = "{";
+            closedbrace = "}";
+            break;
+        case TableState::Unsealed:
+            state.result.invalid = true;
+            openbrace = "{|";
+            closedbrace = "|}";
+            break;
+        case TableState::Free:
+            state.result.invalid = true;
+            openbrace = "{-";
+            closedbrace = "-}";
+            break;
+        case TableState::Generic:
+            state.result.invalid = true;
+            openbrace = "{+";
+            closedbrace = "+}";
+            break;
+        }
+
+        // If this appears to be an array, we want to stringify it using the {T} syntax.
+        if (ttv.indexer && ttv.props.empty() && isNumber(ttv.indexer->indexType))
+        {
+            state.emit("{");
+            if (ttv.indexer->isReadOnly)
+                state.emit("read ");
+            stringify(ttv.indexer->indexResultType);
+            state.emit("}");
+
+            state.unsee(&ttv);
+            return;
+        }
+
+        bool outerLineBreaks = state.lineBreaks;
+        if (state.lineBreaks && state.opts.breakOnlyLargeTables)
+            state.lineBreaks = isLargeTable(ttv);
+
+        state.emit(openbrace);
+        state.indent();
+
+        bool comma = false;
+        if (ttv.indexer)
+        {
+            state.newline();
+            if (ttv.indexer->isReadOnly)
+                state.emit("read ");
+            state.emit("[");
+            stringify(ttv.indexer->indexType);
+            state.emit("]: ");
+            stringify(ttv.indexer->indexResultType);
+            comma = true;
+        }
+
+        size_t index = 0;
+        size_t oldLength = state.result.name.length();
+        bool truncated = false;
+        // false once the table is too long to print more
+        auto emitProperty = [&](const std::string& name, const Property& prop)
+        {
+            if (comma)
+            {
+                state.emit(",");
+                state.newline();
+            }
+            else
+                state.newline();
+
+            size_t length = state.result.name.length() - oldLength;
+
+            if (state.opts.maxTableLength > 0 && (length - 2 * index) >= state.opts.maxTableLength)
+            {
+                emitMoreProperties(ttv.props.size() - index, comma);
+                truncated = true;
+                return false;
+            }
+
+            // Luwu: the first line of the property's doc comment above it, the way the source reads. A property set from a
+            // declaration (`function str.trim()`) has no comments of its own; its value carries them.
+            bool showsComments = state.lineBreaks && state.opts.propertyCommentWidth > 0;
+            const TypeMetadataTable* comments = showsComments ? prop.metadata.get() : nullptr;
+            if (showsComments && !comments && prop.readTy)
+                comments = docMetadataOf(*prop.readTy);
+            if (comments)
+            {
+                for (const std::string& line : metadataDocLines(*comments))
+                {
+                    size_t first = line.find_first_not_of(" \t");
+                    if (first == std::string::npos)
+                        continue;
+                    state.emit("--- ");
+                    state.emit(truncateDocLine(line.substr(first), state.opts.propertyCommentWidth));
+                    state.newline();
+                    break;
+                }
+            }
+
+            stringify(name, prop);
+
+            comma = true;
+            ++index;
+            return true;
+        };
+
+        // Luwu (helpful subtyping errors): properties `maxPropertiesShown` leaves out, counted at the end.
+        size_t leftOut = 0;
+        if (showsEveryProperty(ttv))
+        {
+            for (const auto& [name, prop] : ttv.props)
+            {
+                if (!emitProperty(name, prop))
+                    break;
+            }
+        }
+        else
+        {
+            std::vector<std::pair<const std::string*, const Property*>> shown = propertiesToShow(ty, ttv);
+            leftOut = ttv.props.size() - shown.size();
+            for (const auto& [name, prop] : shown)
+            {
+                if (!emitProperty(*name, *prop))
+                    break;
+            }
+        }
+
+        if (leftOut > 0 && !truncated)
+        {
+            if (comma)
+                state.emit(",");
+            state.newline();
+            emitMoreProperties(leftOut, comma);
+        }
+
+        state.dedent();
+        if (comma)
+            state.newline();
+        else
+            state.emit("  ");
+        state.emit(closedbrace);
+        state.lineBreaks = outerLineBreaks;
+
+        state.unsee(&ttv);
+    }
+
+    // The count of properties not printed, in place of them.
+    void emitMoreProperties(size_t remaining, bool& comma)
+    {
+        // Luwu (helpful subtyping errors): a table cut down to what a message points into has the rest as `…`; how
+        // many there are says nothing to that reader.
+        if (state.opts.onlyFocusedProperties && !state.lineBreaks)
+        {
+            state.emit("…");
+            comma = true;
+            return;
+        }
+        if (state.lineBreaks)
+        {
+            // One property per line, so the elision can be a comment of its own -- `...
+            // N more ...` there reads as a malformed property and throws off highlighting
+            // wherever the output is shown as code (e.g. an editor hover). The closing
+            // brace always follows on its own line (`comma` forces the newline below).
+            state.emit("-- ⋯ ");
+            state.emit(std::to_string(remaining));
+            state.emit(remaining == 1 ? " more property" : " more properties");
+            comma = true;
+        }
+        else
+        {
+            // Single-line output can't use a comment: it would swallow the closing brace.
+            state.emit("... ");
+            state.emit(std::to_string(remaining));
+            state.emit(" more ...");
+        }
+    }
+
+    // Luwu (helpful subtyping errors): whether the table prints all its properties, in order: without a limit or under
+    // it, and not only the focused ones
+    bool showsEveryProperty(const TableType& ttv) const
+    {
+        size_t limit = state.opts.maxPropertiesShown;
+        bool limited = limit != 0 && ttv.props.size() > limit;
+        return !state.opts.onlyFocusedProperties && !limited;
+    }
+
+    // Luwu (helpful subtyping errors): the properties `maxPropertiesShown` lets a table print, in the order it
+    // prints them, when it doesn't print them all (showsEveryProperty)
+    std::vector<std::pair<const std::string*, const Property*>> propertiesToShow(TypeId ty, const TableType& ttv) const
+    {
+        LUAU_ASSERT(!showsEveryProperty(ttv));
+
+        std::vector<std::pair<const std::string*, const Property*>> shown;
+        size_t limit = state.opts.maxPropertiesShown;
+        bool onlyFocused = state.opts.onlyFocusedProperties;
+        bool limited = limit != 0 && ttv.props.size() > limit;
+
+        auto isShown = [&](const std::string& name)
+        {
+            return std::any_of(
+                shown.begin(),
+                shown.end(),
+                [&](const auto& entry)
+                {
+                    return *entry.first == name;
+                }
+            );
+        };
+        auto show = [&](const std::string& name)
+        {
+            auto it = ttv.props.find(name);
+            if (it != ttv.props.end() && !isShown(name))
+                shown.emplace_back(&it->first, &it->second);
+        };
+
+        // What the message is about comes first, however many there are.
+        if (state.opts.propertyFocus)
+        {
+            if (const std::vector<std::string>* focus = state.opts.propertyFocus->find(follow(ty)))
+            {
+                for (const std::string& name : *focus)
+                    show(name);
+            }
+        }
+
+        // Then what tells the reader which shape this is: a discriminant, which code tags a shape with.
+        constexpr size_t maxDiscriminants = 2;
+        size_t discriminants = 0;
+        for (const auto& [name, prop] : ttv.props)
+        {
+            if (discriminants == maxDiscriminants || (limited && shown.size() >= limit))
+                break;
+            bool literal = prop.readTy && get<SingletonType>(follow(*prop.readTy));
+            if (literal && !isShown(name))
+            {
+                show(name);
+                ++discriminants;
+            }
+        }
+
+        // A name conventionally saying what it is, when nothing else does (no variable names the table).
+        if (state.opts.identifyByConventionalNames)
+        {
+            static const std::array<const char*, 6> identifying = {"type", "kind", "tag", "name", "id", "is"};
+            for (const char* name : identifying)
+            {
+                if (limited && shown.size() >= limit)
+                    break;
+                show(name);
+            }
+        }
+
+        if (onlyFocused)
+            return shown;
+        for (const auto& [name, prop] : ttv.props)
+        {
+            if (shown.size() >= limit)
+                break;
+            show(name);
+        }
+        return shown;
+    }
+
+    // Luwu (helpful subtyping errors): whether `breakOnlyLargeTables` gives this table a line per field:
+    // it has more fields than fit comfortably on one line, or one of them is long by itself.
+    bool isLargeTable(const TableType& ttv) const
+    {
+        constexpr size_t maxInlineFields = 3;
+        constexpr size_t maxInlineFieldLength = 40;
+
+        // A map or array is one line however long: only a record's properties are worth a line each.
+        if (ttv.props.empty())
+            return false;
+        size_t fields = ttv.props.size() + (ttv.indexer ? 1 : 0);
+        if (fields > maxInlineFields)
+            return true;
+
+        ToStringOptions inlineOptions = state.opts;
+        inlineOptions.useLineBreaks = false;
+        inlineOptions.alwaysExpandRootAlias = false;
+        inlineOptions.includeWhereClauses = false;
+        // A field's type as it prints inside the table: a named one by its name, which printing it on its own
+        // would expand.
+        auto nestedLength = [&](TypeId fieldType)
+        {
+            fieldType = follow(fieldType);
+            if (const std::string* name = state.opts.repeatedTypeNames ? state.opts.repeatedTypeNames->find(fieldType) : nullptr)
+                return name->size();
+            const UnionType* u = get<UnionType>(fieldType);
+            const IntersectionType* intersection = get<IntersectionType>(fieldType);
+            if (u && u->name)
+                return u->name->size();
+            if (intersection && intersection->name)
+                return intersection->name->size();
+            return toString(fieldType, inlineOptions).size();
+        };
+        auto fieldLength = [&](size_t keyLength, TypeId fieldType)
+        {
+            // `key: type`
+            return keyLength + 2 + nestedLength(fieldType);
+        };
+
+        if (ttv.indexer)
+        {
+            // `[key]`
+            size_t keyLength = toString(ttv.indexer->indexType, inlineOptions).size() + 2;
+            if (fieldLength(keyLength, ttv.indexer->indexResultType) > maxInlineFieldLength)
+                return true;
+        }
+        for (const auto& [name, prop] : ttv.props)
+        {
+            std::optional<TypeId> fieldType = prop.readTy ? prop.readTy : prop.writeTy;
+            if (fieldType && fieldLength(name.size(), *fieldType) > maxInlineFieldLength)
+                return true;
+        }
+        return false;
+    }
+
+    void operator()(TypeId ty, const MetatableType& mtv)
+    {
+        state.result.invalid = true;
+        if (!state.exhaustive && !state.ignoreSyntheticName && mtv.syntheticName && state.suppressNameFor != ty)
+        {
+            state.recordAliasReference(*mtv.syntheticName, ty);
+            state.emitAndRecordSpan(*mtv.syntheticName, ty);
+            return;
+        }
+
+        // The `typeof(setmetatable(...))` class idiom reaches itself through every method's `self`.
+        // So expanding one can arrive back here. That happens at the root, or in a `where` clause
+        // body, where the name check above is deliberately bypassed. Every other printer for a type
+        // that can carry a name guards against this.
+        // Luwu: upstream's MetatableType printer has no such guard. Only the cycle-name short-circuit
+        // in `stringify` keeps it from recursing forever.
+        if (state.hasSeen(&mtv))
+        {
+            if (emitRecursiveAliasName(ty, std::nullopt, mtv.syntheticName))
+                return;
+
+            state.result.cycle = true;
+            state.emit("*CYCLE*");
+            return;
+        }
+
+        state.emit("{ @metatable ");
+        stringify(mtv.metatable);
+        state.emit(",");
+        // Luwu (helpful subtyping errors): under `breakOnlyLargeTables` the table part opens on the same line,
+        // so a large one reads `{ @metatable M, {` with its fields under it.
+        if (state.opts.breakOnlyLargeTables)
+            state.emit(" ");
+        else
+            state.newline();
+        stringify(mtv.table);
+        state.emit(" }");
+
+        state.unsee(&mtv);
+    }
+
+    void operator()(TypeId ty, const ExternType& etv)
+    {
+        const char* valueKind = state.opts.classAndTraitValuesInTypeForm ? nominalValueKind(etv) : nullptr;
+        if (valueKind)
+        {
+            state.emit(valueKind);
+            state.emit("<");
+        }
+
+        state.emitAndRecordSpan(etv.name, ty);
+        if (FFlag::LuwuGenericNominals)
+        {
+            if (state.hasSeen(&etv))
+            {
+                state.result.cycle = true;
+                state.emit("<*CYCLE*>");
+            }
+            else
+            {
+                stringify(etv.instantiatedTypeParams, etv.instantiatedTypePackParams);
+                state.unsee(&etv);
+            }
+        }
+
+        if (valueKind)
+            state.emit(">");
+    }
+
+    void operator()(TypeId, const AnyType&)
+    {
+        state.emit("any");
+    }
+
+    void operator()(TypeId, const NoRefineType&)
+    {
+        state.emit("*no-refine*");
+    }
+
+    void operator()(TypeId ty, const UnionType& uv)
+    {
+        bool showName = (!state.exhaustive || state.opts.hideTableAliasExpansions) && !state.opts.expandAliases && state.suppressNameFor != ty;
+
+        if (showName && uv.name)
+        {
+            if (state.opts.scope)
+            {
+                auto [success, moduleName] = canUseTypeNameInScope(state.opts.scope, *uv.name);
+
+                if (!success)
+                    state.result.invalid = true;
+
+                if (moduleName)
+                {
+                    state.emit(*moduleName);
+                    state.emit(".");
+                }
+            }
+
+            state.recordAliasReference(*uv.name, ty);
+            state.emitAndRecordSpan(*uv.name, ty);
+            return;
+        }
+
+        if (!state.exhaustive && !state.ignoreSyntheticName && state.suppressNameFor != ty && uv.syntheticName)
+        {
+            state.result.invalid = true;
+            state.recordAliasReference(*uv.syntheticName, ty);
+            state.emitAndRecordSpan(*uv.syntheticName, ty);
+            return;
+        }
+
+        if (FFlag::LuauTruthyFalsy && isExactlyFalsyUnion(uv))
+        {
+            state.emit("falsy");
+            return;
+        }
+
+        if (state.hasSeen(&uv))
+        {
+            if (emitRecursiveAliasName(ty, uv.name, uv.syntheticName))
+                return;
+
+            state.result.cycle = true;
+            state.emit("*CYCLE*");
+            return;
+        }
+
+        LUAU_ASSERT(uv.options.size() > 1);
+
+        bool optional = false;
+        bool hasNonNilDisjunct = false;
+
+        std::vector<ElementResult> results = {};
+        size_t resultsLength = 0;
+        bool lengthLimitHit = false;
+
+        // A union's options are flattened -- `A | (B | C)` prints as `A | B | C` -- but a nested
+        // union that has a name of its own should stay that name instead of spilling its options
+        // into the enclosing union: `Encoding?` reads as `Encoding?`, not as every string literal
+        // `Encoding` is made of, followed by a `?`.
+        std::vector<TypeId> elements;
+        // A union may hold itself, directly or through another union, so flattening has to remember
+        // which ones it has already walked into: an option that leads back to a union already being
+        // flattened contributes nothing new, and following it again never terminates.
+        DenseHashSet<TypeId> flattenedUnions{nullptr};
+        flattenedUnions.insert(follow(ty));
+
+        // A named union that is being expanded further up (the root of a hover, say) reaches itself again through
+        // a recursive reference. Kept whole, it prints its own name there (emitRecursiveAliasName): `{ read Content? }`
+        // instead of `Content`'s options spilled into the table, ending in `*CYCLE*`.
+        auto isRecursiveAliasReference = [&](const UnionType* nested)
+        {
+            bool hasName = nested->name || (nested->syntheticName && !state.ignoreSyntheticName);
+            return !state.exhaustive && hasName && state.isBeingPrinted(nested);
+        };
+
+        auto collectOptions = [&](auto&& collectOptions, TypeId option) -> void
+        {
+            option = follow(option);
+
+            const UnionType* nested = get<UnionType>(option);
+            if (nested && !willPrintAsBareName(option, state) && !isRecursiveAliasReference(nested))
+            {
+                if (flattenedUnions.contains(option))
+                    return;
+
+                flattenedUnions.insert(option);
+
+                for (TypeId nestedOption : nested->options)
+                    collectOptions(collectOptions, nestedOption);
+            }
+            else
+            {
+                elements.push_back(option);
+            }
+        };
+
+        for (TypeId option : uv.options)
+            collectOptions(collectOptions, option);
+
+        for (TypeId el : elements)
+        {
+            if (state.opts.useQuestionMarks && isNil(el))
+            {
+                optional = true;
+                continue;
+            }
+            else
+            {
+                hasNonNilDisjunct = true;
+            }
+
+            std::string saved = std::move(state.result.name);
+            size_t savedSpansSize = state.result.typeSpans.size();
+
+            bool needParens = !state.cycleNames.contains(el) && !willPrintAsBareName(el, state) &&
+                              (intersectionRendersWithMultipleParts(el) || get<FunctionType>(el) != nullptr);
+
+            if (needParens)
+                state.emit("(");
+
+            stringify(el);
+
+            if (needParens)
+                state.emit(")");
+
+            ElementResult elem;
+            elem.str = std::move(state.result.name);
+
+            for (size_t i = savedSpansSize; i < state.result.typeSpans.size(); ++i)
+                elem.spans.push_back(state.result.typeSpans[i]);
+            state.result.typeSpans.resize(savedSpansSize);
+
+            resultsLength += elem.str.length();
+            results.push_back(std::move(elem));
+
+            state.result.name = std::move(saved);
+
+            lengthLimitHit = state.opts.maxTypeLength > 0 && resultsLength > state.opts.maxTypeLength;
+
+            if (lengthLimitHit)
+                break;
+        }
+
+        state.unsee(&uv);
+
+        if (!lengthLimitHit && !FFlag::DebugLuauToStringNoLexicalSort && state.opts.sortUnionMembers)
+            std::sort(
+                results.begin(),
+                results.end(),
+                [](const ElementResult& a, const ElementResult& b)
+                {
+                    return a.str < b.str;
+                }
+            );
+
+        if (optional && results.size() > 1)
+            state.emit("(");
+
+        bool first = true;
+        // Luwu (helpful subtyping errors): `breakOnlyLargeTables` keeps a union on one line, however long: a
+        // line per member turns an enum of keys into a page.
+        bool shouldPlaceOnNewlines = results.size() > state.opts.compositeTypesSingleLineLimit && !state.opts.breakOnlyLargeTables;
+        // Only give the *first* option its own "| "-prefixed line when we're actually emitting real
+        // line breaks -- otherwise (a long union still rendered on one line because useLineBreaks is
+        // off) this would just stick a stray leading "| " in front of the first option.
+        bool uniformPipePrefix = shouldPlaceOnNewlines && state.lineBreaks;
+        for (ElementResult& elem : results)
+        {
+            // When multi-line, every option (including the first) goes on its own line prefixed
+            // with "| ", rather than only the 2nd+ options -- so a long enum-like union reads as a
+            // uniform list instead of having its first entry visually stuck onto the "= " prefix.
+            if (uniformPipePrefix)
+            {
+                state.newline();
+                state.emit("| ");
+            }
+            else if (!first)
+            {
+                if (shouldPlaceOnNewlines)
+                    state.newline();
+                else
+                    state.emit(" ");
+                state.emit("| ");
+            }
+
+            size_t basePos = state.result.name.length();
+            state.emit(elem.str);
+            for (const auto& [start, end, ty] : elem.spans)
+                state.result.typeSpans.emplace_back(ToStringSpan{basePos + start, basePos + end, ty});
+
+            first = false;
+        }
+
+        if (optional)
+        {
+            const char* s = "?";
+            if (results.size() > 1)
+                s = ")?";
+
+            if (!hasNonNilDisjunct)
+                s = "nil";
+
+            state.emit(s);
+        }
+    }
+
+    void operator()(TypeId ty, const IntersectionType& uv)
+    {
+        // Luwu Traits (rfcs/classes/traits.md): `self` in a trait function generic over `Self` is `Self & Trait`, read as `Self`
+        for (TypeId part : uv.parts)
+        {
+            const GenericType* gt = get<GenericType>(follow(part));
+            if (gt && gt->traitSelf)
+            {
+                stringify(part);
+                return;
+            }
+        }
+
+        bool showName = (!state.exhaustive || state.opts.hideTableAliasExpansions) && !state.opts.expandAliases && state.suppressNameFor != ty;
+
+        if (showName && uv.name)
+        {
+            if (state.opts.scope)
+            {
+                auto [success, moduleName] = canUseTypeNameInScope(state.opts.scope, *uv.name);
+
+                if (!success)
+                    state.result.invalid = true;
+
+                if (moduleName)
+                {
+                    state.emit(*moduleName);
+                    state.emit(".");
+                }
+            }
+
+            state.recordAliasReference(*uv.name, ty);
+            state.emitAndRecordSpan(*uv.name, ty);
+            return;
+        }
+
+        if (!state.exhaustive && !state.ignoreSyntheticName && state.suppressNameFor != ty && uv.syntheticName)
+        {
+            state.result.invalid = true;
+            state.recordAliasReference(*uv.syntheticName, ty);
+            state.emitAndRecordSpan(*uv.syntheticName, ty);
+            return;
+        }
+
+        if (state.hasSeen(&uv))
+        {
+            if (emitRecursiveAliasName(ty, uv.name, uv.syntheticName))
+                return;
+
+            state.result.cycle = true;
+            state.emit("*CYCLE*");
+            return;
+        }
+
+        // `T & truthy` is redundant when every value of `T` is already truthy, so drop the
+        // `truthy` part rather than displaying (e.g.) `string & truthy` when it's just `string`.
+        bool hasProvablyNeverFalsyPart = false;
+        if (FFlag::LuauTruthyFalsy)
+        {
+            for (TypeId part : uv.parts)
+            {
+                if (isProvablyNeverFalsy(follow(part)))
+                {
+                    hasProvablyNeverFalsyPart = true;
+                    break;
+                }
+            }
+        }
+
+        std::vector<ElementResult> results = {};
+        size_t resultsLength = 0;
+        bool lengthLimitHit = false;
+
+        for (auto el : uv.parts)
+        {
+            el = follow(el);
+
+            if (hasProvablyNeverFalsyPart && isTruthyNegation(el))
+                continue;
+
+            std::string saved = std::move(state.result.name);
+            size_t savedSpansSize = state.result.typeSpans.size();
+
+            bool needParens = !state.cycleNames.contains(el) && !willPrintAsBareName(el, state) &&
+                              (get<UnionType>(el) != nullptr || get<FunctionType>(el) != nullptr);
+
+            if (needParens)
+                state.emit("(");
+
+            stringify(el);
+
+            if (needParens)
+                state.emit(")");
+
+            ElementResult elem;
+            elem.str = std::move(state.result.name);
+
+            for (size_t i = savedSpansSize; i < state.result.typeSpans.size(); ++i)
+                elem.spans.push_back(state.result.typeSpans[i]);
+            state.result.typeSpans.resize(savedSpansSize);
+
+            resultsLength += elem.str.length();
+            results.push_back(std::move(elem));
+
+            state.result.name = std::move(saved);
+
+            lengthLimitHit = state.opts.maxTypeLength > 0 && resultsLength > state.opts.maxTypeLength;
+
+            if (lengthLimitHit)
+                break;
+        }
+
+        state.unsee(&uv);
+
+        if (!lengthLimitHit && !FFlag::DebugLuauToStringNoLexicalSort && state.opts.sortUnionMembers)
+            std::sort(
+                results.begin(),
+                results.end(),
+                [](const ElementResult& a, const ElementResult& b)
+                {
+                    return a.str < b.str;
+                }
+            );
+
+        // An overloaded function (every part of the intersection is a FunctionType) gets its own
+        // wrapping parens with a leading "-- N overloads" comment and every line (including the
+        // first) prefixed with "& ", e.g.:
+        //   ( -- 2 overloads
+        //       & ((path: string) -> Metadata)
+        //       & ((path: Path) -> Metadata | error<FileIoError>)
+        //   )
+        // A `--` comment runs to the end of the line, so this is only safe when line breaks are
+        // actually being emitted; with useLineBreaks off, fall back to the plain inline join below.
+        bool overloaded = isOverloadedFunction(ty);
+        bool wrapOverloadParens = overloaded && state.lineBreaks && results.size() > 1;
+
+        if (wrapOverloadParens)
+        {
+            state.emit("( -- ");
+            state.emit(std::to_string(results.size()));
+            state.emit(results.size() == 1 ? " overload" : " overloads");
+            state.indent();
+        }
+
+        bool first = true;
+        // Luwu (helpful subtyping errors): as for unions above, except overloads, which are functions.
+        bool longIntersection = results.size() > state.opts.compositeTypesSingleLineLimit && !state.opts.breakOnlyLargeTables;
+        bool shouldPlaceOnNewlines = longIntersection || overloaded;
+        for (ElementResult& elem : results)
+        {
+            if (wrapOverloadParens)
+            {
+                state.newline();
+                state.emit("& ");
+            }
+            else if (!first)
+            {
+                if (shouldPlaceOnNewlines)
+                    state.newline();
+                else
+                    state.emit(" ");
+                state.emit("& ");
+            }
+
+            size_t basePos = state.result.name.length();
+            state.emit(elem.str);
+            for (const auto& [start, end, spanTy] : elem.spans)
+                state.result.typeSpans.emplace_back(ToStringSpan{basePos + start, basePos + end, spanTy});
+
+            first = false;
+        }
+
+        if (wrapOverloadParens)
+        {
+            state.dedent();
+            state.newline();
+            state.emit(")");
+        }
+    }
+
+    void operator()(TypeId, const ErrorType& tv)
+    {
+        state.result.error = true;
+
+        if (tv.synthetic)
+        {
+            state.emit("*error-type<");
+            stringify(*tv.synthetic);
+            state.emit(">*");
+        }
+        else
+            state.emit("*error-type*");
+    }
+
+    void operator()(TypeId, const LazyType& ltv)
+    {
+        if (TypeId unwrapped = ltv.unwrapped.load())
+        {
+            stringify(unwrapped);
+        }
+        else
+        {
+            state.result.invalid = true;
+            state.emit("lazy?");
+        }
+    }
+
+    void operator()(TypeId, const UnknownType& ttv)
+    {
+        state.emit("unknown");
+    }
+
+    void operator()(TypeId, const NeverType& ttv)
+    {
+        state.emit("never");
+    }
+
+    void operator()(TypeId, const NegationType& ntv)
+    {
+        TypeId followed = follow(ntv.ty);
+
+        if (FFlag::LuauTruthyFalsy)
+        {
+            if (const UnionType* ut = get<UnionType>(followed); ut && isExactlyFalsyUnion(*ut))
+            {
+                state.emit("truthy");
+                return;
+            }
+        }
+
+        state.emit("~");
+
+        // The precedence of `~` should be less than `|` and `&`.
+        bool parens = get<UnionType>(followed) || get<IntersectionType>(followed);
+
+        if (parens)
+            state.emit("(");
+
+        stringify(ntv.ty);
+
+        if (parens)
+            state.emit(")");
+    }
+
+    void operator()(TypeId, const TypeFunctionInstanceType& tfitv)
+    {
+        if (tfitv.userFuncName) // Special stringification for user-defined type functions
+            state.emit(tfitv.userFuncName->value);
+        else
+            state.emit(tfitv.function->name);
+
+        state.emit("<");
+
+        bool comma = false;
+        for (TypeId ty : tfitv.typeArguments)
+        {
+            if (comma)
+                state.emit(", ");
+
+            comma = true;
+            stringify(ty);
+        }
+
+        for (TypePackId tp : tfitv.packArguments)
+        {
+            if (comma)
+                state.emit(", ");
+
+            comma = true;
+            stringify(tp);
+        }
+
+        state.emit(">");
+    }
+};
+
+struct TypePackStringifier
+{
+    StringifierState& state;
+
+    const std::vector<std::optional<FunctionArgument>> elemNames;
+    static inline const std::vector<std::optional<FunctionArgument>> dummyElemNames = {};
+    unsigned elemIndex = 0;
+
+    explicit TypePackStringifier(StringifierState& state, const std::vector<std::optional<FunctionArgument>>& elemNames)
+        : state(state)
+        , elemNames(elemNames)
+    {
+    }
+
+    explicit TypePackStringifier(StringifierState& state)
+        : state(state)
+        , elemNames(dummyElemNames)
+    {
+    }
+
+    void stringify(TypeId tv)
+    {
+        TypeStringifier tvs{state};
+        tvs.stringify(tv);
+    }
+
+    void stringify(TypePackId tp)
+    {
+        if (state.opts.maxTypeLength > 0 && state.result.name.length() > state.opts.maxTypeLength)
+            return;
+
+        if (tp->ty.valueless_by_exception())
+        {
+            state.result.error = true;
+            state.emit("* VALUELESS TP BY EXCEPTION *");
+            return;
+        }
+
+        if (auto p = state.cycleTpNames.find(tp))
+        {
+            state.usedCycleTpNames.insert(tp);
+            state.emit(*p);
+            return;
+        }
+
+        Luau::visit(
+            [this, tp](auto&& t)
+            {
+                return (*this)(tp, t);
+            },
+            tp->ty
+        );
+    }
+
+    void operator()(TypePackId, const TypePack& tp)
+    {
+        if (state.hasSeen(&tp))
+        {
+            state.result.cycle = true;
+            state.emit("*CYCLETP*");
+            return;
+        }
+
+        if (tp.head.empty() && (!tp.tail || isEmpty(*tp.tail)))
+        {
+            state.emit("()");
+            state.unsee(&tp);
+            return;
+        }
+
+        bool first = true;
+
+        for (const auto& typeId : tp.head)
+        {
+            if (first)
+                first = false;
+            else
+                state.emit(", ");
+
+            // Do not respect opts.namedFunctionOverrideArgNames here
+            if (elemIndex < elemNames.size() && elemNames[elemIndex])
+            {
+                state.emit(elemNames[elemIndex]->name);
+                state.emit(": ");
+            }
+
+            elemIndex++;
+
+            stringify(typeId);
+        }
+
+        if (tp.tail && !isEmpty(*tp.tail))
+        {
+            TypePackId tail = follow(*tp.tail);
+            if (auto vtp = get<VariadicTypePack>(tail); !vtp || (FInt::DebugLuauVerboseTypeNames < 1 && !vtp->hidden))
+            {
+                if (first)
+                    first = false;
+                else
+                    state.emit(", ");
+
+                stringify(tail);
+            }
+        }
+
+        state.unsee(&tp);
+    }
+
+    void operator()(TypePackId, const ErrorTypePack& error)
+    {
+        state.result.error = true;
+
+        if (error.synthetic)
+        {
+            state.emit("*");
+            stringify(*error.synthetic);
+            state.emit("*");
+        }
+        else
+            state.emit("*error-type*");
+    }
+
+    void operator()(TypePackId, const VariadicTypePack& pack)
+    {
+        state.emit("...");
+        if (FInt::DebugLuauVerboseTypeNames >= 1 && pack.hidden)
+        {
+            state.emit("*hidden*");
+        }
+        stringify(pack.ty);
+    }
+
+    void operator()(TypePackId tp, const GenericTypePack& pack)
+    {
+        if (FInt::DebugLuauVerboseTypeNames >= 1)
+            state.emit("gen-");
+
+        if (pack.explicitName)
+        {
+            state.usedNames.insert(pack.name);
+            state.opts.nameMap.typePacks[tp] = pack.name;
+            state.emit(pack.name);
+        }
+        else
+        {
+            state.emit(state.getName(tp));
+        }
+
+        if (FInt::DebugLuauVerboseTypeNames >= 1)
+            state.emit(pack.polarity);
+
+        if (FInt::DebugLuauVerboseTypeNames >= 2)
+        {
+            state.emit("-");
+            state.emitLevel(pack.scope);
+        }
+
+        state.emit("...");
+    }
+
+    void operator()(TypePackId tp, const FreeTypePack& pack)
+    {
+        state.result.invalid = true;
+        if (FInt::DebugLuauVerboseTypeNames >= 1)
+            state.emit("free-");
+        state.emit(state.getName(tp));
+
+        if (FInt::DebugLuauVerboseTypeNames >= 1)
+            state.emit(pack.polarity);
+
+        if (FInt::DebugLuauVerboseTypeNames >= 2)
+        {
+            state.emit("-");
+            state.emitLevel(pack.scope);
+        }
+
+        state.emit("...");
+    }
+
+    void operator()(TypePackId, const BoundTypePack& btv)
+    {
+        stringify(btv.boundTo);
+    }
+
+    void operator()(TypePackId, const BlockedTypePack& btp)
+    {
+        state.emit("*blocked-tp-");
+        state.emit(btp.index);
+        state.emit("*");
+    }
+
+    void operator()(TypePackId, const TypeFunctionInstanceTypePack& tfitp)
+    {
+        state.emit(tfitp.function->name);
+        state.emit("<");
+
+        bool comma = false;
+        for (TypeId p : tfitp.typeArguments)
+        {
+            if (comma)
+                state.emit(", ");
+
+            comma = true;
+            stringify(p);
+        }
+
+        for (TypePackId p : tfitp.packArguments)
+        {
+            if (comma)
+                state.emit(", ");
+
+            comma = true;
+            stringify(p);
+        }
+
+        state.emit(">");
+    }
+};
+
+void TypeStringifier::stringify(TypePackId tp)
+{
+    TypePackStringifier tps(state);
+    tps.stringify(tp);
+}
+
+void TypeStringifier::stringify(TypePackId tpid, const std::vector<std::optional<FunctionArgument>>& names)
+{
+    TypePackStringifier tps(state, names);
+    tps.stringify(tpid);
+}
+
+static void assignCycleNames(
+    const std::set<TypeId>& cycles,
+    const std::set<TypePackId>& cycleTPs,
+    DenseHashMap<TypeId, std::string>& cycleNames,
+    DenseHashMap<TypePackId, std::string>& cycleTpNames,
+    bool exhaustive
+)
+{
+    int nextIndex = 1;
+
+    for (TypeId cycleTy : cycles)
+    {
+        std::string name;
+
+        // TODO: use the stringified type list if there are no cycles
+        if (auto ttv = get<TableType>(follow(cycleTy)); !exhaustive && ttv && (ttv->syntheticName || ttv->name))
+        {
+            // If we have a cycle type in type parameters, assign a cycle name for this named table
+            if (std::find_if(
+                    ttv->instantiatedTypeParams.begin(),
+                    ttv->instantiatedTypeParams.end(),
+                    [&](auto&& el)
+                    {
+                        return cycles.count(follow(el));
+                    }
+                ) != ttv->instantiatedTypeParams.end())
+                cycleNames[cycleTy] = ttv->name ? *ttv->name : *ttv->syntheticName;
+
+            continue;
+        }
+
+        // Luwu: the named-table case above only covers TableType. Every other type that can be the
+        // target of an alias also carries a name, and the common Luau OOP idioms produce those types:
+        // `typeof(setmetatable(...))` is a MetatableType, and `typeof(X.Prototype) & { ... }` is an
+        // IntersectionType. Both reach themselves through every method's `self`, so both are always
+        // cyclic. Upstream gives them a cycle name like any other cycle, so they never print as their
+        // own name, and a table of them reads as `t65` repeated. Each of these printers has its own
+        // name short-circuit and its own hasSeen guard, so leaving them unnamed here is as safe as it
+        // is for a named table.
+        if (!exhaustive)
+        {
+            TypeId cycleTyFollowed = follow(cycleTy);
+
+            auto isNamed = [](const auto* t)
+            {
+                return t && (t->name || t->syntheticName);
+            };
+
+            if (auto mtv = get<MetatableType>(cycleTyFollowed); mtv && mtv->syntheticName)
+                continue;
+            // A named union never gets here: FindCyclicTypes doesn't walk into it.
+            //
+            // FunctionType is left out. A self-recursive function alias is its own root, where
+            // `suppressNameFor` makes `willPrintAsBareName` answer false. Without a cycle name, the union
+            // and intersection printers then wrap it in parentheses: `(F)?` instead of `t1?`.
+            if (isNamed(get<IntersectionType>(cycleTyFollowed)))
+                continue;
+        }
+
+        name = "t" + std::to_string(nextIndex);
+        ++nextIndex;
+
+        cycleNames[cycleTy] = std::move(name);
+    }
+
+    for (TypePackId tp : cycleTPs)
+    {
+        std::string name = "tp" + std::to_string(nextIndex);
+        ++nextIndex;
+        cycleTpNames[tp] = std::move(name);
+    }
+}
+
+enum class IgnoreSyntheticName
+{
+    Yes,
+    No
+};
+
+static void tableTypeToStringDetailed(
+    TypeId ty,
+    const TableType* ttv,
+    const IgnoreSyntheticName ignoreSyntheticName,
+    ToStringResult& result,
+    const std::shared_ptr<Scope>& scope,
+    const std::string_view nameToUse,
+    TypeStringifier& tvs
+)
+{
+    if (ignoreSyntheticName == IgnoreSyntheticName::No && ttv->syntheticName)
+        result.invalid = true;
+
+    // If scope is provided, add module name and check visibility
+    if (ttv->name && scope)
+    {
+        auto [success, moduleName] = canUseTypeNameInScope(scope, *ttv->name);
+
+        if (!success)
+            result.invalid = true;
+
+        if (moduleName)
+            result.name = format("%s.", moduleName->c_str());
+    }
+
+    size_t startPos = result.name.length();
+    result.name += nameToUse;
+    size_t endPos = result.name.length();
+
+    if (endPos > startPos)
+        result.typeSpans.emplace_back(ToStringSpan{startPos, endPos, ty});
+
+    tvs.stringify(ttv->instantiatedTypeParams, ttv->instantiatedTypePackParams);
+}
+
+// Luwu: appends ` where t1 = ... ; t2 = ...`, defining the cycle names that the text printed so far
+// actually used, and only those. A body can reference another cycle, so this repeats until the
+// bodies introduce no new names. Nothing is appended when no name was used.
+//
+// `bypassOwnNameOnly` controls how each body is expanded. When true, a body bypasses only its own
+// name and keeps other named types as names; this is only safe where the clause can also define
+// them. When false, each body is expanded exhaustively.
+static void emitUsedCycleDefinitions(StringifierState& state, TypeStringifier& tvs, bool bypassOwnNameOnly)
+{
+    TypePackStringifier tps{state};
+    ToStringResult& result = state.result;
+
+    // Collected as (name, body) and sorted by name at the end: bodies are *discovered* in usage
+    // order (the root first, then whatever its body referenced), but the clause reads better -- and
+    // stays stable for callers comparing strings -- ordered by name.
+    std::vector<std::pair<std::string, std::string>> whereEntries;
+
+    auto appendBody = [&](auto printBody, const std::string& name)
+    {
+        std::string saved = std::move(result.name);
+        result.name.clear();
+
+        printBody();
+
+        std::string body = std::move(result.name);
+        result.name = std::move(saved);
+
+        whereEntries.emplace_back(name, std::move(body));
+    };
+
+    DenseHashSet<TypeId> definedTys{nullptr};
+    DenseHashSet<TypePackId> definedTps{nullptr};
+
+    bool addedAny = true;
+    while (addedAny)
+    {
+        addedAny = false;
+
+        std::vector<std::pair<TypeId, std::string>> pendingTys;
+        for (const auto& [cycleTy, name] : state.cycleNames)
+        {
+            if (state.usedCycleNames.contains(cycleTy) && !definedTys.contains(cycleTy))
+                pendingTys.emplace_back(cycleTy, name);
+        }
+
+        std::vector<std::pair<TypePackId, std::string>> pendingTps;
+        for (const auto& [cycleTp, name] : state.cycleTpNames)
+        {
+            if (state.usedCycleTpNames.contains(cycleTp) && !definedTps.contains(cycleTp))
+                pendingTps.emplace_back(cycleTp, name);
+        }
+
+        auto byName = [](const auto& a, const auto& b)
+        {
+            return a.second < b.second;
+        };
+        std::sort(pendingTys.begin(), pendingTys.end(), byName);
+        std::sort(pendingTps.begin(), pendingTps.end(), byName);
+
+        for (const auto& pendingTy : pendingTys)
+        {
+            // Bound as ordinary locals: a structured binding cannot be captured by a lambda in C++17.
+            TypeId cycleTy = pendingTy.first;
+            const std::string& name = pendingTy.second;
+
+            definedTys.insert(cycleTy);
+            addedAny = true;
+
+            appendBody(
+                [&]()
+                {
+                    // Expand this cycle with only its own name bypassed, so any other named type in
+                    // the body still prints as its name. Setting `exhaustive` would suppress every
+                    // name instead: a body that mentions another named type would expand that type
+                    // too (`Cache<K, V>` as `t1 & { store: { [K]: V } }`), and one message could
+                    // spell the same type two ways.
+                    //
+                    // This is only safe when the printer can also define the names it uses, which is
+                    // what `includeWhereClauses` means. Without it, a pair of corecursive types would
+                    // print `t1 = () -> (number, B)` with `B` defined nowhere, which says less than a
+                    // full expansion. So in that case the body is expanded with `exhaustive`
+                    // (see `corecursive_function_types`).
+                    std::optional<TypeId> savedSuppress = state.suppressNameFor;
+                    const bool savedExhaustive = state.exhaustive;
+
+                    if (bypassOwnNameOnly)
+                        state.suppressNameFor = cycleTy;
+                    else
+                        state.exhaustive = true;
+
+                    Luau::visit(
+                        [&tvs, cycleTy = cycleTy](auto&& t)
+                        {
+                            return tvs(cycleTy, t);
+                        },
+                        cycleTy->ty
+                    );
+
+                    state.suppressNameFor = savedSuppress;
+                    state.exhaustive = savedExhaustive;
+                },
+                name
+            );
+        }
+
+        for (const auto& pendingTp : pendingTps)
+        {
+            // Bound as ordinary locals: a structured binding cannot be captured by a lambda in C++17.
+            TypePackId cycleTp = pendingTp.first;
+            const std::string& name = pendingTp.second;
+
+            definedTps.insert(cycleTp);
+            addedAny = true;
+
+            appendBody(
+                [&]()
+                {
+                    Luau::visit(
+                        [&tps, cycleTp = cycleTp](auto&& t)
+                        {
+                            return tps(cycleTp, t);
+                        },
+                        cycleTp->ty
+                    );
+                },
+                name
+            );
+        }
+    }
+
+    if (!whereEntries.empty())
+    {
+        std::sort(
+            whereEntries.begin(),
+            whereEntries.end(),
+            [](const auto& a, const auto& b)
+            {
+                return a.first < b.first;
+            }
+        );
+
+        result.cycle = true;
+        state.emit(" where ");
+
+        bool semi = false;
+        for (const auto& [name, body] : whereEntries)
+        {
+            if (semi)
+                state.emit(" ; ");
+
+            state.emit(name);
+            state.emit(" = ");
+            state.emit(body);
+            semi = true;
+        }
+    }
+
+}
+
+ToStringResult toStringDetailed(TypeId ty, ToStringOptions& opts)
+{
+    /*
+     * 1. Walk the Type and track seen TypeIds.  When you reencounter a TypeId, add it to a set of seen cycles.
+     * 2. Generate some names for each cycle.  For a starting point, we can just call them t0, t1 and so on.
+     * 3. For each seen cycle, stringify it like we do now, but replace each known cycle with its name.
+     * 4. Print out the root of the type using the same algorithm as step 3.
+     */
+    ty = follow(ty);
+    ToStringResult result;
+
+    StringifierState state{opts, result};
+
+    std::set<TypeId> cycles;
+    std::set<TypePackId> cycleTPs;
+
+    findCyclicTypes(cycles, cycleTPs, ty, opts.exhaustive);
+
+    assignCycleNames(cycles, cycleTPs, state.cycleNames, state.cycleTpNames, opts.exhaustive);
+
+    TypeStringifier tvs{state};
+
+    if (!opts.exhaustive && !opts.alwaysExpandRootAlias && !opts.expandAliases)
+    {
+        if (state.ignoreSyntheticName)
+        {
+            if (auto ttv = get<TableType>(ty); ttv && ttv->name)
+            {
+                tableTypeToStringDetailed(ty, ttv, IgnoreSyntheticName::Yes, result, opts.scope, *ttv->name, tvs);
+
+                return result;
+            }
+        }
+        else if (auto ttv = get<TableType>(ty); ttv && (ttv->name || ttv->syntheticName))
+        {
+            tableTypeToStringDetailed(ty, ttv, IgnoreSyntheticName::No, result, opts.scope, ttv->name ? *ttv->name : *ttv->syntheticName, tvs);
+
+            return result;
+        }
+        else if (auto mtv = get<MetatableType>(ty); mtv && mtv->syntheticName)
+        {
+            result.invalid = true;
+            result.name = *mtv->syntheticName;
+            return result;
+        }
+    }
+
+    // Unlike TableType/MetatableType above, a named UnionType/IntersectionType/FunctionType at the
+    // *root* of a toStringDetailed call always expands fully rather than short-circuiting to its
+    // own name - e.g. printing a type alias's own definition, or the type of a variable declared
+    // with that alias, should show what it expands to. Nested occurrences of the same alias
+    // elsewhere in the type still collapse to the name (see the per-Type operator() overloads in
+    // TypeStringifier), which is what feeds the `where` clause below.
+    state.suppressNameFor = ty;
+
+    /* If the root itself is a cycle, we special case a little.
+     * We go out of our way to print the following:
+     *
+     * t1 where t1 = the_whole_root_type
+     */
+    if (auto p = state.cycleNames.find(ty))
+    {
+        // Emitted directly rather than through TypeStringifier::stringify, so record it here too --
+        // otherwise the root's own cycle is never marked used and loses its `where` binding.
+        state.usedCycleNames.insert(ty);
+        state.emit(*p);
+    }
+    else
+        tvs.stringify(ty);
+
+    state.suppressNameFor = std::nullopt;
+
+    if (opts.includeWhereClauses && !state.aliasReferences.empty())
+    {
+        for (const auto& [name, refTy] : state.aliasReferences)
+        {
+            if (opts.maxTypeLength > 0 && result.whereClauses.length() > opts.maxTypeLength)
+            {
+                result.truncated = true;
+                result.whereClauses += "... *TRUNCATED*";
+                break;
+            }
+
+            std::string body = tvs.stringifyAliasBodyOnce(refTy);
+
+            if (!result.whereClauses.empty())
+                result.whereClauses += "\n";
+
+            result.whereClauses += "type ";
+            result.whereClauses += name;
+            result.whereClauses += " = ";
+            result.whereClauses += body;
+        }
+    }
+
+    emitUsedCycleDefinitions(state, tvs, /* bypassOwnNameOnly */ opts.includeWhereClauses);
+
+    if (opts.maxTypeLength > 0 && result.name.length() > opts.maxTypeLength)
+    {
+        result.truncated = true;
+
+        result.name += "... *TRUNCATED*";
+    }
+
+    return result;
+}
+
+ToStringResult toStringDetailed(TypePackId tp, ToStringOptions& opts)
+{
+    /*
+     * 1. Walk the Type and track seen TypeIds.  When you reencounter a TypeId, add it to a set of seen cycles.
+     * 2. Generate some names for each cycle.  For a starting point, we can just call them t0, t1 and so on.
+     * 3. For each seen cycle, stringify it like we do now, but replace each known cycle with its name.
+     * 4. Print out the root of the type using the same algorithm as step 3.
+     */
+    ToStringResult result;
+    StringifierState state{opts, result};
+
+    std::set<TypeId> cycles;
+    std::set<TypePackId> cycleTPs;
+
+    findCyclicTypes(cycles, cycleTPs, tp, opts.exhaustive);
+
+    assignCycleNames(cycles, cycleTPs, state.cycleNames, state.cycleTpNames, opts.exhaustive);
+
+    TypeStringifier tvs{state};
+
+    /* If the root itself is a cycle, we special case a little.
+     * We go out of our way to print the following:
+     *
+     * t1 where t1 = the_whole_root_type
+     */
+    if (auto p = state.cycleTpNames.find(tp))
+    {
+        state.usedCycleTpNames.insert(tp);
+        state.emit(*p);
+    }
+    else
+        tvs.stringify(tp);
+
+    // Luwu: same as the TypeId overload. Define only the cycle names that reached the output, and
+    // repeat until the bodies introduce no new ones.
+    // Upstream's TypePackId overload decides whether to emit a `where` clause from `cycles` (every
+    // cycle found) instead of `cycleNames` (every cycle given a name). Those differ, because
+    // assignCycleNames deliberately leaves a named type unnamed so that it prints as its own name. For
+    // a root like that, upstream prints ` where ` followed by nothing.
+    TypePackStringifier tps{tvs.state};
+
+    std::vector<std::pair<std::string, std::string>> whereEntries;
+
+    auto appendBody = [&](auto printBody, const std::string& name)
+    {
+        std::string saved = std::move(result.name);
+        result.name.clear();
+
+        printBody();
+
+        std::string body = std::move(result.name);
+        result.name = std::move(saved);
+
+        whereEntries.emplace_back(name, std::move(body));
+    };
+
+    DenseHashSet<TypeId> definedTys{nullptr};
+    DenseHashSet<TypePackId> definedTps{nullptr};
+
+    bool addedAny = true;
+    while (addedAny)
+    {
+        addedAny = false;
+
+        std::vector<std::pair<TypeId, std::string>> pendingTys;
+        for (const auto& [cycleTy, name] : state.cycleNames)
+        {
+            if (state.usedCycleNames.contains(cycleTy) && !definedTys.contains(cycleTy))
+                pendingTys.emplace_back(cycleTy, name);
+        }
+
+        std::vector<std::pair<TypePackId, std::string>> pendingTps;
+        for (const auto& [cycleTp, name] : state.cycleTpNames)
+        {
+            if (state.usedCycleTpNames.contains(cycleTp) && !definedTps.contains(cycleTp))
+                pendingTps.emplace_back(cycleTp, name);
+        }
+
+        auto byName = [](const auto& a, const auto& b)
+        {
+            return a.second < b.second;
+        };
+        std::sort(pendingTys.begin(), pendingTys.end(), byName);
+        std::sort(pendingTps.begin(), pendingTps.end(), byName);
+
+        for (const auto& pendingTy : pendingTys)
+        {
+            // Bound as ordinary locals: a structured binding cannot be captured by a lambda in C++17.
+            TypeId cycleTy = pendingTy.first;
+            const std::string& name = pendingTy.second;
+
+            definedTys.insert(cycleTy);
+            addedAny = true;
+
+            appendBody(
+                [&]()
+                {
+                    std::optional<TypeId> savedSuppress = state.suppressNameFor;
+                    const bool savedExhaustive = state.exhaustive;
+
+                    if (state.opts.includeWhereClauses)
+                        state.suppressNameFor = cycleTy;
+                    else
+                        state.exhaustive = true;
+
+                    Luau::visit(
+                        [&tvs, cycleTy = cycleTy](auto&& t)
+                        {
+                            return tvs(cycleTy, t);
+                        },
+                        cycleTy->ty
+                    );
+
+                    state.suppressNameFor = savedSuppress;
+                    state.exhaustive = savedExhaustive;
+                },
+                name
+            );
+        }
+
+        for (const auto& pendingTp : pendingTps)
+        {
+            // Bound as ordinary locals: a structured binding cannot be captured by a lambda in C++17.
+            TypePackId cycleTp = pendingTp.first;
+            const std::string& name = pendingTp.second;
+
+            definedTps.insert(cycleTp);
+            addedAny = true;
+
+            appendBody(
+                [&]()
+                {
+                    Luau::visit(
+                        [&tps, cycleTp = cycleTp](auto t)
+                        {
+                            return tps(cycleTp, t);
+                        },
+                        cycleTp->ty
+                    );
+                },
+                name
+            );
+        }
+    }
+
+    if (!whereEntries.empty())
+    {
+        std::sort(
+            whereEntries.begin(),
+            whereEntries.end(),
+            [](const auto& a, const auto& b)
+            {
+                return a.first < b.first;
+            }
+        );
+
+        result.cycle = true;
+        state.emit(" where ");
+
+        bool semi = false;
+        for (const auto& [name, body] : whereEntries)
+        {
+            if (semi)
+                state.emit(" ; ");
+
+            state.emit(name);
+            state.emit(" = ");
+            state.emit(body);
+            semi = true;
+        }
+    }
+
+    if (opts.maxTypeLength > 0 && result.name.length() > opts.maxTypeLength)
+    {
+        result.name += "... *TRUNCATED*";
+    }
+
+    return result;
+}
+
+std::string toString(TypeId ty, ToStringOptions& opts)
+{
+    return toStringDetailed(ty, opts).name;
+}
+
+std::string toString(TypePackId tp, ToStringOptions& opts)
+{
+    return toStringDetailed(tp, opts).name;
+}
+
+std::string toString(const Type& tv, ToStringOptions& opts)
+{
+    return toString(const_cast<TypeId>(&tv), opts);
+}
+
+std::string toString(const TypePackVar& tp, ToStringOptions& opts)
+{
+    return toString(const_cast<TypePackId>(&tp), opts);
+}
+
+std::string toStringNamedFunction(const std::string& funcName, const FunctionType& ftv, ToStringOptions& opts)
+{
+    ToStringResult result;
+    StringifierState state{opts, result};
+
+    // Luwu: name the cycles before printing, exactly as toStringDetailed does. Without this
+    // `state.cycleNames` is empty, so a recursive type in a signature has no `t<n>` to collapse to
+    // and degrades to a bare `*CYCLE*` -- which doesn't say *which* type recursed, and in the shapes
+    // this matters for (an OOP prototype table, whose every method takes `self`) there are several
+    // candidates on screen at once. A `where` clause is emitted below for whatever gets named.
+    std::set<TypeId> cycles;
+    std::set<TypePackId> cycleTPs;
+
+    // `findCyclicTypes` assigns to its out-params rather than adding to them, so accumulate.
+    auto gatherCycles = [&](auto ty)
+    {
+        std::set<TypeId> found;
+        std::set<TypePackId> foundTPs;
+        findCyclicTypes(found, foundTPs, ty, opts.exhaustive);
+        cycles.insert(found.begin(), found.end());
+        cycleTPs.insert(foundTPs.begin(), foundTPs.end());
+    };
+
+    gatherCycles(ftv.argTypes);
+    gatherCycles(ftv.retTypes);
+
+    assignCycleNames(cycles, cycleTPs, state.cycleNames, state.cycleTpNames, opts.exhaustive);
+
+    TypeStringifier tvs{state};
+
+    state.emit(funcName);
+
+    if (!opts.hideNamedFunctionTypeParameters)
+        tvs.stringify(ftv.generics, ftv.genericPacks);
+
+    state.emit("(");
+
+    auto argPackIter = begin(ftv.argTypes);
+
+    bool first = true;
+    size_t idx = 0;
+    while (argPackIter != end(ftv.argTypes))
+    {
+        // ftv takes a self parameter as the first argument, skip it if specified in option
+        if (idx == 0 && ftv.hasSelf && opts.hideFunctionSelfArgument)
+        {
+            ++argPackIter;
+            ++idx;
+            continue;
+        }
+
+        if (!first)
+            state.emit(", ");
+        first = false;
+
+        // ftv takes a self parameter as the first argument, print it bare (no type) if specified in option
+        if (idx == 0 && ftv.hasSelf && opts.hideFunctionSelfArgumentType)
+        {
+            state.emit(idx < ftv.argNames.size() && ftv.argNames[idx] ? ftv.argNames[idx]->name : "self");
+            ++argPackIter;
+            ++idx;
+            continue;
+        }
+
+        // We don't respect opts.functionTypeArguments
+        if (idx < opts.namedFunctionOverrideArgNames.size())
+        {
+            state.emit(opts.namedFunctionOverrideArgNames[idx] + ": ");
+        }
+        else if (idx < ftv.argNames.size() && ftv.argNames[idx])
+        {
+            state.emit(ftv.argNames[idx]->name + ": ");
+        }
+        else
+        {
+            state.emit("_: ");
+        }
+        tvs.stringify(*argPackIter);
+
+        ++argPackIter;
+        ++idx;
+    }
+
+    if (argPackIter.tail())
+    {
+        if (auto vtp = get<VariadicTypePack>(*argPackIter.tail()); !vtp || !vtp->hidden)
+        {
+            if (!first)
+                state.emit(", ");
+
+            state.emit("...: ");
+
+            if (vtp)
+                tvs.stringify(vtp->ty);
+            else
+                tvs.stringify(*argPackIter.tail());
+        }
+    }
+
+    state.emit("): ");
+
+    size_t retSize = size(ftv.retTypes);
+    bool hasTail = !finite(ftv.retTypes);
+    bool wrap = get<TypePack>(follow(ftv.retTypes)) && (hasTail ? retSize != 0 : retSize > 1);
+
+    if (wrap)
+        state.emit("(");
+
+    tvs.stringify(ftv.retTypes);
+
+    if (wrap)
+        state.emit(")");
+
+    // Luwu try expressions
+    if (ftv.errorHint)
+    {
+        state.emit(" ! ");
+        tvs.stringify(*ftv.errorHint);
+    }
+
+    // Luwu: define the cycle names the signature used, so `t1` above means something.
+    emitUsedCycleDefinitions(state, tvs, /* bypassOwnNameOnly */ true);
+
+    return result.name;
+}
+
+static ToStringOptions& dumpOptions()
+{
+    static ToStringOptions opts = ([]() {
+        ToStringOptions o;
+        o.exhaustive = true;
+        o.functionTypeArguments = true;
+        o.maxTableLength = 0;
+        o.maxTypeLength = 0;
+        return o;
+    })();
+
+    return opts;
+}
+
+std::string dump(TypeId ty)
+{
+    std::string s = toString(ty, dumpOptions());
+    printf("%s\n", s.c_str());
+    return s;
+}
+
+std::string dump(const std::optional<TypeId>& ty)
+{
+    if (ty)
+        return dump(*ty);
+
+    printf("nullopt\n");
+    return "nullopt";
+}
+
+std::string dump(TypePackId ty)
+{
+    std::string s = toString(ty, dumpOptions());
+    printf("%s\n", s.c_str());
+    return s;
+}
+
+std::string dump(const std::optional<TypePackId>& ty)
+{
+    if (ty)
+        return dump(*ty);
+
+    printf("nullopt\n");
+    return "nullopt";
+}
+
+std::string dump(const std::vector<TypeId>& types)
+{
+    return toStringVector(types, dumpOptions());
+}
+
+std::string dump(const std::vector<TypePackId>& typePacks)
+{
+    return toStringVector(typePacks, dumpOptions());
+}
+
+std::string dump(DenseHashMap<TypeId, TypeId>& types)
+{
+    std::string s = "{";
+    ToStringOptions& opts = dumpOptions();
+    for (const auto& [key, value] : types)
+    {
+        if (s.length() > 1)
+            s += ", ";
+        s += toString(key, opts) + " : " + toString(value, opts);
+    }
+    s += "}";
+    return s;
+}
+
+std::string dump(DenseHashMap<TypePackId, TypePackId>& types)
+{
+    std::string s = "{";
+    ToStringOptions& opts = dumpOptions();
+    for (const auto& [key, value] : types)
+    {
+        if (s.length() > 1)
+            s += ", ";
+        s += toString(key, opts) + " : " + toString(value, opts);
+    }
+    s += "}";
+    return s;
+}
+
+std::string dump(const ScopePtr& scope, const char* name)
+{
+    auto binding = scope->linearSearchForBinding(name);
+    if (!binding)
+    {
+        printf("No binding %s\n", name);
+        return {};
+    }
+
+    TypeId ty = binding->typeId;
+    std::string s = toString(ty, dumpOptions());
+    printf("%s\n", s.c_str());
+    return s;
+}
+
+std::string generateName(size_t i)
+{
+    std::string n;
+    n = char('a' + i % 26);
+    if (i >= 26)
+        n += std::to_string(i / 26);
+    return n;
+}
+
+std::string toStringVector(const std::vector<TypeId>& types, ToStringOptions& opts)
+{
+    std::string s;
+    for (TypeId ty : types)
+    {
+        if (!s.empty())
+            s += ", ";
+        s += toString(ty, opts);
+    }
+    return s;
+}
+
+std::string toStringVector(const std::vector<TypePackId>& typePacks, ToStringOptions& opts)
+{
+    std::string s;
+    for (TypePackId typePack : typePacks)
+    {
+        if (!s.empty())
+            s += ", ";
+        s += toString(typePack, opts);
+    }
+    return s;
+}
+
+std::string toString(const Constraint& constraint, ToStringOptions& opts)
+{
+    auto go = [&opts](auto&& c) -> std::string
+    {
+        using T = std::decay_t<decltype(c)>;
+
+        auto tos = [&opts](auto&& a)
+        {
+            return toString(a, opts);
+        };
+
+        if constexpr (std::is_same_v<T, SubtypeConstraint>)
+        {
+            std::string subStr = tos(c.subType);
+            std::string superStr = tos(c.superType);
+            return subStr + " <: " + superStr;
+        }
+        else if constexpr (std::is_same_v<T, PackSubtypeConstraint>)
+        {
+            std::string subStr = tos(c.subPack);
+            std::string superStr = tos(c.superPack);
+            return subStr + " <...: " + superStr;
+        }
+        else if constexpr (std::is_same_v<T, GeneralizationConstraint>)
+        {
+            std::string subStr = tos(c.generalizedType);
+            std::string superStr = tos(c.sourceType);
+            return subStr + " ~ gen " + superStr;
+        }
+        else if constexpr (std::is_same_v<T, IterableConstraint>)
+        {
+            std::string iteratorStr = tos(c.iterator);
+            std::string variableStr = toStringVector(c.variables, opts);
+
+            return variableStr + " ~ iterate " + iteratorStr;
+        }
+        else if constexpr (std::is_same_v<T, NameConstraint>)
+        {
+            std::string namedStr = tos(c.namedType);
+            return "@name(" + namedStr + ") = " + c.name;
+        }
+        else if constexpr (std::is_same_v<T, TypeAliasExpansionConstraint>)
+        {
+            std::string targetStr = tos(c.target);
+            return "expand " + targetStr;
+        }
+        else if constexpr (std::is_same_v<T, FunctionCallConstraint>)
+        {
+            return "call " + tos(c.fn) + "( " + tos(c.argsPack) + " )" + " with { result = " + tos(c.result) + " }";
+        }
+        else if constexpr (std::is_same_v<T, FunctionCheckConstraint>)
+        {
+            return "function_check " + tos(c.fn) + " " + tos(c.argsPack);
+        }
+        else if constexpr (std::is_same_v<T, DEPRECATED_PrimitiveTypeConstraint>)
+        {
+            if (c.expectedType)
+                return "prim " + tos(c.freeType) + "[expected: " + tos(*c.expectedType) + "] as " + tos(c.primitiveType);
+            else
+                return "prim " + tos(c.freeType) + " as " + tos(c.primitiveType);
+        }
+        else if constexpr (std::is_same_v<T, HasPropConstraint>)
+        {
+            std::string s = tos(c.resultType) + " ~ hasProp " + tos(c.subjectType) + ", \"" + c.prop + "\" ctx=" + std::to_string(int(c.context));
+            if (c.inConditional)
+                s += " (inConditional)";
+            return s;
+        }
+        else if constexpr (std::is_same_v<T, HasIndexerConstraint>)
+        {
+            return tos(c.resultType) + " ~ hasIndexer " + tos(c.subjectType) + " " + tos(c.indexType);
+        }
+        else if constexpr (std::is_same_v<T, AssignPropConstraint>)
+            return tos(c.propType) + " ~ assignProp " + tos(c.lhsType) + " " + c.propName + " " + tos(c.rhsType);
+        else if constexpr (std::is_same_v<T, AssignIndexConstraint>)
+            return "assignIndex " + tos(c.lhsType) + " " + tos(c.indexType) + " " + tos(c.rhsType);
+        else if constexpr (std::is_same_v<T, PushConstraint>)
+            return "push " + tos(c.containerType) + " " + tos(c.valuesPack);
+        else if constexpr (std::is_same_v<T, UnpackConstraint>)
+            return toStringVector(c.resultPack, opts) + " ~ ...unpack " + tos(c.sourcePack);
+        else if constexpr (std::is_same_v<T, ReduceConstraint>)
+            return "reduce " + tos(c.ty);
+        else if constexpr (std::is_same_v<T, ReducePackConstraint>)
+        {
+            return "reduce " + tos(c.tp);
+        }
+        else if constexpr (std::is_same_v<T, EqualityConstraint>)
+            return "equality: " + tos(c.resultType) + " ~ " + tos(c.assignmentType);
+        else if constexpr (std::is_same_v<T, SimplifyConstraint>)
+            return "simplify " + tos(c.ty);
+        else if constexpr (std::is_same_v<T, PushFunctionTypeConstraint>)
+            return "push_function_type " + tos(c.expectedFunctionType) + " => " + tos(c.functionType);
+        else if constexpr (std::is_same_v<T, TypeInstantiationConstraint>)
+            return "explicitly_specified_constraints " + tos(c.functionType) + " (typeArguments = " + dump(c.typeArguments) +
+                   "), (typePackArguments = " + dump(c.typePackArguments) + ")";
+        else if constexpr (std::is_same_v<T, PushTypeConstraint>)
+            return "push_type " + tos(c.expectedType) + " => " + tos(c.targetType);
+        else if constexpr (std::is_same_v<T, InstantiateNominalPropConstraint>)
+            return "instantiate_nominal_prop " + tos(c.templateProp) + " of " + tos(c.templateType) + " => " + tos(c.target) + " of " +
+                   tos(c.instantiatedType);
+        else
+            static_assert(always_false_v<T>, "Non-exhaustive constraint switch");
+    };
+
+    return visit(go, constraint.c);
+}
+
+std::string toString(const Constraint& constraint)
+{
+    return toString(constraint, ToStringOptions{});
+}
+
+std::string dump(const Constraint& c)
+{
+    ToStringOptions opts;
+    opts.exhaustive = true;
+    opts.functionTypeArguments = true;
+    std::string s = toString(c, opts);
+    printf("%s\n", s.c_str());
+    return s;
+}
+
+// Converts the given number index into a human-readable string for that index to be used in errors.
+// e.g. the index `0` becomes `1st`, `1` becomes `2nd`, `11` becomes `12th`, etc.
+std::string toHumanReadableIndex(size_t number)
+{
+    size_t humanIndex = number + 1;
+    size_t finalDigit = humanIndex % 10;
+
+    if (humanIndex > 10 && humanIndex < 20)
+        return std::to_string(humanIndex) + "th";
+
+    switch (finalDigit)
+    {
+    case 1:
+        return std::to_string(humanIndex) + "st";
+    case 2:
+        return std::to_string(humanIndex) + "nd";
+    case 3:
+        return std::to_string(humanIndex) + "rd";
+    default:
+        return std::to_string(humanIndex) + "th";
+    }
+}
+
+std::optional<std::string> getFunctionNameAsString(const AstExpr& expr)
+{
+    const AstExpr* curr = &expr;
+    std::string s;
+
+    for (;;)
+    {
+        if (auto local = curr->as<AstExprLocal>())
+            return local->local->name.value + s;
+
+        if (auto global = curr->as<AstExprGlobal>())
+            return global->name.value + s;
+
+        if (auto indexname = curr->as<AstExprIndexName>())
+        {
+            curr = indexname->expr;
+
+            s = "." + std::string(indexname->index.value) + s;
+        }
+        else if (auto group = curr->as<AstExprGroup>())
+        {
+            curr = group->expr;
+        }
+        else
+        {
+            return std::nullopt;
+        }
+    }
+
+    return s;
+}
+
+std::string toString(const Position& position)
+{
+    return "{ line = " + std::to_string(position.line) + ", col = " + std::to_string(position.column) + " }";
+}
+
+std::string toString(const Location& location, int offset, bool useBegin)
+{
+    return "(" + std::to_string(location.begin.line + offset) + ", " + std::to_string(location.begin.column + offset) + ") - (" +
+           std::to_string(location.end.line + offset) + ", " + std::to_string(location.end.column + offset) + ")";
+}
+
+std::string toString(const TypeOrPack& tyOrTp, ToStringOptions& opts)
+{
+    if (const TypeId* ty = get<TypeId>(tyOrTp))
+        return toString(*ty, opts);
+    else if (const TypePackId* tp = get<TypePackId>(tyOrTp))
+        return toString(*tp, opts);
+    else
+        LUAU_UNREACHABLE();
+}
+
+std::string dump(const TypeOrPack& tyOrTp)
+{
+    ToStringOptions opts;
+    opts.exhaustive = true;
+    opts.functionTypeArguments = true;
+    std::string s = toString(tyOrTp, opts);
+    printf("%s\n", s.c_str());
+    return s;
+}
+
+} // namespace Luau

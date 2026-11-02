@@ -1,0 +1,115 @@
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
+#include "Luau/Common.h"
+#include "Luau/ExperimentalFlags.h"
+
+#include <string>
+#include <string_view>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void setLuauFlag(std::string_view name, bool state)
+{
+    for (Luau::FValue<bool>* flag = Luau::FValue<bool>::list; flag; flag = flag->next)
+    {
+        if (name == flag->name)
+        {
+            flag->value = state;
+            return;
+        }
+        if (flag->version != 0)
+        {
+            if (name == std::string(flag->name) + std::to_string(flag->version))
+            {
+                flag->value = state;
+                return;
+            }
+        }
+    }
+
+    fprintf(stderr, "Warning: unrecognized flag '%.*s'.\n", int(name.length()), name.data());
+}
+
+// Luwu: sets an integer flag (`LuauCompileInlineThreshold=40`); false when no integer flag has that name
+static bool setLuauIntFlag(std::string_view name, int value)
+{
+    for (Luau::FValue<int>* flag = Luau::FValue<int>::list; flag; flag = flag->next)
+    {
+        if (name == flag->name)
+        {
+            flag->value = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void setLuauFlags(bool state)
+{
+    for (Luau::FValue<bool>* flag = Luau::FValue<bool>::list; flag; flag = flag->next)
+        if (strncmp(flag->name, "Luau", 4) == 0 || strncmp(flag->name, "Luwu", 4) == 0)
+            flag->value = state;
+}
+
+void setLuauFlagsDefault()
+{
+    for (Luau::FValue<bool>* flag = Luau::FValue<bool>::list; flag; flag = flag->next)
+        if ((strncmp(flag->name, "Luau", 4) == 0 || strncmp(flag->name, "Luwu", 4) == 0) && !Luau::isAnalysisFlagExperimental(flag->name))
+            flag->value = true;
+}
+
+void setLuauFlags(const char* list)
+{
+    std::string_view rest = list;
+
+    while (!rest.empty())
+    {
+        size_t ending = rest.find(",");
+        std::string_view element = rest.substr(0, ending);
+
+        if (size_t separator = element.find('='); separator != std::string_view::npos)
+        {
+            std::string_view key = element.substr(0, separator);
+            std::string_view value = element.substr(separator + 1);
+
+            if (value == "true" || value == "True")
+                setLuauFlag(key, true);
+            else if (value == "false" || value == "False")
+                setLuauFlag(key, false);
+            else
+            {
+                // Luwu: an integer value sets an integer flag
+                std::string number(value);
+                char* numberEnd = nullptr;
+                long parsed = strtol(number.c_str(), &numberEnd, 10);
+                bool isInteger = !number.empty() && *numberEnd == '\0';
+                bool set = isInteger && setLuauIntFlag(key, int(parsed));
+
+                if (!set)
+                    fprintf(
+                        stderr,
+                        "Warning: unrecognized value '%.*s' for flag '%.*s'.\n",
+                        int(value.length()),
+                        value.data(),
+                        int(key.length()),
+                        key.data()
+                    );
+            }
+        }
+        else
+        {
+            if (element == "true" || element == "True")
+                setLuauFlags(true);
+            else if (element == "false" || element == "False")
+                setLuauFlags(false);
+            else
+                setLuauFlag(element, true);
+        }
+
+        if (ending != std::string_view::npos)
+            rest.remove_prefix(ending + 1);
+        else
+            break;
+    }
+}

@@ -1,0 +1,232 @@
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
+#pragma once
+
+#include "Luau/Config.h"
+#include "Luau/Error.h"
+#include "Luau/Linter.h"
+#include "Luau/FileResolver.h"
+#include "Luau/ParseOptions.h"
+#include "Luau/ParseResult.h"
+#include "Luau/Scope.h"
+#include "Luau/TypeArena.h"
+#include "Luau/DataFlowGraph.h"
+#include "Luau/DocRefs.h"
+
+#include <memory>
+#include <vector>
+#include <unordered_map>
+#include <optional>
+
+namespace Luau
+{
+
+using LogLuauProc = void (*)(std::string_view, std::string_view);
+extern LogLuauProc logLuau;
+
+void setLogLuau(LogLuauProc ll);
+void resetLogLuauProc();
+
+struct Module;
+
+using ScopePtr = std::shared_ptr<struct Scope>;
+using ModulePtr = std::shared_ptr<Module>;
+
+class AstType;
+class AstTypePack;
+
+/// Root of the AST of a parsed source file
+// Luwu: a comment as a type function sees it in a type's `comments` metadata (ConstraintGenerator::attachDeclarationComments
+// adds whether it's above the declaration or to its side).
+// `prefix` is what opens it (`--`, `---`, `--[[`, `--[==[`) and `message` the rest, trimmed, so a type function can
+// tell docs from other comments by its own conventions.
+struct SourceComment
+{
+    Location location;
+    std::string prefix;
+    std::string message;
+    // nothing but whitespace before it on its line
+    bool startsLine = false;
+};
+
+std::vector<SourceComment> readSourceComments(std::string_view source, const std::vector<Comment>& comments);
+
+struct SourceModule
+{
+    ModuleName name; // Module identifier or a filename
+    std::string humanReadableName;
+
+    SourceCode::Type type = SourceCode::None;
+    // Luwu: from the module's config when it's parsed.
+    Language language = Language::Luwu;
+    // Luwu object notation: the module is a `.luwon` data file.
+    bool luwon = false;
+    std::optional<std::string> environmentName;
+    bool cyclic = false;
+
+    std::shared_ptr<Allocator> allocator;
+    std::shared_ptr<AstNameTable> names;
+    std::vector<ParseError> parseErrors;
+
+    AstStatBlock* root = nullptr;
+    std::optional<Mode> mode;
+
+    std::vector<HotComment> hotcomments;
+    std::vector<Comment> commentLocations;
+    // Luwu: see SourceComment. Hot comments (`--!strict`) and broken ones are left out.
+    std::vector<SourceComment> comments;
+
+    // Luwu doc references: references and bindings in doc comments, and their syntax errors, which
+    // never stop the module from compiling
+    std::vector<DocComment> docComments;
+    std::vector<ParseError> docParseErrors;
+
+    SourceModule()
+        : allocator(new Allocator)
+        , names(new AstNameTable(*allocator))
+    {
+    }
+};
+
+bool isWithinComment(const std::vector<Comment>& commentLocations, Position pos);
+bool isWithinComment(const SourceModule& sourceModule, Position pos);
+bool isWithinComment(const ParseResult& result, Position pos);
+
+bool isWithinHotComment(const std::vector<HotComment>& hotComments, Position pos);
+// Luwu: the hot comment `pos` is in, or nullptr
+const HotComment* findHotComment(const std::vector<HotComment>& hotComments, Position pos);
+bool isWithinHotComment(const SourceModule& sourceModule, Position pos);
+bool isWithinHotComment(const ParseResult& result, Position pos);
+
+struct RequireCycle
+{
+    Location location;
+    std::vector<ModuleName> path; // one of the paths for a require() to go all the way back to the originating module
+};
+
+struct Module
+{
+    explicit Module(std::shared_ptr<TypeArena> sharedInternalTypes)
+        : internalTypes(std::move(sharedInternalTypes))
+    {
+        LUAU_ASSERT(internalTypes);
+    }
+
+    ~Module();
+
+    // TODO: Clip this when we clip FFlagLuauSolverV2
+    bool checkedInNewSolver = false;
+
+    ModuleName name;
+    std::string humanReadableName;
+    // Luwu: the source module's language.
+    Language language = Language::Luwu;
+
+    TypeArena interfaceTypes;
+    // For modules in a require cycle, internalTypes is shared across all members
+    // so that a single constraint solver pass can allocate and resolve types across the cycle.
+    std::shared_ptr<TypeArena> internalTypes;
+
+    // Scopes and AST types refer to parse data, so we need to keep that alive
+    std::shared_ptr<Allocator> allocator;
+    std::shared_ptr<AstNameTable> names;
+    AstStatBlock* root = nullptr;
+
+    std::vector<std::pair<Location, ScopePtr>> scopes; // never empty
+
+    // Luwu doc references: where each name in the doc comments' references is declared
+    std::vector<DocRefTarget> docRefTargets;
+
+    DenseHashMap<const AstExpr*, TypeId> astTypes{nullptr};
+    DenseHashMap<const AstExpr*, TypePackId> astTypePacks{nullptr};
+    DenseHashMap<const AstExpr*, TypeId> astExpectedTypes{nullptr};
+
+    // Luwu literal types: each parameter and local annotated `literal<B>`, `V<literal<B>>` or an alias of either, with its
+    // check. Its value was checked where it was given, so passing it on unchanged passes a literal.
+    DenseHashMap<const AstLocal*, LiteralCheck> literalLocals{nullptr};
+    // Luwu literal types: `x :: literal<B>` (or `:: V<literal<B>>`, or an alias of either), which is a `B` the code says is a
+    // literal: it passes as one, unchecked, like a cast to `any` does
+    DenseHashSet<const AstExpr*> literalAssertions{nullptr};
+
+    // For AST nodes that are function calls, this map provides the
+    // unspecialized type of the function that was called. If a function call
+    // resolves to a __call metamethod application, this map will point at that
+    // metamethod.
+    //
+    // This is useful for type checking and Signature Help.
+    DenseHashMap<const AstNode*, TypeId> astOriginalCallTypes{nullptr};
+
+    // The specialization of a function that was selected.  If the function is
+    // generic, those generic type parameters will be replaced with the actual
+    // types that were passed.  If the function is an overload, this map will
+    // point at the specific overloads that were selected.
+    DenseHashMap<const AstNode*, TypeId> astOverloadResolvedTypes{nullptr};
+
+    // Only used with for...in loops.  The computed type of the next() function
+    // is kept here for type checking.
+    DenseHashMap<const AstNode*, TypeId> astForInNextTypes{nullptr};
+
+    DenseHashMap<const AstType*, TypeId> astResolvedTypes{nullptr};
+    DenseHashMap<const AstTypePack*, TypePackId> astResolvedTypePacks{nullptr};
+
+    // The computed result type of a compound assignment. (eg foo += 1)
+    //
+    // Type checking uses this to check that the result of such an operation is
+    // actually compatible with the left-side operand.
+    DenseHashMap<const AstStat*, TypeId> astCompoundAssignResultTypes{nullptr};
+
+    DenseHashMap<TypeId, std::vector<std::pair<Location, TypeId>>> upperBoundContributors{nullptr};
+
+    // Luwu: the return packs of functions whose return type was inferred value by value from their `return` statements
+    // (ConstraintSolver::dispatchInferredReturn). A `return` that gives fewer values than the others gives `nil` for
+    // the rest.
+    DenseHashSet<TypePackId> inferredReturnPacks{nullptr};
+
+    // Map AST nodes to the scope they create.  Cannot be NotNull<Scope> because
+    // we need a sentinel value for the map.
+    DenseHashMap<const AstNode*, Scope*> astScopes{nullptr};
+
+    // Stable references for type aliases registered in the environment
+    std::vector<std::unique_ptr<TypeFun>> typeFunctionAliases;
+
+    std::unordered_map<Name, TypeId> declaredGlobals;
+    ErrorVec errors;
+    // Luwu: remarks that aren't errors, such as each use of a local left without a type by an error elsewhere
+    std::vector<DiagnosticNote> notes;
+    LintResult lintResult;
+    Mode mode;
+    SourceCode::Type type;
+    double checkDurationSec = 0.0;
+    bool timeout = false;
+    bool cancelled = false;
+
+    TypePackId returnType = nullptr;
+    std::unordered_map<Name, TypeFun> exportedTypeBindings;
+    // Luwu Destructuring (rfcs/destructuring.md): the required modules this one exports as values, by the name they're
+    // exported under (`export t = require(...)`, `return { t = t }`), so `hub.t.Cat` and `type .{Cat} = hub.t` find
+    // their types in a module requiring this one
+    std::unordered_map<Name, ModuleName> exportedModules;
+
+    // Luwu forwarded module types: the exported types of the module this one returns unchanged (`return require(path)`).
+    // clonePublicInterface adds them to exportedTypeBindings, after the types this module declares itself. They aren't
+    // in the module scope, so this module can't name them unqualified.
+    std::unordered_map<Name, TypeFun> forwardedTypeBindings;
+
+    // Arenas related to the DFG must persist after the DFG no longer exists, as
+    // Module objects maintain raw pointers to objects in these arenas.
+    DefArena defArena;
+    RefinementKeyArena keyArena;
+
+    bool hasModuleScope() const;
+    ScopePtr getModuleScope() const;
+
+    // Once a module has been typechecked, we clone its public interface into a
+    // separate arena. This helps us to force Type ownership into a DAG rather
+    // than a DCG.
+    void clonePublicInterface(NotNull<BuiltinTypes> builtinTypes, InternalErrorReporter& ice, SolverMode mode);
+
+    bool constraintGenerationDidNotComplete = true;
+};
+
+void synthesizeExportReturn(NotNull<BuiltinTypes> builtinTypes, NotNull<Module> module);
+
+} // namespace Luau

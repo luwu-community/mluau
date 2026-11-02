@@ -1,0 +1,1181 @@
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
+#include "Luau/Substitution.h"
+
+#include "Luau/ApplyTypeFunction.h"
+
+#include "Luau/Ast.h"
+#include "Luau/Common.h"
+#include "Luau/TxnLog.h"
+#include "Luau/Type.h"
+
+#include <algorithm>
+
+LUAU_FASTINTVARIABLE(LuauTarjanChildLimit, 10000)
+LUAU_FASTFLAG(LuauSolverV2)
+LUAU_FASTFLAG(LuwuGenericNominals)
+LUAU_FASTINTVARIABLE(LuauTarjanPreallocationSize, 256)
+
+namespace Luau
+{
+
+static TypeId shallowClone(TypeId ty, TypeArena& dest, const TxnLog* log, bool templatesBecomeInstantiations)
+{
+    auto go = [ty, &dest, templatesBecomeInstantiations](auto&& a)
+    {
+        using T = std::decay_t<decltype(a)>;
+
+        // The pointer identities of free and local types is very important.
+        // We decline to copy them.
+        if constexpr (std::is_same_v<T, FreeType>)
+            return ty;
+        else if constexpr (std::is_same_v<T, BoundType>)
+        {
+            // This should never happen, but visit() cannot see it.
+            LUAU_ASSERT(!"shallowClone didn't follow its argument!");
+            return dest.addType(BoundType{a.boundTo});
+        }
+        else if constexpr (std::is_same_v<T, GenericType>)
+            return dest.addType(a);
+        else if constexpr (std::is_same_v<T, BlockedType>)
+            return dest.addType(a);
+        else if constexpr (std::is_same_v<T, PrimitiveType>)
+        {
+            LUAU_ASSERT(ty->persistent);
+            return ty;
+        }
+        else if constexpr (std::is_same_v<T, PendingExpansionType>)
+        {
+            PendingExpansionType clone = PendingExpansionType{a.prefix, a.name, a.typeArguments, a.packArguments};
+            return dest.addType(std::move(clone));
+        }
+        else if constexpr (std::is_same_v<T, AnyType>)
+        {
+            LUAU_ASSERT(ty->persistent);
+            return ty;
+        }
+        else if constexpr (std::is_same_v<T, NoRefineType>)
+        {
+            LUAU_ASSERT(ty->persistent);
+            return ty;
+        }
+        else if constexpr (std::is_same_v<T, ErrorType>)
+        {
+            LUAU_ASSERT(ty->persistent || a.synthetic);
+
+            if (ty->persistent)
+                return ty;
+
+            // While this code intentionally works (and clones) even if `a.synthetic` is `std::nullopt`,
+            // we still assert above because we consider it a bug to have a non-persistent error type
+            // without any associated metadata. We should always use the persistent version in such cases.
+            ErrorType clone = ErrorType{};
+            clone.synthetic = a.synthetic;
+            return dest.addType(clone);
+        }
+        else if constexpr (std::is_same_v<T, UnknownType>)
+        {
+            LUAU_ASSERT(ty->persistent);
+            return ty;
+        }
+        else if constexpr (std::is_same_v<T, NeverType>)
+        {
+            LUAU_ASSERT(ty->persistent);
+            return ty;
+        }
+        else if constexpr (std::is_same_v<T, LazyType>)
+            return ty;
+        else if constexpr (std::is_same_v<T, SingletonType>)
+            return dest.addType(a);
+        else if constexpr (std::is_same_v<T, FunctionType>)
+        {
+            FunctionType clone = FunctionType{a.level, a.argTypes, a.retTypes, a.definition, a.hasSelf};
+            clone.generics = a.generics;
+            clone.genericPacks = a.genericPacks;
+            clone.magic = a.magic;
+            clone.tags = a.tags;
+            clone.argNames = a.argNames;
+            clone.isCheckedFunction = a.isCheckedFunction;
+            clone.isDeprecatedFunction = a.isDeprecatedFunction;
+            clone.deprecatedInfo = a.deprecatedInfo;
+            // Luwu: `@nodiscard`
+            clone.isNodiscard = a.isNodiscard;
+            clone.nodiscardReason = a.nodiscardReason;
+            // Luwu user-defined refinements
+            clone.truthyRefinement = a.truthyRefinement;
+            // Luwu literal types
+            clone.literalParameters = a.literalParameters;
+            // Luwu try expressions
+            clone.errorHint = a.errorHint;
+            clone.name = a.name;
+            clone.syntheticName = a.syntheticName;
+            return dest.addType(std::move(clone));
+        }
+        else if constexpr (std::is_same_v<T, TableType>)
+        {
+            LUAU_ASSERT(!a.boundTo);
+            TableType clone = TableType{a.props, a.indexer, a.level, a.scope, a.state};
+            clone.definitionModuleName = a.definitionModuleName;
+            clone.definitionLocation = a.definitionLocation;
+            clone.name = a.name;
+            clone.syntheticName = a.syntheticName;
+            clone.instantiatedTypeParams = a.instantiatedTypeParams;
+            clone.instantiatedTypePackParams = a.instantiatedTypePackParams;
+            clone.tags = a.tags;
+            // Luwu literal types
+            clone.literalFields = a.literalFields;
+            return dest.addType(std::move(clone));
+        }
+        else if constexpr (std::is_same_v<T, MetatableType>)
+        {
+            MetatableType clone = MetatableType{a.table, a.metatable};
+            clone.syntheticName = a.syntheticName;
+            return dest.addType(std::move(clone));
+        }
+        else if constexpr (std::is_same_v<T, UnionType>)
+        {
+            UnionType clone;
+            clone.options = a.options;
+            clone.name = a.name;
+            clone.syntheticName = a.syntheticName;
+            return dest.addType(std::move(clone));
+        }
+        else if constexpr (std::is_same_v<T, IntersectionType>)
+        {
+            IntersectionType clone;
+            clone.parts = a.parts;
+            clone.name = a.name;
+            clone.syntheticName = a.syntheticName;
+            return dest.addType(std::move(clone));
+        }
+        else if constexpr (std::is_same_v<T, ExternType>)
+        {
+            // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): an instantiation's members are rebuilt from the
+            // copy's template and arguments (Substitution::clone), so they aren't copied. Neither are a template's when
+            // the copy is to become an instantiation of it.
+            const bool becomesInstantiation = a.genericTemplate || (templatesBecomeInstantiations && a.isGenericTemplate());
+            ExternType::Props members;
+            if (!becomesInstantiation)
+                members = a.builtProps();
+            ExternType clone{
+                a.name, std::move(members), a.parent, a.metatable, a.tags, a.userData, a.definitionModuleName, a.definitionLocation, a.indexer
+            };
+            clone.genericTemplate = a.genericTemplate;
+            // Preserve the hierarchy root explicitly; roots are persistent builtins that are never
+            // cloned, so this stays valid even as `parent` is re-pointed to substituted children.
+            clone.root = a.root;
+            if (FFlag::LuwuClasses)
+            {
+                clone.relation = a.relation;
+                clone.initLocation = a.initLocation;
+            }
+            // Luwu Traits (rfcs/classes/traits.md)
+            clone.implementedTraits = a.implementedTraits;
+            clone.traitInfo = a.traitInfo;
+            clone.traitIntersection = a.traitIntersection;
+            // Luwu: a class or trait a type function made is still the same one
+            clone.generatedKey = a.generatedKey;
+            if (FFlag::LuwuGenericNominals)
+            {
+                clone.hasUnresolvedGenerics = a.hasUnresolvedGenerics;
+                clone.instantiatedTypeParams = a.instantiatedTypeParams;
+                clone.instantiatedTypePackParams = a.instantiatedTypePackParams;
+            }
+            return dest.addType(std::move(clone));
+        }
+        else if constexpr (std::is_same_v<T, NegationType>)
+            return dest.addType(NegationType{a.ty});
+        else if constexpr (std::is_same_v<T, TypeFunctionInstanceType>)
+        {
+            TypeFunctionInstanceType clone{a.function, a.typeArguments, a.packArguments, a.userFuncName, a.userFuncData};
+            return dest.addType(std::move(clone));
+        }
+        else
+            static_assert(always_false_v<T>, "Non-exhaustive shallowClone switch");
+    };
+
+    ty = log->follow(ty);
+
+    if (auto pty = log->pending(ty))
+        ty = &pty->pending;
+
+    TypeId resTy = visit(go, ty->ty);
+    if (resTy != ty)
+    {
+        asMutable(resTy)->documentationSymbol = ty->documentationSymbol;
+        // Luwu: only ever adds metadata; a replacement can be an existing type that has its own
+        if (ty->metadata)
+            asMutable(resTy)->metadata = ty->metadata;
+    }
+
+    return resTy;
+}
+
+Tarjan::Tarjan()
+    : typeToIndex(nullptr, FInt::LuauTarjanPreallocationSize)
+    , packToIndex(nullptr, FInt::LuauTarjanPreallocationSize)
+{
+    nodes.reserve(FInt::LuauTarjanPreallocationSize);
+    stack.reserve(FInt::LuauTarjanPreallocationSize);
+    edgesTy.reserve(FInt::LuauTarjanPreallocationSize);
+    edgesTp.reserve(FInt::LuauTarjanPreallocationSize);
+    worklist.reserve(FInt::LuauTarjanPreallocationSize);
+}
+
+void Tarjan::visitChildren(TypeId ty, int index)
+{
+    LUAU_ASSERT(ty == log->follow(ty));
+
+    if (ignoreChildrenVisit(ty))
+        return;
+
+    if (auto pty = log->pending(ty))
+        ty = &pty->pending;
+
+    // Luwu: the types in a type's or a property's metadata are its children too (metadataHasTypes)
+    auto visitMetadata = [&](const std::shared_ptr<const TypeMetadataTable>& metadata)
+    {
+        if (!metadata)
+            return;
+
+        forEachMetadataType(
+            *metadata,
+            [&](TypeId metadataTy)
+            {
+                visitChild(metadataTy);
+            }
+        );
+    };
+    visitMetadata(ty->metadata);
+
+    // Luwu literal types: a function's literal parameters and a table's literal fields
+    auto visitLiteralCheck = [&](const LiteralCheck& check)
+    {
+        check.forEachType(
+            [&](TypeId checkTy)
+            {
+                visitChild(checkTy);
+            }
+        );
+    };
+
+    if (const FunctionType* ftv = get<FunctionType>(ty))
+    {
+        for (TypeId generic : ftv->generics)
+            visitChild(generic);
+        for (TypePackId genericPack : ftv->genericPacks)
+            visitChild(genericPack);
+
+        visitChild(ftv->argTypes);
+        visitChild(ftv->retTypes);
+
+        // Luwu user-defined refinements and literal types: types held beside the signature. Unvisited, a copy (the
+        // module's public interface is one) keeps pointing into the arena it copied from.
+        if (ftv->truthyRefinement)
+            visitChild(ftv->truthyRefinement->type);
+        for (const FunctionType::LiteralParameter& literal : ftv->literalParameters)
+            visitLiteralCheck(literal);
+
+        // Luwu try expressions
+        if (ftv->errorHint)
+            visitChild(*ftv->errorHint);
+    }
+    else if (const TableType* ttv = get<TableType>(ty))
+    {
+        LUAU_ASSERT(!ttv->boundTo);
+        for (const auto& [name, prop] : ttv->props)
+        {
+            visitChild(prop.readTy);
+            visitChild(prop.writeTy);
+            visitMetadata(prop.metadata);
+        }
+
+        if (ttv->indexer)
+        {
+            visitChild(ttv->indexer->indexType);
+            visitChild(ttv->indexer->indexResultType);
+        }
+
+        for (TypeId itp : ttv->instantiatedTypeParams)
+            visitChild(itp);
+
+        for (TypePackId itp : ttv->instantiatedTypePackParams)
+            visitChild(itp);
+
+        // Luwu literal types
+        for (const auto& [_, check] : ttv->literalFields)
+            visitLiteralCheck(check);
+    }
+    else if (const MetatableType* mtv = get<MetatableType>(ty))
+    {
+        visitChild(mtv->table);
+        visitChild(mtv->metatable);
+    }
+    else if (const UnionType* utv = get<UnionType>(ty))
+    {
+        for (TypeId opt : utv->options)
+            visitChild(opt);
+    }
+    else if (const IntersectionType* itv = get<IntersectionType>(ty))
+    {
+        for (TypeId part : itv->parts)
+            visitChild(part);
+    }
+    else if (const PendingExpansionType* petv = get<PendingExpansionType>(ty))
+    {
+        for (TypeId a : petv->typeArguments)
+            visitChild(a);
+
+        for (TypePackId a : petv->packArguments)
+            visitChild(a);
+    }
+    else if (const TypeFunctionInstanceType* tfit = get<TypeFunctionInstanceType>(ty))
+    {
+        for (TypeId a : tfit->typeArguments)
+            visitChild(a);
+
+        for (TypePackId a : tfit->packArguments)
+            visitChild(a);
+    }
+    else if (const ExternType* etv = get<ExternType>(ty))
+    {
+        // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): an instantiation's members are its template's with its type arguments in, so a
+        // substitution reaches them through the arguments (below). The template and class value are shared by every
+        // instantiation and only come along when the subclass asks for them. A template is its own instantiation with
+        // its own generics as arguments, so substituting those makes an instantiation of it (Substitution::clone).
+        const bool isInstantiation = etv->genericTemplate || (etv->isGenericTemplate() && !substitutesGenericTemplates());
+        if (!isInstantiation)
+        {
+            for (const auto& [name, prop] : etv->builtProps())
+            {
+                if (prop.readTy)
+                    visitChild(prop.readTy);
+                if (prop.writeTy)
+                    visitChild(prop.writeTy);
+                visitMetadata(prop.metadata);
+            }
+        }
+        else if (substitutesGenericTemplates())
+            visitChild(*etv->genericTemplate);
+
+        if (etv->parent)
+            visitChild(*etv->parent);
+
+        for (TypeId trait : etv->implementedTraits)
+            visitChild(trait);
+
+        if (etv->traitInfo && etv->traitInfo->implementorClass)
+            visitChild(*etv->traitInfo->implementorClass);
+
+        if (etv->traitInfo)
+        {
+            for (const auto& [trait, arguments] : etv->traitInfo->neededTypeArguments)
+            {
+                visitChild(trait);
+                for (TypeId argument : arguments)
+                    visitChild(argument);
+            }
+
+            if (etv->traitInfo->selfMarker)
+                visitChild(*etv->traitInfo->selfMarker);
+            for (const auto& [_, field] : etv->traitInfo->selfFieldTemplates)
+                visitChild(field);
+            for (const auto& [_, function] : etv->traitInfo->selfFunctions)
+            {
+                visitChild(function.generic);
+                if (function.selfType)
+                    visitChild(function.selfType);
+            }
+        }
+
+        for (TypeId trait : etv->traitIntersection)
+            visitChild(trait);
+
+        if (etv->metatable)
+            visitChild(*etv->metatable);
+
+        if (etv->indexer)
+        {
+            visitChild(etv->indexer->indexType);
+            visitChild(etv->indexer->indexResultType);
+        }
+
+        const bool visitsRelation = !isInstantiation || substitutesGenericTemplates();
+        if (FFlag::LuwuClasses && etv->relation && visitsRelation)
+        {
+            Luau::visit(
+                overloaded{
+                    [&](const Obj& obj)
+                    {
+                        visitChild(obj.ty);
+                    },
+                    [&](const Klass& klass)
+                    {
+                        visitChild(klass.ty);
+                    }
+                },
+                *etv->relation
+            );
+        }
+
+        if (FFlag::LuwuGenericNominals)
+        {
+            for (TypeId itp : etv->instantiatedTypeParams)
+                visitChild(itp);
+
+            for (TypePackId itp : etv->instantiatedTypePackParams)
+                visitChild(itp);
+        }
+    }
+    else if (const NegationType* ntv = get<NegationType>(ty))
+    {
+        visitChild(ntv->ty);
+    }
+}
+
+void Tarjan::visitChildren(TypePackId tp, int index)
+{
+    LUAU_ASSERT(tp == log->follow(tp));
+
+    if (ignoreChildrenVisit(tp))
+        return;
+
+    if (auto ptp = log->pending(tp))
+        tp = &ptp->pending;
+
+    if (const TypePack* tpp = get<TypePack>(tp))
+    {
+        for (TypeId tv : tpp->head)
+            visitChild(tv);
+        if (tpp->tail)
+            visitChild(*tpp->tail);
+    }
+    else if (const VariadicTypePack* vtp = get<VariadicTypePack>(tp))
+    {
+        visitChild(vtp->ty);
+    }
+}
+
+std::pair<int, bool> Tarjan::indexify(TypeId ty)
+{
+    ty = log->follow(ty);
+
+    auto [index, fresh] = typeToIndex.try_insert(ty, false);
+
+    if (fresh)
+    {
+        index = int(nodes.size());
+        nodes.emplace_back(ty, nullptr, false, false, index);
+    }
+
+    return {index, fresh};
+}
+
+std::pair<int, bool> Tarjan::indexify(TypePackId tp)
+{
+    tp = log->follow(tp);
+
+    auto [index, fresh] = packToIndex.try_insert(tp, false);
+
+    if (fresh)
+    {
+        index = int(nodes.size());
+        nodes.emplace_back(nullptr, tp, false, false, index);
+    }
+
+    return {index, fresh};
+}
+
+void Tarjan::visitChild(TypeId ty)
+{
+    ty = log->follow(ty);
+
+    edgesTy.push_back(ty);
+    edgesTp.push_back(nullptr);
+}
+
+void Tarjan::visitChild(TypePackId tp)
+{
+    tp = log->follow(tp);
+
+    edgesTy.push_back(nullptr);
+    edgesTp.push_back(tp);
+}
+
+TarjanResult Tarjan::loop()
+{
+    // Normally Tarjan is presented recursively, but this is a hot loop, so worth optimizing
+    while (!worklist.empty())
+    {
+        auto [index, currEdge, lastEdge] = worklist.back();
+
+        // First visit
+        if (currEdge == -1)
+        {
+            ++childCount;
+            if (childLimit > 0 && childLimit <= childCount)
+                return TarjanResult::TooManyChildren;
+
+            stack.push_back(index);
+
+            nodes[index].onStack = true;
+
+            currEdge = int(edgesTy.size());
+
+            // Fill in edge list of this vertex
+            if (TypeId ty = nodes[index].ty)
+                visitChildren(ty, index);
+            else if (TypePackId tp = nodes[index].tp)
+                visitChildren(tp, index);
+
+            lastEdge = int(edgesTy.size());
+        }
+
+        // Visit children
+        bool foundFresh = false;
+
+        for (; currEdge < lastEdge; currEdge++)
+        {
+            int childIndex = -1;
+            bool fresh = false;
+
+            if (auto ty = edgesTy[currEdge])
+                std::tie(childIndex, fresh) = indexify(ty);
+            else if (auto tp = edgesTp[currEdge])
+                std::tie(childIndex, fresh) = indexify(tp);
+            else
+                LUAU_ASSERT(false);
+
+            if (fresh)
+            {
+                // Original recursion point, update the parent continuation point and start the new element
+                worklist.back() = {index, currEdge + 1, lastEdge};
+                worklist.emplace_back(childIndex, -1, -1); // We need to continue the top-level loop from the start with the new worklist element
+                foundFresh = true;
+                break;
+            }
+            else if (nodes[childIndex].onStack)
+            {
+                nodes[index].lowlink = std::min(nodes[index].lowlink, childIndex);
+            }
+
+            visitEdge(childIndex, index);
+        }
+
+        if (foundFresh)
+            continue;
+
+        if (nodes[index].lowlink == index)
+        {
+            visitSCC(index);
+            while (!stack.empty())
+            {
+                int popped = stack.back();
+                stack.pop_back();
+                nodes[popped].onStack = false;
+                if (popped == index)
+                    break;
+            }
+        }
+
+        worklist.pop_back();
+
+        // Original return from recursion into a child
+        if (!worklist.empty())
+        {
+            auto [parentIndex, _, parentEndEdge] = worklist.back();
+
+            // No need to keep child edges around
+            edgesTy.resize(parentEndEdge);
+            edgesTp.resize(parentEndEdge);
+
+            nodes[parentIndex].lowlink = std::min(nodes[parentIndex].lowlink, nodes[index].lowlink);
+            visitEdge(index, parentIndex);
+        }
+    }
+
+    return TarjanResult::Ok;
+}
+
+TarjanResult Tarjan::visitRoot(TypeId ty)
+{
+    childCount = 0;
+    if (childLimit == 0)
+        childLimit = FInt::LuauTarjanChildLimit;
+
+    ty = log->follow(ty);
+
+    auto [index, fresh] = indexify(ty);
+    worklist.emplace_back(index, -1, -1);
+    return loop();
+}
+
+TarjanResult Tarjan::visitRoot(TypePackId tp)
+{
+    childCount = 0;
+    if (childLimit == 0)
+        childLimit = FInt::LuauTarjanChildLimit;
+
+    tp = log->follow(tp);
+
+    auto [index, fresh] = indexify(tp);
+    worklist.emplace_back(index, -1, -1);
+    return loop();
+}
+
+void Tarjan::clearTarjan(const TxnLog* log)
+{
+    typeToIndex.clear(~0u);
+    packToIndex.clear(~0u);
+
+    nodes.clear();
+
+    stack.clear();
+
+    childCount = 0;
+    // childLimit setting stays the same
+
+    this->log = log;
+
+    edgesTy.clear();
+    edgesTp.clear();
+    worklist.clear();
+}
+
+bool Tarjan::getDirty(int index)
+{
+    LUAU_ASSERT(size_t(index) < nodes.size());
+    return nodes[index].dirty;
+}
+
+void Tarjan::setDirty(int index, bool d)
+{
+    LUAU_ASSERT(size_t(index) < nodes.size());
+    nodes[index].dirty = d;
+}
+
+void Tarjan::visitEdge(int index, int parentIndex)
+{
+    if (getDirty(index))
+        setDirty(parentIndex, true);
+}
+
+void Tarjan::visitSCC(int index)
+{
+    bool d = getDirty(index);
+
+    for (auto it = stack.rbegin(); !d && it != stack.rend(); it++)
+    {
+        TarjanNode& node = nodes[*it];
+
+        if (TypeId ty = node.ty)
+            d = isDirty(ty);
+        else if (TypePackId tp = node.tp)
+            d = isDirty(tp);
+
+        if (*it == index)
+            break;
+    }
+
+    if (!d)
+        return;
+
+    for (auto it = stack.rbegin(); it != stack.rend(); it++)
+    {
+        setDirty(*it, true);
+
+        TarjanNode& node = nodes[*it];
+
+        if (TypeId ty = node.ty)
+            foundDirty(ty);
+        else if (TypePackId tp = node.tp)
+            foundDirty(tp);
+
+        if (*it == index)
+            return;
+    }
+}
+
+bool Tarjan::ignoreChildren(TypeId ty)
+{
+    return false;
+}
+
+bool Tarjan::ignoreChildren(TypePackId ty)
+{
+    return false;
+}
+
+// Some subclasses might ignore children visit, but not other actions like replacing the children
+bool Tarjan::ignoreChildrenVisit(TypeId ty)
+{
+    return ignoreChildren(ty);
+}
+
+bool Tarjan::ignoreChildrenVisit(TypePackId ty)
+{
+    return ignoreChildren(ty);
+}
+
+TarjanResult Tarjan::findDirty(TypeId ty)
+{
+    return visitRoot(ty);
+}
+
+TarjanResult Tarjan::findDirty(TypePackId tp)
+{
+    return visitRoot(tp);
+}
+
+Substitution::Substitution(TypeArena* arena)
+    : Substitution(TxnLog::empty(), arena)
+{
+}
+
+Substitution::Substitution(const TxnLog* log_, TypeArena* arena)
+    : arena(arena)
+{
+    log = log_;
+    LUAU_ASSERT(log);
+}
+
+void Substitution::dontTraverseInto(TypeId ty)
+{
+    noTraverseTypes.insert(ty);
+}
+
+void Substitution::dontTraverseInto(TypePackId tp)
+{
+    noTraverseTypePacks.insert(tp);
+}
+
+std::optional<TypeId> Substitution::substitute(TypeId ty)
+{
+    ty = log->follow(ty);
+
+    // clear algorithm state for reentrancy
+    clearTarjan(log);
+
+    auto result = findDirty(ty);
+    if (result != TarjanResult::Ok)
+        return std::nullopt;
+
+    for (auto [oldTy, newTy] : newTypes)
+    {
+        if (!ignoreChildren(oldTy) && !replacedTypes.contains(newTy))
+        {
+            if (!noTraverseTypes.contains(newTy))
+                replaceChildren(newTy);
+            replacedTypes.insert(newTy);
+        }
+    }
+    for (auto [oldTp, newTp] : newPacks)
+    {
+        if (!ignoreChildren(oldTp) && !replacedTypePacks.contains(newTp))
+        {
+            if (!noTraverseTypePacks.contains(newTp))
+                replaceChildren(newTp);
+            replacedTypePacks.insert(newTp);
+        }
+    }
+    TypeId newTy = replace(ty);
+    return newTy;
+}
+
+std::optional<TypePackId> Substitution::substitute(TypePackId tp)
+{
+    tp = log->follow(tp);
+
+    // clear algorithm state for reentrancy
+    clearTarjan(log);
+
+    auto result = findDirty(tp);
+    if (result != TarjanResult::Ok)
+        return std::nullopt;
+
+    for (auto [oldTy, newTy] : newTypes)
+    {
+        if (!ignoreChildren(oldTy) && !replacedTypes.contains(newTy))
+        {
+            if (!noTraverseTypes.contains(newTy))
+                replaceChildren(newTy);
+            replacedTypes.insert(newTy);
+        }
+    }
+    for (auto [oldTp, newTp] : newPacks)
+    {
+        if (!ignoreChildren(oldTp) && !replacedTypePacks.contains(newTp))
+        {
+            if (!noTraverseTypePacks.contains(newTp))
+                replaceChildren(newTp);
+            replacedTypePacks.insert(newTp);
+        }
+    }
+    TypePackId newTp = replace(tp);
+    return newTp;
+}
+
+void Substitution::resetState(const TxnLog* log, TypeArena* arena)
+{
+    clearTarjan(log);
+
+    this->arena = arena;
+
+    newTypes.clear();
+    newPacks.clear();
+    replacedTypes.clear();
+    replacedTypePacks.clear();
+
+    noTraverseTypes.clear();
+    noTraverseTypePacks.clear();
+}
+
+TypeId Substitution::clone(TypeId ty)
+{
+    TypeId result = shallowClone(ty, *arena, log, /* templatesBecomeInstantiations */ !substitutesGenericTemplates());
+
+    // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): the copy's members are built from its own (substituted) template and arguments. A
+    // template whose generics are being replaced becomes an instantiation of itself (see visitChildren).
+    if (ExternType* etv = getMutable<ExternType>(result))
+    {
+        if (etv->isGenericTemplate() && !substitutesGenericTemplates())
+            etv->genericTemplate = log->follow(ty);
+
+        if (etv->genericTemplate)
+            resetNominalMembers(result, arena, sharedNominalArena());
+    }
+
+    return result;
+}
+
+TypePackId Substitution::clone(TypePackId tp)
+{
+    tp = log->follow(tp);
+
+    if (auto ptp = log->pending(tp))
+        tp = &ptp->pending;
+
+    if (const TypePack* tpp = get<TypePack>(tp))
+    {
+        TypePack clone;
+        clone.head = tpp->head;
+        clone.tail = tpp->tail;
+        return addTypePack(std::move(clone));
+    }
+    else if (const VariadicTypePack* vtp = get<VariadicTypePack>(tp))
+    {
+        VariadicTypePack clone;
+        clone.ty = vtp->ty;
+        clone.hidden = vtp->hidden;
+        return addTypePack(std::move(clone));
+    }
+    else if (const TypeFunctionInstanceTypePack* tfitp = get<TypeFunctionInstanceTypePack>(tp))
+    {
+        TypeFunctionInstanceTypePack clone{
+            tfitp->function, std::vector<TypeId>(tfitp->typeArguments.size()), std::vector<TypePackId>(tfitp->packArguments.size())
+        };
+        clone.typeArguments.assign(tfitp->typeArguments.begin(), tfitp->typeArguments.end());
+        clone.packArguments.assign(tfitp->packArguments.begin(), tfitp->packArguments.end());
+        return addTypePack(std::move(clone));
+    }
+    else
+        return addTypePack(*tp);
+}
+
+void Substitution::foundDirty(TypeId ty)
+{
+    ty = log->follow(ty);
+
+    if (newTypes.contains(ty))
+        return;
+
+    if (isDirty(ty))
+        newTypes[ty] = follow(clean(ty));
+    else
+        newTypes[ty] = follow(clone(ty));
+}
+
+void Substitution::foundDirty(TypePackId tp)
+{
+    tp = log->follow(tp);
+
+    if (newPacks.contains(tp))
+        return;
+
+    if (isDirty(tp))
+        newPacks[tp] = follow(clean(tp));
+    else
+        newPacks[tp] = follow(clone(tp));
+}
+
+TypeId Substitution::replace(TypeId ty)
+{
+    ty = log->follow(ty);
+
+    if (TypeId* prevTy = newTypes.find(ty))
+        return *prevTy;
+    else
+        return ty;
+}
+
+TypePackId Substitution::replace(TypePackId tp)
+{
+    tp = log->follow(tp);
+
+    if (TypePackId* prevTp = newPacks.find(tp))
+        return *prevTp;
+    else
+        return tp;
+}
+
+void Substitution::replaceChildren(TypeId ty)
+{
+    LUAU_ASSERT(ty == log->follow(ty));
+
+    if (ignoreChildren(ty))
+        return;
+
+    if (ty->owningArena != arena)
+        return;
+
+    // Luwu: see Tarjan::visitChildren
+    auto replaceMetadata = [&](std::shared_ptr<const TypeMetadataTable>& metadata)
+    {
+        metadata = mapMetadataTypes(
+            metadata,
+            [&](TypeId metadataTy)
+            {
+                return replace(metadataTy);
+            }
+        );
+    };
+    replaceMetadata(asMutable(ty)->metadata);
+
+    // Luwu literal types: see Tarjan::visitChildren
+    auto replaceLiteralCheck = [&](LiteralCheck& check)
+    {
+        check.forEachType(
+            [&](TypeId& checkTy)
+            {
+                checkTy = replace(checkTy);
+            }
+        );
+    };
+
+    if (FunctionType* ftv = getMutable<FunctionType>(ty))
+    {
+        for (TypeId& generic : ftv->generics)
+            generic = replace(generic);
+        for (TypePackId& genericPack : ftv->genericPacks)
+            genericPack = replace(genericPack);
+
+        ftv->argTypes = replace(ftv->argTypes);
+        ftv->retTypes = replace(ftv->retTypes);
+
+        // Luwu user-defined refinements: a generic target is instantiated with the call
+        if (ftv->truthyRefinement)
+            ftv->truthyRefinement->type = replace(ftv->truthyRefinement->type);
+
+        // Luwu literal types: a base or validator can name the function's or its class's generics (`literal<S>`,
+        // `V<literal<string>, T>`)
+        for (FunctionType::LiteralParameter& literal : ftv->literalParameters)
+            replaceLiteralCheck(literal);
+
+        // Luwu try expressions: a hint can name the function's generics
+        if (ftv->errorHint)
+            ftv->errorHint = replace(*ftv->errorHint);
+    }
+    else if (TableType* ttv = getMutable<TableType>(ty))
+    {
+        LUAU_ASSERT(!ttv->boundTo);
+        for (auto& [name, prop] : ttv->props)
+        {
+            if (prop.readTy)
+                prop.readTy = replace(prop.readTy);
+            if (prop.writeTy)
+                prop.writeTy = replace(prop.writeTy);
+            replaceMetadata(prop.metadata);
+        }
+
+        if (ttv->indexer)
+        {
+            ttv->indexer->indexType = replace(ttv->indexer->indexType);
+            ttv->indexer->indexResultType = replace(ttv->indexer->indexResultType);
+        }
+
+        for (TypeId& itp : ttv->instantiatedTypeParams)
+            itp = replace(itp);
+
+        for (TypePackId& itp : ttv->instantiatedTypePackParams)
+            itp = replace(itp);
+
+        // Luwu literal types
+        for (auto& [_, check] : ttv->literalFields)
+            replaceLiteralCheck(check);
+    }
+    else if (MetatableType* mtv = getMutable<MetatableType>(ty))
+    {
+        mtv->table = replace(mtv->table);
+        mtv->metatable = replace(mtv->metatable);
+    }
+    else if (UnionType* utv = getMutable<UnionType>(ty))
+    {
+        for (TypeId& opt : utv->options)
+            opt = replace(opt);
+    }
+    else if (IntersectionType* itv = getMutable<IntersectionType>(ty))
+    {
+        for (TypeId& part : itv->parts)
+            part = replace(part);
+    }
+    else if (PendingExpansionType* petv = getMutable<PendingExpansionType>(ty))
+    {
+        for (TypeId& a : petv->typeArguments)
+            a = replace(a);
+
+        for (TypePackId& a : petv->packArguments)
+            a = replace(a);
+    }
+    else if (TypeFunctionInstanceType* tfit = getMutable<TypeFunctionInstanceType>(ty))
+    {
+        for (TypeId& a : tfit->typeArguments)
+            a = replace(a);
+
+        for (TypePackId& a : tfit->packArguments)
+            a = replace(a);
+    }
+    else if (ExternType* etv = getMutable<ExternType>(ty))
+    {
+        // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): see visitChildren. An instantiation's copy builds its members on first read.
+        const bool isInstantiation = etv->genericTemplate.has_value();
+        if (!isInstantiation)
+        {
+            for (auto& [name, prop] : etv->props())
+            {
+                if (prop.readTy)
+                    prop.readTy = replace(prop.readTy);
+                if (prop.writeTy)
+                    prop.writeTy = replace(prop.writeTy);
+                replaceMetadata(prop.metadata);
+            }
+        }
+        else if (substitutesGenericTemplates())
+            etv->genericTemplate = replace(*etv->genericTemplate);
+
+        if (etv->parent)
+            etv->parent = replace(*etv->parent);
+
+        for (TypeId& trait : etv->implementedTraits)
+            trait = replace(trait);
+
+        if (etv->traitInfo && etv->traitInfo->implementorClass)
+            etv->traitInfo->implementorClass = replace(*etv->traitInfo->implementorClass);
+
+        if (etv->traitInfo)
+        {
+            for (auto& [trait, arguments] : etv->traitInfo->neededTypeArguments)
+            {
+                trait = replace(trait);
+                for (TypeId& argument : arguments)
+                    argument = replace(argument);
+            }
+
+            if (etv->traitInfo->selfMarker)
+                etv->traitInfo->selfMarker = replace(*etv->traitInfo->selfMarker);
+            for (auto& [_, field] : etv->traitInfo->selfFieldTemplates)
+                field = replace(field);
+            for (auto& [_, function] : etv->traitInfo->selfFunctions)
+            {
+                function.generic = replace(function.generic);
+                if (function.selfType)
+                    function.selfType = replace(function.selfType);
+            }
+        }
+
+        for (TypeId& trait : etv->traitIntersection)
+            trait = replace(trait);
+
+        if (etv->metatable)
+            etv->metatable = replace(*etv->metatable);
+
+        if (etv->indexer)
+        {
+            etv->indexer->indexType = replace(etv->indexer->indexType);
+            etv->indexer->indexResultType = replace(etv->indexer->indexResultType);
+        }
+
+        // `clone()` copies `relation` across verbatim and `isDirty` descends into it, so it has to
+        // be re-pointed here like every other child: otherwise the substituted copy holds a pointer
+        // into the arena the original came from, which is freed once that module is done.
+        const bool replacesRelation = !isInstantiation || substitutesGenericTemplates();
+        if (FFlag::LuwuClasses && etv->relation && replacesRelation)
+        {
+            Luau::visit(
+                overloaded{
+                    [&](Obj& obj)
+                    {
+                        obj.ty = replace(obj.ty);
+                    },
+                    [&](Klass& klass)
+                    {
+                        klass.ty = replace(klass.ty);
+                    }
+                },
+                *etv->relation
+            );
+        }
+
+        if (FFlag::LuwuGenericNominals)
+        {
+            for (TypeId& itp : etv->instantiatedTypeParams)
+                itp = replace(itp);
+            for (TypePackId& itp : etv->instantiatedTypePackParams)
+                itp = replace(itp);
+        }
+    }
+    else if (NegationType* ntv = getMutable<NegationType>(ty))
+    {
+        ntv->ty = replace(ntv->ty);
+    }
+}
+
+void Substitution::replaceChildren(TypePackId tp)
+{
+    LUAU_ASSERT(tp == log->follow(tp));
+
+    if (ignoreChildren(tp))
+        return;
+
+    if (tp->owningArena != arena)
+        return;
+
+    if (TypePack* tpp = getMutable<TypePack>(tp))
+    {
+        for (TypeId& tv : tpp->head)
+            tv = replace(tv);
+        if (tpp->tail)
+            tpp->tail = replace(*tpp->tail);
+    }
+    else if (VariadicTypePack* vtp = getMutable<VariadicTypePack>(tp))
+    {
+        vtp->ty = replace(vtp->ty);
+    }
+    else if (TypeFunctionInstanceTypePack* tfitp = getMutable<TypeFunctionInstanceTypePack>(tp))
+    {
+        for (TypeId& t : tfitp->typeArguments)
+            t = replace(t);
+
+        for (TypePackId& t : tfitp->packArguments)
+            t = replace(t);
+    }
+}
+
+template<typename Ty>
+std::optional<Ty> Substitution::replace(std::optional<Ty> ty)
+{
+    if (ty)
+        return replace(*ty);
+    else
+        return std::nullopt;
+}
+
+} // namespace Luau

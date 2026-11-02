@@ -1,0 +1,235 @@
+// This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
+#pragma once
+
+#include "Luau/Common.h"
+#include "Luau/DenseHash.h"
+#include "Luau/TypeFwd.h"
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+LUAU_FASTINT(LuauTableTypeMaximumStringifierLength)
+LUAU_FASTINT(LuauTypeMaximumStringifierLength)
+
+namespace Luau
+{
+
+class AstExpr;
+
+struct Scope;
+
+struct Constraint;
+
+struct Position;
+struct Location;
+
+struct ToStringNameMap
+{
+    std::unordered_map<TypeId, std::string> types;
+    std::unordered_map<TypePackId, std::string> typePacks;
+};
+
+// Luwu (helpful subtyping errors): for a table, the properties an error message is about, which it prints first.
+using PropertyFocus = DenseHashMap<TypeId, std::vector<std::string>>;
+
+struct ToStringOptions
+{
+    ToStringOptions(bool exhaustive = false)
+        : exhaustive(exhaustive)
+    {
+    }
+
+    bool exhaustive = false;                      // If true, we produce complete output rather than comprehensible output
+    bool useLineBreaks = false;                   // If true, we insert new lines to separate long results such as table entries/metatable.
+    bool functionTypeArguments = false;           // If true, output function type argument names when they are available
+    bool hideTableKind = false;                   // If true, all tables will be surrounded with plain '{}'
+    bool hideNamedFunctionTypeParameters = false; // If true, type parameters of functions will be hidden at top-level.
+    bool hideFunctionSelfArgument = false;        // If true, `self: X` will be omitted from the function signature if the function has self
+    bool hideFunctionSelfArgumentType = false;    // If true, `self: X` will be printed as bare `self` (no type) if the function has self
+    bool hideTableAliasExpansions = false;        // If true, all table aliases will not be expanded
+    bool useQuestionMarks = true;                 // If true, use a postfix ? for options, else write them out as unions that include nil.
+    bool ignoreSyntheticName = false;             // If true, ignore synthetic names on table types.
+    // If true, a `whereClauses` trailing section is populated in ToStringResult with a one-level
+    // expansion of each named type (table/union/intersection/function alias) referenced (but not
+    // itself the root) while printing this type, e.g. "where Metadata = { ... }".
+    bool includeWhereClauses = false;
+    // If true, a named TableType/MetatableType at the *root* of a toStringDetailed call is expanded to
+    // its structure instead of printing just its name. Union, intersection and function types at the
+    // root are always expanded (see TypeStringifier's per-Type operator() overloads).
+    // Off by default, for callers that want the compact `Alias<T>` form at the root, such as a hover
+    // over a type alias declaration. Turn it on for callers that display the type of a *value*, such
+    // as a hover over a variable. There, printing the alias's own name back (`const fs: fs.fs`) tells
+    // the reader nothing.
+    bool alwaysExpandRootAlias = false;
+    // Luwu (helpful subtyping errors): if false, union and intersection members print in the order the type
+    // holds them (the order they were written in, for an annotation) instead of sorted. Mismatch
+    // explanations number union members (`Drop#2`), and the number has to match what the reader sees.
+    bool sortUnionMembers = true;
+    // Luwu (helpful subtyping errors): print a class or trait value as `class<Paint>` or `trait<Colored>`. Without it a
+    // value and its objects' type both print as `Paint`. Type errors turn it on to tell the two apart. Hover and other
+    // prose say "class Paint".
+    bool classAndTraitValuesInTypeForm = false;
+    // Luwu (helpful subtyping errors): types an error message names because it would otherwise print them
+    // several times (`where type Animal = ...`), printed by that name. The root of a call with
+    // `alwaysExpandRootAlias` is still expanded, which is how the name's own declaration is printed.
+    const DenseHashMap<TypeId, std::string>* repeatedTypeNames = nullptr;
+    // Luwu (helpful subtyping errors): with `useLineBreaks`, put a table's fields on lines of their own only
+    // when it has more than a few, or one of them is long. A small table reads better on one line, even
+    // inside a large one.
+    bool breakOnlyLargeTables = false;
+    // Luwu (helpful subtyping errors): past this many properties (0 for no limit), a table prints only this many:
+    // the ones in `propertyFocus` first, then up to two whose type is a literal (a discriminant, `kind: "leave"`),
+    // then with `identifyByConventionalNames` the ones conventionally naming what it is (`type`, `kind`, `name`,
+    // ...), then the rest in order, and counts the others. A record of twenty properties where three are wrong is
+    // mostly properties the reader doesn't need.
+    size_t maxPropertiesShown = 0;
+    const PropertyFocus* propertyFocus = nullptr;
+    bool identifyByConventionalNames = false;
+    // Luwu (helpful subtyping errors): print only the properties `maxPropertiesShown` puts ahead of the rest, and `…`
+    // for the others, however few there are: for a table the message only needs to point into.
+    bool onlyFocusedProperties = false;
+    // Luwu: print every alias's structure instead of its name (`string | Path` for `Pathlike`). A recursive alias still
+    // prints by name where it refers to itself.
+    bool expandAliases = false;
+    // Luwu: spaces per indentation level, with useLineBreaks
+    size_t indentSize = 4;
+    // Luwu: with useLineBreaks, the first line of each table property's doc comment (its metadata's `comments`) goes above
+    // it as `--- ...`, cut to this many characters. 0 leaves them out.
+    size_t propertyCommentWidth = 0;
+    size_t maxTableLength = size_t(FInt::LuauTableTypeMaximumStringifierLength); // Only applied to TableTypes
+    size_t maxTypeLength = size_t(FInt::LuauTypeMaximumStringifierLength);
+    size_t compositeTypesSingleLineLimit = 5; // The number of type elements permitted on a single line when printing type unions/intersections
+    ToStringNameMap nameMap;
+    std::shared_ptr<Scope> scope; // If present, module names will be added and types that are not available in scope will be marked as 'invalid'
+    std::vector<std::string> namedFunctionOverrideArgNames; // If present, named function argument names will be overridden
+};
+
+struct ToStringSpan
+{
+    size_t startPos;
+    size_t endPos;
+    TypeId type;
+};
+
+struct ToStringResult
+{
+    std::string name;
+
+    // Records which TypeId produced each substring of the output. Only recorded for named types
+    std::vector<ToStringSpan> typeSpans;
+
+    // Populated only when ToStringOptions::includeWhereClauses is set: a one-level expansion of
+    // each named type referenced while printing `name`, formatted as one "where X = ..." line per
+    // referenced alias. Empty if nothing was referenced or the option was off.
+    std::string whereClauses;
+
+    bool invalid = false;
+    bool error = false;
+    bool cycle = false;
+    bool truncated = false;
+};
+
+ToStringResult toStringDetailed(TypeId ty, ToStringOptions& opts);
+ToStringResult toStringDetailed(TypePackId tp, ToStringOptions& opts);
+
+std::string toString(TypeId ty, ToStringOptions& opts);
+std::string toString(TypePackId tp, ToStringOptions& opts);
+
+// These overloads are selected when a temporary ToStringOptions is passed. (eg
+// via an initializer list)
+inline std::string toString(TypePackId ty, ToStringOptions&& opts)
+{
+    // Delegate to the overload (TypePackId, ToStringOptions&)
+    return toString(ty, opts);
+}
+inline std::string toString(TypeId ty, ToStringOptions&& opts)
+{
+    // Delegate to the overload (TypeId, ToStringOptions&)
+    return toString(ty, opts);
+}
+
+// These are offered as overloads rather than a default parameter so that they can be easily invoked from within the MSVC debugger.
+// You can use them in watch expressions!
+inline std::string toString(TypeId ty)
+{
+    return toString(ty, ToStringOptions{});
+}
+inline std::string toString(TypePackId ty)
+{
+    return toString(ty, ToStringOptions{});
+}
+
+std::string toString(const Constraint& c, ToStringOptions& opts);
+
+inline std::string toString(const Constraint& c, ToStringOptions&& opts)
+{
+    return toString(c, opts);
+}
+
+std::string toString(const Constraint& c);
+
+std::string toString(const Type& tv, ToStringOptions& opts);
+std::string toString(const TypePackVar& tp, ToStringOptions& opts);
+
+inline std::string toString(const Type& tv)
+{
+    ToStringOptions opts;
+    return toString(tv, opts);
+}
+
+inline std::string toString(const TypePackVar& tp)
+{
+    ToStringOptions opts;
+    return toString(tp, opts);
+}
+
+std::string toStringNamedFunction(const std::string& funcName, const FunctionType& ftv, ToStringOptions& opts);
+
+inline std::string toStringNamedFunction(const std::string& funcName, const FunctionType& ftv)
+{
+    ToStringOptions opts;
+    return toStringNamedFunction(funcName, ftv, opts);
+}
+
+// Converts the given number index into a human-readable string for that index to be used in errors.
+// e.g. the index `0` becomes `1st`, `1` becomes `2nd`, `11` becomes `12th`, etc.
+std::string toHumanReadableIndex(size_t number);
+
+std::optional<std::string> getFunctionNameAsString(const AstExpr& expr);
+
+// It could be useful to see the text representation of a type during a debugging session instead of exploring the content of the class
+// These functions will dump the type to stdout and can be evaluated in Watch/Immediate windows or as gdb/lldb expression
+std::string dump(TypeId ty);
+std::string dump(const std::optional<TypeId>& ty);
+std::string dump(TypePackId ty);
+std::string dump(const std::optional<TypePackId>& ty);
+std::string dump(const std::vector<TypeId>& types);
+std::string dump(const std::vector<TypePackId>& typePacks);
+std::string dump(DenseHashMap<TypeId, TypeId>& types);
+std::string dump(DenseHashMap<TypePackId, TypePackId>& types);
+
+std::string dump(const Constraint& c);
+
+std::string dump(const std::shared_ptr<Scope>& scope, const char* name);
+
+std::string generateName(size_t i);
+
+std::string toString(const Position& position);
+std::string toString(const Location& location, int offset = 0, bool useBegin = true);
+
+std::string toString(const TypeOrPack& tyOrTp, ToStringOptions& opts);
+
+inline std::string toString(const TypeOrPack& tyOrTp)
+{
+    ToStringOptions opts{};
+    return toString(tyOrTp, opts);
+}
+
+std::string dump(const TypeOrPack& tyOrTp);
+
+std::string toStringVector(const std::vector<TypeId>& types, ToStringOptions& opts);
+std::string toStringVector(const std::vector<TypePackId>& typePacks, ToStringOptions& opts);
+} // namespace Luau

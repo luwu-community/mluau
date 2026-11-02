@@ -15,6 +15,8 @@ pub struct Build {
     host: Option<String>,
     // Enable code generator (jit)
     enable_codegen: bool,
+    // Build the type checker and its C API (luaanalysis.h)
+    enable_analysis: bool,
     // Vector size, must be 3 (default) or 4
     vector_size: usize,
 }
@@ -33,6 +35,7 @@ impl Default for Build {
             target: env::var("TARGET").ok(),
             host: env::var("HOST").ok(),
             enable_codegen: false,
+            enable_analysis: false,
             vector_size: 3,
         }
     }
@@ -49,6 +52,14 @@ impl Build {
     /// Default is false.
     pub fn enable_codegen(&mut self, enable: bool) -> &mut Build {
         self.enable_codegen = enable;
+        self
+    }
+
+    /// Sets whether to build the type checker and its C API.
+    ///
+    /// Default is false.
+    pub fn enable_analysis(&mut self, enable: bool) -> &mut Build {
+        self.enable_analysis = enable;
         self
     }
 
@@ -232,6 +243,39 @@ impl Build {
 
         if self.enable_codegen {
             artifacts.libs.push(codegen_lib_name.to_string());
+        }
+
+        if self.enable_analysis {
+            let analysis_lib_name = "luauanalysis";
+            let analysis_include_dir = luau_source_dir.join("Analysis").join("include");
+            let analysis_api_include_dir = luau_source_dir.join("AnalysisApi").join("include");
+            let cli_include_dir = luau_source_dir.join("CLI").join("include");
+            let cli_source_dir = luau_source_dir.join("CLI").join("src");
+
+            let mut analysis_config = config.clone();
+            analysis_config
+                .include(&analysis_include_dir)
+                .include(&analysis_api_include_dir)
+                .include(&cli_include_dir)
+                .include(&ast_include_dir)
+                .include(&config_include_dir)
+                .include(&compiler_include_dir)
+                .include(&bytecode_include_dir)
+                .include(&require_include_dir)
+                .include(&vm_include_dir)
+                .define("LUAANALYSIS_API", "extern \"C\"")
+                .add_files_by_ext_sorted(&luau_source_dir.join("Analysis").join("src"), "cpp")
+                .add_files_by_ext_sorted(&luau_source_dir.join("AnalysisApi").join("src"), "cpp");
+
+            // Only the CLI files the C API uses: luwu-analyze's file and config resolvers and what they need
+            for file in ["AnalyzeRequirer.cpp", "AnalyzeResolvers.cpp", "FileUtils.cpp", "Flags.cpp", "VfsNavigator.cpp"] {
+                analysis_config.file(cli_source_dir.join(file));
+            }
+
+            analysis_config.out_dir(&artifacts.lib_dir).compile(analysis_lib_name);
+
+            // Before the libraries it uses: a static library only resolves symbols from libraries listed after it
+            artifacts.libs.insert(0, analysis_lib_name.to_string());
         }
 
         artifacts

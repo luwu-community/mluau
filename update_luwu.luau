@@ -21,7 +21,8 @@ if path and path:find("~") then
 end
 const use_local_path = path ~= nil
 
-const important_directories_in_luwu = { "Ast", "CodeGen", "Common", "Bytecode", "Require", "VM", "Compiler", "Config" }
+-- Analysis, AnalysisApi and CLI (for luwu-analyze's file and config resolvers) build only with the luwu-analysis feature
+const important_directories_in_luwu = { "Ast", "CodeGen", "Common", "Bytecode", "Require", "VM", "Compiler", "Config", "Analysis", "AnalysisApi", "CLI" }
 
 const project = fs.dir.project()
 const vendored_path = project:join("luwu")
