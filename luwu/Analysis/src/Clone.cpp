@@ -450,6 +450,8 @@ private:
                 t->traitInfo->selfMarker = shallowClone(*t->traitInfo->selfMarker);
             for (auto& [_, field] : t->traitInfo->selfFieldTemplates)
                 field = shallowClone(field);
+            for (auto& [_, function] : t->traitInfo->scopedFunctions)
+                function = shallowClone(function);
             for (auto& [_, function] : t->traitInfo->selfFunctions)
             {
                 function.generic = shallowClone(function.generic);
@@ -754,6 +756,8 @@ TypeFun clone(const TypeFun& typeFun, TypeArena& dest, CloneState& cloneState)
     }
 
     copy.type = cloner.clone(copy.type);
+    if (copy.errorHint)
+        copy.errorHint = cloner.clone(*copy.errorHint);
 
     return copy;
 }
@@ -837,6 +841,8 @@ TypeFun cloneIncremental(const TypeFun& typeFun, TypeArena& dest, CloneState& cl
     }
 
     copy.type = cloner.clone(copy.type);
+    if (copy.errorHint)
+        copy.errorHint = cloner.clone(*copy.errorHint);
 
     return copy;
 }

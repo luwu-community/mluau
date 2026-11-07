@@ -4,8 +4,6 @@
 #include <string>
 #include <string.h>
 
-LUAU_FASTFLAG(DebugLuwuCollections)
-
 namespace Luau
 {
 
@@ -31,6 +29,8 @@ LuwonConstructor luwonConstructorOf(const AstExprCall* call)
 {
     if (call->self)
         return LuwonConstructor::None;
+    if (call->fromDotPositional)
+        return LuwonConstructor::Bundle;
 
     const AstExprGlobal* global = call->func->as<AstExprGlobal>();
     if (global && global->name != kParseNameError)
@@ -56,14 +56,7 @@ LuwonConstructor luwonConstructorOf(const AstExprCall* call)
 
 std::vector<LuwonBuiltinClass> luwonBuiltinClasses()
 {
-    if (!FFlag::DebugLuwuCollections)
-        return {};
-
-    return {
-        {"collections", "pair", {"first", "second"}},
-        {"collections", "triple", {"first", "second", "third"}},
-        {"collections", "quad", {"first", "second", "third", "fourth"}},
-    };
+    return {};
 }
 
 std::string luwonClassNameOf(const AstExprCall* call)

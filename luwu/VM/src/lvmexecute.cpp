@@ -140,9 +140,7 @@ LUAU_FASTFLAGVARIABLE(LuauPromoteProto)
         VM_DISPATCH_OP(LOP_IDIVK), VM_DISPATCH_OP(LOP_GETUDATAKS), VM_DISPATCH_OP(LOP_SETUDATAKS), VM_DISPATCH_OP(LOP_NAMECALLUDATA), \
         VM_DISPATCH_OP(LOP_NEWCLASSMEMBER), VM_DISPATCH_OP(LOP_CALLFB), VM_DISPATCH_OP(LOP_CMPPROTO), VM_DISPATCH_OP(LOP_CHECKSELFCLASS), \
         VM_DISPATCH_OP(LOP_JUMPXISA), VM_DISPATCH_OP(LOP_NEWOBJECT), \
-        VM_DISPATCH_OP(LOP_GETOBJECTMEMBER), VM_DISPATCH_OP(LOP_SETOBJECTMEMBER), VM_DISPATCH_OP(LOP_INITTRAITS), \
-        VM_DISPATCH_OP(LOP_GETPOSITIONAL), VM_DISPATCH_OP(LOP_PRESIZETABLE), VM_DISPATCH_OP(LOP_APPENDTABLE), \
-        VM_DISPATCH_OP(LOP_PUSH), VM_DISPATCH_OP(LOP_POP), VM_DISPATCH_OP(LOP_WRAPRESULT), VM_DISPATCH_OP(LOP_RESULTGET),
+        VM_DISPATCH_OP(LOP_GETOBJECTMEMBER), VM_DISPATCH_OP(LOP_SETOBJECTMEMBER), VM_DISPATCH_OP(LOP_INITTRAITS), VM_DISPATCH_OP(LOP_PRESIZETABLE), VM_DISPATCH_OP(LOP_APPENDTABLE), VM_DISPATCH_OP(LOP_GETQUALIFIED), VM_DISPATCH_OP(LOP_GETPOSITIONAL), VM_DISPATCH_OP(LOP_PUSH), VM_DISPATCH_OP(LOP_POP), VM_DISPATCH_OP(LOP_WRAPRESULT), VM_DISPATCH_OP(LOP_RESULTGET),
 
 #if defined(__GNUC__) || defined(__clang__)
 #define VM_USE_CGOTO 1
@@ -2926,8 +2924,8 @@ reentry:
                     pc++;
                     VM_NEXT();
                 }
-                // Luwu collections: a builtin container's loop (luaR_collectionprep), stepped without a call. A `vec` or
-                // `vecdeque` (true) steps inline and can't raise.
+                // Luwu collections: a builtin container's loop (luaR_collectionprep), stepped without a call. A `Vec` or
+                // `VecDeque` (true) steps inline and can't raise.
                 else if (LUAU_UNLIKELY(ttisboolean(ra)))
                 {
                     bool more;
@@ -3849,6 +3847,15 @@ reentry:
                     VM_NEXT();
                 }
 
+                // Luwu Traits (rfcs/classes/traits.md): the class's qualified implementation of a trait's function
+                if (LUAU_INSN_B(insn) == LBC_NEWCLASSMEMBER_QUALIFIED)
+                {
+                    TValue* name = VM_KV(aux);
+                    LUAU_ASSERT(ttisstring(name));
+                    VM_PROTECT(luaR_addqualified(L, classvalue(ra), rc + 1, tsvalue(name), rc));
+                    VM_NEXT();
+                }
+
                 // Luwu Traits (rfcs/classes/traits.md): the class's compiled copy of a trait's function
                 if (LUAU_INSN_B(insn) == LBC_NEWCLASSMEMBER_TRAITCOPY)
                 {
@@ -4130,30 +4137,6 @@ reentry:
                 VM_NEXT();
             }
 
-            VM_CASE(LOP_GETPOSITIONAL)
-            {
-                // Luwu Destructuring (rfcs/destructuring.md): one element of a positional pattern `.(a, b)`
-                Instruction insn = *pc++;
-                StkId ra = VM_REG(LUAU_INSN_A(insn));
-                StkId rb = VM_REG(LUAU_INSN_B(insn));
-                int c = LUAU_INSN_C(insn);
-
-                // fast path: an array element of a table without a metatable, like GETTABLEN's
-                if (ttistable(rb))
-                {
-                    LuaTable* h = hvalue(rb);
-
-                    if (LUAU_LIKELY(unsigned(c) < unsigned(h->sizearray) && !h->metatable))
-                    {
-                        setobj2s(L, ra, &h->array[c]);
-                        VM_NEXT();
-                    }
-                }
-
-                VM_PROTECT(luaV_getpositional(L, rb, c, ra));
-                VM_NEXT();
-            }
-
             VM_CASE(LOP_PRESIZETABLE)
             {
                 // Luwu Table Comprehensions (rfcs/table-comprehensions.md): sizes or trims the table a comprehension builds
@@ -4199,6 +4182,77 @@ reentry:
                 }
 
                 luaC_barriert(L, h, rb);
+                VM_NEXT();
+            }
+
+            VM_CASE(LOP_WRAPRESULT)
+            {
+                // Luwu try expressions: the value of a `try` expression, or the error its protected range caught
+                Instruction insn = *pc++;
+                StkId ra = VM_REG(LUAU_INSN_A(insn));
+
+                VM_PROTECT_PC(); // raises when the result library isn't open, and allocates
+                luaR_wrapresult(L, ra, LUAU_INSN_B(insn) == LBC_WRAPRESULT_ERR);
+                VM_PROTECT(luaC_checkGC(L));
+                VM_NEXT();
+            }
+
+            VM_CASE(LOP_RESULTGET)
+            {
+                // Luwu try expressions: `r:ok()` or `r:err()` of a result kept in registers
+                Instruction insn = *pc++;
+                StkId ra = VM_REG(LUAU_INSN_A(insn));
+                StkId rb = VM_REG(LUAU_INSN_B(insn));
+
+                bool isOk = !l_isfalse(rb + LBC_TRYRESULT_OKFLAG);
+                bool wantsOk = LUAU_INSN_C(insn) == LBC_RESULTGET_OK;
+                if (isOk == wantsOk)
+                {
+                    setobj2s(L, ra, rb);
+                }
+                else
+                {
+                    setsymnonevalue(ra);
+                }
+                VM_NEXT();
+            }
+
+            VM_CASE(LOP_GETQUALIFIED)
+            {
+                // Luwu Traits (rfcs/classes/traits.md): `obj:Trait:name`, `Class:Trait.name`
+                Instruction insn = *pc++;
+                uint32_t aux = *pc++;
+                StkId ra = VM_REG(LUAU_INSN_A(insn));
+                StkId rb = VM_REG(LUAU_INSN_B(insn));
+                StkId rc = VM_REG(LUAU_INSN_C(insn));
+                TValue* name = VM_KV(aux);
+                LUAU_ASSERT(ttisstring(name));
+
+                VM_PROTECT(luaR_getqualified(L, ra, rb, rc, tsvalue(name)));
+                VM_NEXT();
+            }
+
+            VM_CASE(LOP_GETPOSITIONAL)
+            {
+                // Luwu Destructuring (rfcs/destructuring.md): one element of a positional pattern `.(a, b)`
+                Instruction insn = *pc++;
+                StkId ra = VM_REG(LUAU_INSN_A(insn));
+                StkId rb = VM_REG(LUAU_INSN_B(insn));
+                int c = LUAU_INSN_C(insn);
+
+                // fast path: an array element of a table without a metatable, like GETTABLEN's
+                if (ttistable(rb))
+                {
+                    LuaTable* h = hvalue(rb);
+
+                    if (LUAU_LIKELY(unsigned(c) < unsigned(h->sizearray) && !h->metatable))
+                    {
+                        setobj2s(L, ra, &h->array[c]);
+                        VM_NEXT();
+                    }
+                }
+
+                VM_PROTECT(luaV_getpositional(L, rb, c, ra));
                 VM_NEXT();
             }
 
@@ -4266,50 +4320,6 @@ reentry:
                 }
 
                 VM_PROTECT(luaV_pop(L, ra, rb));
-                VM_NEXT();
-            }
-
-            VM_CASE(LOP_WRAPRESULT)
-            {
-                // Luwu try expressions: the value of a `try` expression, or the error its protected range caught
-                Instruction insn = *pc++;
-                StkId ra = VM_REG(LUAU_INSN_A(insn));
-                bool caught = LUAU_INSN_B(insn) == LBC_WRAPRESULT_ERR;
-
-                VM_PROTECT_PC(); // raises when the collections library isn't open, and allocates
-
-                LuauObject* result = luaR_newpayload(L, caught ? LUWU_BUILTIN_ERR : LUWU_BUILTIN_OK, ra);
-                if (caught)
-                {
-                    // where the error was raised, which the handler's registers hold after it; a new object needs no barrier
-                    LUAU_ASSERT(result->numberofmembers >= 4);
-                    TValue* members = luaR_members(result);
-                    for (int i = 1; i <= 3; i++)
-                        setobj(L, &members[i], ra + i);
-                }
-
-                setobjectvalue(L, ra, result);
-                VM_PROTECT(luaC_checkGC(L));
-                VM_NEXT();
-            }
-
-            VM_CASE(LOP_RESULTGET)
-            {
-                // Luwu try expressions: `r:ok()` or `r:err()` of a result kept in registers
-                Instruction insn = *pc++;
-                StkId ra = VM_REG(LUAU_INSN_A(insn));
-                StkId rb = VM_REG(LUAU_INSN_B(insn));
-
-                bool isOk = !l_isfalse(rb + LBC_TRYRESULT_OKFLAG);
-                bool wantsOk = LUAU_INSN_C(insn) == LBC_RESULTGET_OK;
-                if (isOk == wantsOk)
-                {
-                    setobj2s(L, ra, rb);
-                }
-                else
-                {
-                    setsymnonevalue(ra);
-                }
                 VM_NEXT();
             }
 

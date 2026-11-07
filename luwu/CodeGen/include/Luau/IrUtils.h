@@ -115,8 +115,9 @@ inline bool canInvalidateSafeEnv(IrCmd cmd)
     case IrCmd::FALLBACK_NEWOBJECT:
     case IrCmd::FALLBACK_NEWCLASSMEMBER:
     case IrCmd::FALLBACK_INITTRAITS:
-    case IrCmd::FALLBACK_GETPOSITIONAL:
     case IrCmd::FALLBACK_PRESIZETABLE:
+    case IrCmd::FALLBACK_GETQUALIFIED:
+    case IrCmd::FALLBACK_GETPOSITIONAL:
     case IrCmd::FALLBACK_PUSH:
     case IrCmd::FALLBACK_POP:
         return true;
@@ -130,7 +131,8 @@ inline bool canInvalidateSafeEnv(IrCmd cmd)
 inline bool isPseudo(IrCmd cmd)
 {
     // Instructions that are used for internal needs and are not a part of final lowering
-    return cmd == IrCmd::NOP || cmd == IrCmd::SUBSTITUTE || cmd == IrCmd::MARK_USED || cmd == IrCmd::MARK_DEAD;
+    return cmd == IrCmd::NOP || cmd == IrCmd::SUBSTITUTE || cmd == IrCmd::MARK_USED || cmd == IrCmd::MARK_DEAD ||
+           cmd == IrCmd::MARK_TRY_READS;
 }
 
 inline bool hasSideEffects(IrCmd cmd)

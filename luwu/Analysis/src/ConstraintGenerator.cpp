@@ -1510,7 +1510,9 @@ void ConstraintGenerator::prototypeClass(
                 },
                 [&](const AstClassMethod& method)
                 {
-                    if (memberTypes.contains(method.functionName))
+                    // Luwu Traits (rfcs/classes/traits.md): a qualified implementation isn't a member of the class
+                    // (checkQualifiedImplementation)
+                    if (method.qualifiedTrait || memberTypes.contains(method.functionName))
                         return;
 
                     auto [propertyType, _] = memberTypes.try_insert(method.functionName, arena->addType(BlockedType{}));
@@ -1548,9 +1550,10 @@ void ConstraintGenerator::prototypeClass(
                     // The parser will report an error for classes that define disallowed metamethods.
                     // The RFC also requires that it is a syntax error for methods to have __ in their name whos name is not in the
                     // validClassMetamethod set.
+                    // Luwu Traits (rfcs/classes/traits.md): a scoped function is on the trait's value only
                     if (isMetamethod)
                         instanceMetatableProps[method.functionName.value] = prop;
-                    else
+                    else if (!method.scopeLocation)
                         props[method.functionName.value] = prop;
                 }
             },
@@ -1637,7 +1640,20 @@ void ConstraintGenerator::prototypeClass(
                 info.expectations[prop->name.value] = false;
             else if (prop && prop->finalLocation)
                 info.finals.insert(prop->name.value);
-            else if (const AstClassMethod* method = member.get_if<AstClassMethod>(); method && method->expectLocation)
+            else if (const AstClassMethod* method = member.get_if<AstClassMethod>(); method && method->scopeLocation)
+            {
+                TypeId* type = memberTypes.find(method->functionName);
+                if (type && method->isOptional)
+                    info.scopedFunctions[method->functionName.value] = makeOption(builtinTypes, *arena, *type);
+                else if (type)
+                    info.scopedFunctions[method->functionName.value] = *type;
+
+                if (method->expectLocation)
+                    info.scopedExpectations[method->functionName.value] = method->isOptional;
+                else if (method->finalLocation)
+                    info.finals.insert(method->functionName.value);
+            }
+            else if (method && method->expectLocation)
                 info.expectations[method->functionName.value] = method->isOptional;
             else if (method && method->finalLocation)
                 info.finals.insert(method->functionName.value);
@@ -2354,6 +2370,147 @@ void ConstraintGenerator::bindTraitImplementorConstructor(ClassDeclRecord* trait
 
 // The checks mirror luaR_implementtraits's, which raise at runtime; each error underlines the `implements` entry of the
 // trait it is about (for a trait implied through `needs`, the entry that implied it).
+// Luwu Traits (rfcs/classes/traits.md): a qualifier (`Json` in `function Json.name`) as the entry `implements Json` would be
+static AstClassTraitRef qualifierTraitRef(AstExpr* qualifier)
+{
+    AstClassTraitRef ref;
+    ref.trait = qualifier;
+    ref.location = qualifier->location;
+    return ref;
+}
+
+// Luwu Traits (rfcs/classes/traits.md): the value type of a class or trait whose object type is `objectType`
+static const ExternType* classValueOf(const ExternType* objectType)
+{
+    if (!objectType->relation)
+        return nullptr;
+
+    const Klass* klass = get_if<Klass>(&*objectType->relation);
+    return klass ? get<ExternType>(follow(klass->ty)) : nullptr;
+}
+
+void ConstraintGenerator::checkQualifiedImplementation(
+    const ScopePtr& scope,
+    AstStatClass* cls,
+    ClassDeclRecord* record,
+    const AstClassMethod& method,
+    bool declared
+)
+{
+    TypeId trait = resolveTraitRef(scope, qualifierTraitRef(method.qualifiedTrait));
+    const ExternType* traitType = trait ? get<ExternType>(trait) : nullptr;
+    const ExternType* classType = get<ExternType>(follow(record->ty));
+    const char* name = method.functionName.value;
+
+    bool implemented = false;
+    if (classType && traitType)
+    {
+        for (TypeId implementedTrait : classType->implementedTraits)
+            implemented |= follow(implementedTrait) == trait;
+    }
+
+    // the trait's function, as its own code has it
+    std::optional<TypeId> expected;
+    if (traitType && implemented)
+    {
+        const std::map<Name, TypeId>* local = traitFunctionSignatures.find(trait);
+        if (auto it = local ? local->find(name) : std::map<Name, TypeId>::const_iterator{}; local && it != local->end())
+            expected = it->second;
+        else if (const ExternType* traitValue = classValueOf(traitType))
+        {
+            auto prop = traitValue->props().find(name);
+            if (prop != traitValue->props().end() && prop->second.readTy && get<FunctionType>(follow(*prop->second.readTy)))
+                expected = follow(*prop->second.readTy);
+        }
+    }
+
+    if (!traitType)
+        reportError(method.qualifiedTrait->location, GenericError{format("Qualify '%s' with a trait '%s' implements", name, cls->name->name.value)});
+    else if (!implemented)
+        reportError(
+            method.qualifiedTrait->location,
+            GenericError{format(
+                "'%s' implements a function of '%s', so it has to implement '%s'", cls->name->name.value, traitType->name.c_str(), traitType->name.c_str()
+            )}
+        );
+    else if (!expected)
+        reportError(method.nameLocation, GenericError{format("Trait '%s' has no function '%s' to implement", traitType->name.c_str(), name)});
+    else if (traitType->traitInfo && traitType->traitInfo->finals.count(name))
+        reportError(method.nameLocation, GenericError{format("'%s' is final in trait '%s' and can't be overridden", name, traitType->name.c_str())});
+
+    // an unannotated implementation takes its types from the trait's function, like an override
+    bool overrides = expected && hasUnannotatedSignature(method.function);
+    FunctionSignature sig;
+    {
+        ScopedMemberValue<bool> override{checkingOverride, overrides};
+        sig = checkFunctionSignature(scope, record, method.function, overrides ? expected : std::nullopt, method.function->location);
+    }
+
+    Checkpoint start = checkpoint(this);
+    if (!declared)
+        checkFunctionBody(sig.bodyScope, method.function);
+    Checkpoint end = checkpoint(this);
+
+    TypeId functionType = arena->addType(BlockedType{});
+    NotNull<Scope> constraintScope{sig.signatureScope ? sig.signatureScope.get() : sig.bodyScope.get()};
+    std::unique_ptr<Constraint> c =
+        std::make_unique<Constraint>(constraintScope, method.function->location, GeneralizationConstraint{functionType, sig.signature});
+    addAllAsDependencies(start, end, this, NotNull{c.get()});
+
+    NotNull<Constraint> generalization = addConstraint(scope, std::move(c));
+    getMutable<BlockedType>(functionType)->setOwner(generalization);
+    module->astTypes[method.function] = functionType;
+}
+
+void ConstraintGenerator::checkScopedExpectations(const ScopePtr& scope, AstStatClass* cls)
+{
+    // whether `cls` declares the scoped function `name` for `trait`: `function Self.name` in a trait, `function Trait.name`
+    // in a class
+    auto declares = [&](TypeId trait, const Name& name)
+    {
+        for (const AstClassMember& member : cls->members)
+        {
+            const AstClassMethod* method = member.get_if<AstClassMethod>();
+            if (!method || method->functionName != name.c_str())
+                continue;
+
+            if (cls->isTrait && method->scopeLocation)
+                return true;
+            if (!cls->isTrait && method->qualifiedTrait && resolveTraitRef(scope, qualifierTraitRef(method->qualifiedTrait)) == trait)
+                return true;
+        }
+
+        return false;
+    };
+
+    const AstArray<AstClassTraitRef>& refs = cls->isTrait ? cls->needs : cls->implements;
+    for (const AstClassTraitRef& ref : refs)
+    {
+        TypeId trait = resolveTraitRef(scope, ref);
+        const ExternType* traitType = trait ? get<ExternType>(trait) : nullptr;
+        if (!traitType || !traitType->traitInfo)
+            continue;
+
+        for (const auto& [name, optional] : traitType->traitInfo->scopedExpectations)
+        {
+            if (optional || declares(trait, name))
+                continue;
+
+            const char* traitName = traitType->name.c_str();
+            const char* className = cls->name->name.value;
+            if (cls->isTrait)
+                reportError(
+                    ref.location, GenericError{format("'%s' needs '%s', so it has to declare 'function Self.%s'", className, traitName, name.c_str())}
+                );
+            else
+                reportError(
+                    ref.location,
+                    GenericError{format("Missing function '%s.%s' required for '%s' to implement '%s'", traitName, name.c_str(), className, traitName)}
+                );
+        }
+    }
+}
+
 void ConstraintGenerator::checkTraitArguments(const ScopePtr& initializerScope, AstStatClass* cls)
 {
     for (const AstClassTraitRef& ref : cls->implements)
@@ -2904,7 +3061,7 @@ std::map<Name, TypeId> ConstraintGenerator::implementTraits(const ScopePtr& scop
         {
             for (const auto& [name, prop] : traitValueType->props())
             {
-                bool provided = !belongsToTraitAlone(name) && info.expectations.count(name) == 0;
+                bool provided = !belongsToTraitAlone(name) && info.expectations.count(name) == 0 && info.scopedFunctions.count(name) == 0;
                 if (provided && ownStatics.count(name))
                 {
                     auto own = classValueType->props().find(name);
@@ -3054,6 +3211,8 @@ void ConstraintGenerator::prototypeTypeDefinitions(const ScopePtr& scope, AstSta
                 initialFun.typePackParams.push_back(genPack);
             }
             initialFun.definitionLocation = alias->location;
+            if (alias->errorHint)
+                initialFun.errorHint = arena->addType(BlockedType{});
 
             if (alias->exported)
                 scope->exportedTypeBindings[alias->name.value] = std::move(initialFun);
@@ -3429,6 +3588,97 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStat* stat)
     }
 }
 
+ConstraintGenerator::ResolvedAnnotation ConstraintGenerator::resolveLocalAnnotation(const ScopePtr& scope, AstLocal* local)
+{
+    if (ResolvedAnnotation* resolved = bundleElementAnnotations.find(local))
+        return *resolved;
+
+    polarity = Polarity::Positive;
+    if (FFlag::LuwuLiteralTypes)
+        return resolveLiteralCheckAnnotation(scope, local->annotation, /* inTypeArguments */ false, /* replaceErrorWithFresh */ false);
+    return ResolvedAnnotation{resolveType(scope, local->annotation, /* inTypeArguments */ false), std::nullopt};
+}
+
+// Luwu bundles: how many values the `.(...)` that `expr` evaluates to holds (Parser::parseDotPositional), looking
+// through parentheses and if-else branches. 0 when it isn't one.
+static size_t dotPositionalSize(AstExpr* expr)
+{
+    if (AstExprGroup* group = expr->as<AstExprGroup>())
+        return dotPositionalSize(group->expr);
+
+    if (AstExprIfElse* ifElse = expr->as<AstExprIfElse>())
+    {
+        size_t size = dotPositionalSize(ifElse->trueExpr);
+        return size != 0 ? size : dotPositionalSize(ifElse->falseExpr);
+    }
+
+    AstExprCall* call = expr->as<AstExprCall>();
+    if (!call || !call->fromDotPositional || call->args.size == 0)
+        return 0;
+
+    // a last value that's a call or `...` decides the size at runtime
+    AstExpr* last = call->args.data[call->args.size - 1];
+    if (last->is<AstExprCall>() || last->is<AstExprVarargs>())
+        return 0;
+    return call->args.size;
+}
+
+// Luwu Destructuring (rfcs/destructuring.md): a positional pattern on a `.(...)` value gives the bundle its elements'
+// annotations as its expected type, so `const .(format: Format, extension: string) = .("Zip", "zip")` checks "Zip"
+// against `Format` instead of widening it to `string`. Every element needs an annotation: a placeholder for a missing one
+// would be inferred from how the element is used later instead of from its value.
+std::optional<TypeId> ConstraintGenerator::expectedBundleType(const ScopePtr& scope, AstStatLocal* statLocal)
+{
+    AstDestructurePattern* pattern = statLocal->destructure;
+    if (!pattern || !pattern->positional || statLocal->vars.size != 1 || statLocal->values.size != 1 || statLocal->vars.data[0]->annotation)
+        return std::nullopt;
+
+    // the bundle class of each size, as the `bundle` library exports them
+    static const char* const kBundles[] = {
+        "Bundle0", "Bundle1", "Bundle2", "Bundle3", "Bundle4", "Bundle5", "Bundle6",
+        "Bundle7", "Bundle8", "Bundle9", "Bundle10", "Bundle11", "Bundle12",
+    };
+    static constexpr size_t kBundleCount = sizeof(kBundles) / sizeof(kBundles[0]);
+
+    size_t size = dotPositionalSize(statLocal->values.data[0]);
+    if (size == 0 || size >= kBundleCount || pattern->fields.size != size || !globalScope->lookupImportedType("bundle", kBundles[size]))
+        return std::nullopt;
+
+    for (const AstDestructureField& field : pattern->fields)
+    {
+        if (field.target.location || !field.target.local->annotation)
+            return std::nullopt;
+    }
+
+    std::vector<TypeId> elements;
+    for (const AstDestructureField& field : pattern->fields)
+    {
+        ResolvedAnnotation annotation = resolveLocalAnnotation(scope, field.target.local);
+        bundleElementAnnotations[field.target.local] = annotation;
+        elements.push_back(annotation.type);
+    }
+
+    expectDotPositionalElements(statLocal->values.data[0], elements);
+
+    TypeId bundle = arena->addType(PendingExpansionType{AstName{"bundle"}, AstName{kBundles[size]}, std::move(elements), {}});
+    addConstraint(globalScope, statLocal->location, TypeAliasExpansionConstraint{/* target */ bundle});
+    return bundle;
+}
+
+// Each `.(...)` that `expr` evaluates to, through parentheses and if-else branches like dotPositionalSize
+void ConstraintGenerator::expectDotPositionalElements(AstExpr* expr, const std::vector<TypeId>& elements)
+{
+    if (AstExprGroup* group = expr->as<AstExprGroup>())
+        expectDotPositionalElements(group->expr, elements);
+    else if (AstExprIfElse* ifElse = expr->as<AstExprIfElse>())
+    {
+        expectDotPositionalElements(ifElse->trueExpr, elements);
+        expectDotPositionalElements(ifElse->falseExpr, elements);
+    }
+    else if (AstExprCall* call = expr->as<AstExprCall>(); call && call->fromDotPositional && call->args.size == elements.size())
+        dotPositionalElementTypes[call] = elements;
+}
+
 ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatLocal* statLocal)
 {
     std::vector<TypeId> annotatedTypes;
@@ -3471,13 +3721,7 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatLocal* stat
 
         ResolvedAnnotation annotation{nullptr, std::nullopt};
         if (local->annotation)
-        {
-            polarity = Polarity::Positive;
-            if (FFlag::LuwuLiteralTypes)
-                annotation = resolveLiteralCheckAnnotation(scope, local->annotation, /* inTypeArguments */ false, /* replaceErrorWithFresh */ false);
-            else
-                annotation.type = resolveType(scope, local->annotation, /* inTypeArguments */ false);
-        }
+            annotation = resolveLocalAnnotation(scope, local);
 
         if (annotation.check)
         {
@@ -3515,6 +3759,9 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatLocal* stat
             scope->lvalueTypes[def] = assignee;
         }
     }
+
+    if (std::optional<TypeId> bundle = expectedBundleType(scope, statLocal))
+        expectedTypes[0] = bundle;
 
     Checkpoint start = checkpoint(this);
     TypePackId rvaluePack = checkPack(scope, statLocal->values, expectedTypes).tp;
@@ -4654,6 +4901,13 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatTypeAlias* 
     else
         emplaceType<BoundType>(asMutable(aliasTy), ty);
 
+    // Luwu try expressions: the hint resolves like the type, with the alias's generics in scope
+    if (alias->errorHint && bindingIt->second.errorHint)
+    {
+        TypeId hint = resolveType(defnScope, alias->errorHint, /* inTypeArguments */ false, /* replaceErrorWithFresh */ false);
+        emplaceType<BoundType>(asMutable(*bindingIt->second.errorHint), hint);
+    }
+
     std::vector<TypeId> typeParams;
     for (const auto& tyParam : createGenerics(defnScope, alias->generics, /* useCache */ true, /* addTypes */ false))
         typeParams.push_back(tyParam.second.ty);
@@ -5056,7 +5310,7 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatDeclareFunc
     TypePackId paramPack = resolveTypePack(
         funScope, global->params, /* inTypeArguments */ false, /* replaceErrorWithFresh */ false, /* initialPolarity */ Polarity::Negative
     );
-    TypePackId retPack = resolveTypePack(
+    TypePackId retPack = resolveReturnTypePack(
         funScope, global->retTypes, /* inTypeArguments */ false, /* replaceErrorWithFresh */ false, /* initialPolarity */ Polarity::Positive
     );
 
@@ -5090,8 +5344,10 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatDeclareFunc
         ftv->argNames.emplace_back(FunctionArgument{el.first.value, el.second});
 
     // Luwu try expressions
+    std::optional<TypeId> declaredHint;
     if (global->errorHint)
-        ftv->errorHint = resolveType(funScope, global->errorHint, /* inTypeArguments */ false);
+        declaredHint = resolveType(funScope, global->errorHint, /* inTypeArguments */ false);
+    ftv->errorHint = returnErrorHint(funScope, global->retTypes, declaredHint, /* inTypeArguments */ false);
 
     Name fnName(global->name.value);
 
@@ -5262,6 +5518,14 @@ void ConstraintGenerator::visitClass(const ScopePtr& scope, AstStatClass* statCl
     // Luwu literal types: the constructor's literal parameters, counting the class value (or, for `__init`, the instance)
     std::vector<FunctionType::LiteralParameter> primaryCtorLiteralParams;
 
+    // Luwu Traits (rfcs/classes/traits.md): the object `Self` in a trait's defaults is the class of, known by the trait
+    if (AstLocal* initSelf = statClass->initSelf)
+    {
+        bodyScope->bindings[initSelf] = Binding{classDeclRecord->ty, initSelf->location};
+        if (!FFlag::DebugLuauCFG)
+            bodyScope->lvalueTypes[dfg->getDef(initSelf)] = classDeclRecord->ty;
+    }
+
     if (const AstClassPrimaryConstructor* primaryConstructor = statClass->primaryConstructor)
     {
         // Deliberately not childScope(): that would register the scope under the *class's* location,
@@ -5322,6 +5586,9 @@ void ConstraintGenerator::visitClass(const ScopePtr& scope, AstStatClass* statCl
 
     if (FFlag::LuwuTraits && statClass->implements.size > 0)
         checkTraitArguments(initializerScope, statClass);
+
+    if (FFlag::LuwuTraits)
+        checkScopedExpectations(bodyScope, statClass);
 
     // Which parameter, if any, a class member restates -- `class Card(hash: string) private const hash
     // end` names one field, declared by the parameter and given its access by the restatement.
@@ -5401,6 +5668,12 @@ void ConstraintGenerator::visitClass(const ScopePtr& scope, AstStatClass* statCl
                 },
                 [&](const AstClassMethod& method)
                 {
+                    if (method.qualifiedTrait)
+                    {
+                        checkQualifiedImplementation(bodyScope, statClass, classDeclRecord, method, declared);
+                        return;
+                    }
+
                     auto entry = classDeclRecord->memberTypes.find(method.functionName);
                     if (entry == nullptr)
                     {
@@ -5870,6 +6143,10 @@ InferencePack ConstraintGenerator::checkExprCall(
 
     std::vector<std::optional<TypeId>> expectedTypesForCall = getExpectedCallTypesForFunctionOverloads(fnType);
 
+    // Luwu Destructuring (rfcs/destructuring.md): a `.(...)` value destructured by an annotated positional pattern
+    if (const std::vector<TypeId>* elements = call->fromDotPositional ? dotPositionalElementTypes.find(call) : nullptr)
+        expectedTypesForCall.assign(elements->begin(), elements->end());
+
     module->astOriginalCallTypes[call->func] = fnType;
 
     Checkpoint argBeginCheckpoint = checkpoint(this);
@@ -6230,6 +6507,9 @@ Inference ConstraintGenerator::check(const ScopePtr& scope, AstExpr* expr, std::
         result = check(scope, interpString);
     else if (auto explicitTypeInstantiation = expr->as<AstExprInstantiate>())
         result = check(scope, explicitTypeInstantiation);
+    // Luwu Traits (rfcs/classes/traits.md): `Self` in a trait method is its `class.of(self)` call
+    else if (auto selfClass = expr->as<AstExprSelfClass>())
+        result = check(scope, selfClass->classOf, std::nullopt, forceSingleton);
     else if (auto tryExpr = expr->as<AstExprTry>())
         result = check(scope, tryExpr);
     else if (auto err = expr->as<AstExprError>())
@@ -6452,6 +6732,27 @@ Inference ConstraintGenerator::checkIndexName(
 
 Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprIndexName* indexName)
 {
+    // Luwu Traits (rfcs/classes/traits.md): `obj:Trait:name` and `Class:Trait.name` have the type of `Trait.name`. A call
+    // passes `obj` as the first argument, which the method's `self` checks.
+    if (indexName->qualifiedTrait)
+    {
+        check(scope, indexName->expr);
+
+        TypeId trait = resolveTraitRef(scope, qualifierTraitRef(indexName->qualifiedTrait));
+        const ExternType* traitType = trait ? get<ExternType>(trait) : nullptr;
+        if (traitType && traitType->traitInfo)
+        {
+            auto scoped = traitType->traitInfo->scopedFunctions.find(indexName->index.value);
+            if (scoped != traitType->traitInfo->scopedFunctions.end())
+            {
+                check(scope, indexName->qualifiedTrait);
+                return Inference{scoped->second};
+            }
+        }
+
+        return checkIndexName(scope, nullptr, indexName->qualifiedTrait, indexName->index.value, indexName->indexLocation);
+    }
+
     const RefinementKey* key = dfg->getRefinementKey(indexName);
     return checkIndexName(scope, key, indexName->expr, indexName->index.value, indexName->indexLocation);
 }
@@ -6918,9 +7219,9 @@ Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprInterpString*
     return Inference{builtinTypes->stringType};
 }
 
-// Luwu try expressions: `try expr` is `collections.result<T, E>`, with T expr's type. It's expanded like that
-// annotation, but looked up in the global scope, so a module's own `collections` import can't change it. E is
-// weakunknown, joined with the callee's error hints when expr is a call.
+// Luwu try expressions: `try expr` is `Result<T, E>`, with T expr's type. It's expanded like that annotation, but looked
+// up in the global scope, so a module's own `Result` type can't change it. E is weakunknown, joined with the callee's
+// error hints when expr is a call.
 Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprTry* tryExpr)
 {
     TypeId valueTy = check(scope, tryExpr->expr).ty;
@@ -6932,15 +7233,16 @@ Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprTry* tryExpr)
             errorTy = createTypeFunctionInstance(builtinTypes->typeFunctions->raisesFunc, {*callee}, {}, scope, tryExpr->location);
     }
 
-    const AstName library{"collections"};
-    const AstName result{"result"};
-    if (!globalScope->lookupImportedType(library.value, result.value))
+    const AstName result{"Result"};
+    if (!globalScope->lookupType(result.value))
     {
-        reportError(tryExpr->tryLocation, GenericError{"'try' gives a collections.result, so it needs the collections library"});
+        const char* message = "'try' gives a Result, which needs the LuwuNonePrimitive, LuwuDeclareStatements and "
+                              "LuwuGenericNominals flags";
+        reportError(tryExpr->tryLocation, GenericError{message});
         return Inference{builtinTypes->errorType};
     }
 
-    TypeId resultTy = arena->addType(PendingExpansionType{library, result, {valueTy, errorTy}, {}});
+    TypeId resultTy = arena->addType(PendingExpansionType{std::nullopt, result, {valueTy, errorTy}, {}});
     addConstraint(globalScope, tryExpr->location, TypeAliasExpansionConstraint{/* target */ resultTy});
     return Inference{resultTy};
 }
@@ -7821,7 +8123,7 @@ ConstraintGenerator::FunctionSignature ConstraintGenerator::checkFunctionSignatu
     if (fn->returnAnnotation)
     {
         TypePackId annotatedRetType =
-            resolveTypePack(signatureScope, fn->returnAnnotation, /* inTypeArguments */ false, /* replaceErrorWithFresh*/ true);
+            resolveReturnTypePack(signatureScope, fn->returnAnnotation, /* inTypeArguments */ false, /* replaceErrorWithFresh*/ true, Polarity::Positive);
         // We bind the annotated type directly here so that, when we need to
         // generate constraints for return typeArguments, we have a guarantee that we
         // know the annotated return type already, if one was provided.
@@ -7858,9 +8160,12 @@ ConstraintGenerator::FunctionSignature ConstraintGenerator::checkFunctionSignatu
     if (FFlag::DebugLuwuUserDefinedRefinements)
         actualFunction.truthyRefinement = resolveTruthyRefinement(signatureScope, fn);
 
-    // Luwu try expressions: the declared hint. checkFunctionBody joins the inferred one onto it.
+    // Luwu try expressions: the declared hint, and the hint of an alias the return type names. checkFunctionBody joins
+    // the inferred one onto them.
+    std::optional<TypeId> declaredHint;
     if (fn->errorHint)
-        actualFunction.errorHint = resolveType(signatureScope, fn->errorHint, /* inTypeArguments */ false);
+        declaredHint = resolveType(signatureScope, fn->errorHint, /* inTypeArguments */ false);
+    actualFunction.errorHint = returnErrorHint(signatureScope, fn->returnAnnotation, declaredHint, /* inTypeArguments */ false);
 
     TypeId actualFunctionType = arena->addType(std::move(actualFunction));
     LUAU_ASSERT(actualFunctionType);
@@ -8266,6 +8571,73 @@ void ConstraintGenerator::recordRaisedError(AstExprCall* call, const std::vector
         raisedErrors.back().types.push_back(builtinTypes->stringType);
 }
 
+// Luwu try expressions: the alias a return annotation is, when it's exactly one alias reference (`(): Result<string>`)
+static AstTypeReference* soleReturnReference(AstTypePack* returns)
+{
+    AstTypePackExplicit* explicitReturns = returns ? returns->as<AstTypePackExplicit>() : nullptr;
+    if (!explicitReturns || explicitReturns->typeList.tailType || explicitReturns->typeList.types.size != 1)
+        return nullptr;
+
+    AstType* type = explicitReturns->typeList.types.data[0];
+    while (AstTypeGroup* group = type->as<AstTypeGroup>())
+        type = group->type;
+
+    return type->as<AstTypeReference>();
+}
+
+// Luwu try expressions: resolves a function's return annotation, the one place an alias with an error hint may go
+TypePackId ConstraintGenerator::resolveReturnTypePack(
+    const ScopePtr& scope,
+    AstTypePack* returns,
+    bool inTypeArguments,
+    bool replaceErrorWithFresh,
+    std::optional<Polarity> initialPolarity
+)
+{
+    AstTypeReference* outer = hintedAliasReturn;
+    hintedAliasReturn = soleReturnReference(returns);
+
+    TypePackId result = initialPolarity ? resolveTypePack(scope, returns, inTypeArguments, replaceErrorWithFresh, *initialPolarity)
+                                        : resolveTypePack_(scope, returns, inTypeArguments, replaceErrorWithFresh);
+
+    hintedAliasReturn = outer;
+    return result;
+}
+
+// Luwu try expressions: a function's error hint, from its declared one and the hint of an alias its return annotation is
+// (`type Result<T> = T ! IoError` and `function read(): Result<string>`). The alias's hint is expanded with the arguments
+// the return annotation gives it. `returns` is already resolved.
+std::optional<TypeId> ConstraintGenerator::returnErrorHint(
+    const ScopePtr& scope,
+    AstTypePack* returns,
+    std::optional<TypeId> declared,
+    bool inTypeArguments
+)
+{
+    AstTypeReference* ref = soleReturnReference(returns);
+    if (!ref)
+        return declared;
+
+    std::optional<TypeFun> alias = ref->prefix ? scope->lookupImportedType(ref->prefix->value, ref->name.value) : scope->lookupType(ref->name.value);
+    if (!alias || !alias->errorHint)
+        return declared;
+
+    TypeId hint = *alias->errorHint;
+    TypeId* resolved = module->astResolvedTypes.find(ref);
+    if (const PendingExpansionType* expansion = resolved ? get<PendingExpansionType>(follow(*resolved)) : nullptr)
+    {
+        hint = arena->addType(PendingExpansionType{expansion->prefix, expansion->name, expansion->typeArguments, expansion->packArguments});
+        getMutable<PendingExpansionType>(hint)->errorHint = true;
+        if (!inTypeArguments)
+            addConstraint(scope, ref->location, TypeAliasExpansionConstraint{/* target */ hint});
+    }
+
+    if (!declared)
+        return hint;
+
+    return arena->addType(UnionType{{*declared, hint}});
+}
+
 TypeId ConstraintGenerator::resolveReferenceType(
     const ScopePtr& scope,
     AstType* ty,
@@ -8397,6 +8769,10 @@ TypeId ConstraintGenerator::resolveReferenceType(
     {
         alias = scope->lookupType(ref->name.value);
     }
+
+    // Luwu try expressions: an alias with a hint only means something as a function's whole return type
+    if (alias && alias->errorHint && ref != hintedAliasReturn)
+        reportError(ty->location, GenericError{format("'%s' has an error hint, so it can only be a function's return type", ref->name.value)});
 
     if (alias.has_value())
     {
@@ -8636,14 +9012,16 @@ TypeId ConstraintGenerator::resolveFunctionType(
     else
         argTypes = resolveTypePack_(signatureScope, &tempArgTypes, inTypeArguments, replaceErrorWithFresh);
     polarity = p;
-    TypePackId returnTypes = resolveTypePack_(signatureScope, fn->returnTypes, inTypeArguments, replaceErrorWithFresh);
+    TypePackId returnTypes = resolveReturnTypePack(signatureScope, fn->returnTypes, inTypeArguments, replaceErrorWithFresh);
 
     // TODO: FunctionType needs a pointer to the scope so that we know
     // how to quantify/instantiate it.
     FunctionType ftv{TypeLevel{}, {}, {}, argTypes, returnTypes};
     // Luwu try expressions
+    std::optional<TypeId> declaredHint;
     if (fn->errorHint)
-        ftv.errorHint = resolveType_(signatureScope, fn->errorHint, inTypeArguments, replaceErrorWithFresh);
+        declaredHint = resolveType_(signatureScope, fn->errorHint, inTypeArguments, replaceErrorWithFresh);
+    ftv.errorHint = returnErrorHint(signatureScope, fn->returnTypes, declaredHint, inTypeArguments);
     ftv.isCheckedFunction = fn->isCheckedFunction();
     ftv.literalParameters = std::move(literalParameters);
     AstAttr* deprecatedAttr = fn->getAttribute(AstAttr::Type::Deprecated);

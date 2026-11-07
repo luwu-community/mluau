@@ -208,17 +208,36 @@ private:
     // the position isn't known until after the attributes are consumed, i.e. statements.
     void validateAttributeContexts(const AstArray<AstAttr*>& attributes, AstAttr::Context context);
 
+    // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): for `--@[...]` comments over a statement
+    // no attribute applies to.
+    void reportStatementAttributes(const AstArray<AstAttr*>& attributes);
+
+    // False for an attribute from a `--@[...]` comment when a compiler is parsing: valid Luau has to keep compiling.
+    bool reportsAttributeErrors(const AstAttr* attr) const;
+
     // "Attribute '@x' can only be applied to ..." / "... cannot be applied to ...".
     void reportAttributeNotAllowed(const Location& location, const char* attributeName, const char* allowedPositionsHint, AstAttr::Context context);
 
-    // Attribute arguments must be literals.
-    void reportNonLiteralAttributeArgs(const AstArray<AstExpr*>& args, const Location& argsLocation);
+    // Attribute arguments must be literals. Reports the first argument that isn't one, unless parsing them already
+    // reported an error. Returns whether every argument is a literal.
+    bool checkAttributeArgsAreLiterals(const AstArray<AstExpr*>& args, const Location& argsLocation, size_t errorsBeforeArgs);
 
     // `first` followed by `second`, for attributes written on both sides of an access specifier.
     AstArray<AstAttr*> concatAttributes(const AstArray<AstAttr*>& first, const AstArray<AstAttr*>& second);
 
-    // True if an attribute begins at the current lexeme, i.e. a member/field/parameter is attributed.
+    // True if an attribute begins at the current lexeme, i.e. a member/field/parameter is attributed. A
+    // `--@[...]` comment right before the lexeme counts.
     bool attributesFollow() const;
+
+    // True if the current lexeme is an `@name` or `@[`, not counting comments.
+    bool attributeLexemeFollows() const;
+
+    // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): the attributes in the `--@[...]`
+    // comments right before the current lexeme, parsed as if written there. Empty when there are none.
+    AstArray<AstAttr*> takeCommentAttributes(AstAttr::Context context);
+
+    // Reports an attribute written as `@...` in a Luau or Lua module on a position upstream can't parse attributes on.
+    void checkAttributeLanguage(const Location& location, const char* attributeName, bool hasArguments, AstAttr::Context context);
 
     // attributes local function Name funcbody
     // attributes function funcname funcbody
@@ -522,6 +541,9 @@ private:
 
     // NAME
     AstExpr* parseNameExpr(const char* context = nullptr);
+    AstExpr* nameExpr(const Name& name);
+    AstExpr* selfClassExpr(const Location& location);
+    std::string printedQualifier(AstExpr* qualifier);
 
     // prefixexp -> NAME | '(' expr ')'
     AstExpr* parsePrefixExpr();
@@ -556,6 +578,7 @@ private:
     // dotfield ::= Name | Name `=' exp
     AstExpr* parseDotTableConstructor();
     AstExpr* parseDotPositional();
+    AstType* parseDotPositionalType();
 
     // TODO: Add grammar rules here?
     AstExpr* parseIfElseExpr();
@@ -846,9 +869,18 @@ private:
 
     Lexer lexer;
     Allocator& allocator;
+    // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): for the parser over a `--@[...]` comment
+    AstNameTable& names;
 
     std::vector<Comment> commentLocations;
     std::vector<HotComment> hotcomments;
+
+    // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): the `--@[...]` comments between the
+    // previous lexeme and the current one, for takeCommentAttributes.
+    std::vector<Lexeme> pendingCommentAttributes;
+
+    // True in the parser takeCommentAttributes runs over a comment's text. Its attributes skip checkAttributeLanguage.
+    bool parsingCommentAttributes = false;
 
     bool hotcommentHeader = true;
 
@@ -921,6 +953,8 @@ private:
     void checkLeaveShorthandFeature(const Location& keyword, const char* introducer);
 
     AstName nameSelf;
+    AstName nameSelfClass;
+    AstName nameOf;
     // Luwu match expressions: the globals and functions `is` / `implements` call, and a `match` subject's hidden name
     AstName nameClass;
     AstName nameType;
@@ -928,6 +962,7 @@ private:
     AstName nameImplements;
     AstName nameMatched;
     AstName nameNone;
+    AstName nameNoneGlobal;
 
     // Luwu match expressions: the clauses a `.{}` after a type test (`x is Point.{x, y}`) adds to the condition it's
     // in: a hidden local holding the tested value when it isn't a local already, the test, then one untested binding
@@ -961,9 +996,10 @@ private:
     AstName nameNil;
     AstName nameContinue;
     AstName nameTrait;
-    // Luwu collections: what `.(a, b)` calls, `collections.pair`, `triple` or `quad` by its count
-    AstName nameCollections;
-    AstName nameCollectionsClasses[3];
+    // Luwu bundles: `.(a, b)` calls `bundle.pack`, and a `.(A, B)` type names the bundle class of its size
+    AstName nameBundle;
+    AstName nameBundleClasses[13];
+    AstName nameBundlePack;
 
     MatchLexeme endMismatchSuspect;
 
@@ -973,6 +1009,23 @@ private:
     DenseHashMap<AstName, AstLocal*> localMap;
     std::vector<AstLocal*> localStack;
     DenseHashMap<AstName, AstStatClass*> classesWithinModule{{}};
+
+    // Luwu Traits (rfcs/classes/traits.md): the class or trait whose body is being parsed, which `Self` refers to
+    struct SelfClassContext
+    {
+        AstName name;
+        bool isTrait = false;
+        // The class statement's function depth. A local named `Self` declared deeper, inside the body, shadows `Self`.
+        size_t functionDepth = 0;
+        // Set while parsing one of the body's functions, together with that function's `self` if it takes one.
+        bool inFunction = false;
+        AstLocal* self = nullptr;
+        // A trait's AstStatClass::initSelf, made by the first `Self` in a field default
+        AstLocal* initSelf = nullptr;
+        // Set while parsing a trait's parameters, where `Self` is an error
+        bool inParameters = false;
+    };
+    std::optional<SelfClassContext> selfClass;
 
     std::vector<ParseError> parseErrors;
 

@@ -964,6 +964,15 @@ ControlFlow DataFlowGraphBuilder::visit(AstStatDeclareClass* d)
 
 void DataFlowGraphBuilder::visitClassShape(AstStatClass* d)
 {
+    // Luwu Traits (rfcs/classes/traits.md): the object `Self` in a trait's defaults is the class of
+    if (AstLocal* initSelf = d->initSelf)
+    {
+        DefId def = defArena->freshCell(initSelf, initSelf->location);
+        graph.localDefs[initSelf] = def;
+        currentScope()->bindings[initSelf] = def;
+        captures[initSelf].allVersions.push_back(def);
+    }
+
     // Luwu Classes (rfcs/classes): a primary constructor's parameters are visible to the class's
     // field initializer expressions and to nothing else, so they get a scope of their own that the
     // class's methods are visited outside of. They are compiled into the synthesized `__init`, hence
@@ -1013,6 +1022,10 @@ void DataFlowGraphBuilder::visitClassShape(AstStatClass* d)
                 },
                 [&](const AstClassMethod& method)
                 {
+                    // Luwu Traits (rfcs/classes/traits.md): the trait of `function Json.name`, read by the class statement
+                    if (method.qualifiedTrait)
+                        visitExpr(method.qualifiedTrait);
+
                     visitExpr(method.function);
                 }
             },
@@ -1121,6 +1134,9 @@ DataFlowResult DataFlowGraphBuilder::visitExpr(AstExpr* e)
             return visitExpr(i);
         else if (auto i = e->as<AstExprInstantiate>())
             return visitExpr(i);
+        // Luwu Traits (rfcs/classes/traits.md): `Self` in a trait method is its `class.of(self)` call
+        else if (auto s = e->as<AstExprSelfClass>())
+            return visitExpr(s->classOf);
         else if (auto d = e->as<AstExprDo>())
             return visitExpr(d);
         else if (auto c = e->as<AstExprTableComprehension>())
@@ -1252,6 +1268,14 @@ DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprCall* c)
 
 DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprIndexName* i)
 {
+    // Luwu Traits (rfcs/classes/traits.md): `obj:Trait:name` reads the trait's member, which nothing refines
+    if (i->qualifiedTrait)
+    {
+        visitExpr(i->expr);
+        visitExpr(i->qualifiedTrait);
+        return {defArena->freshCell(Symbol{}, i->location), nullptr};
+    }
+
     auto [parentDef, parentKey] = visitExpr(i->expr);
     std::string index = i->index.value;
 

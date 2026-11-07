@@ -758,6 +758,10 @@ struct ExternType
     // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): set on an instantiation of a generic class, to the class's template
     std::optional<TypeId> genericTemplate;
 
+    // Luwu bundles: a bundle class (`bundle.Two`), which prints the way `.(A, B)` writes it. Set on the declared class;
+    // an instantiation reads its template's.
+    bool printsAsBundle = false;
+
     // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): whether the members still have to be built (see props)
     bool hasUnbuiltMembers() const
     {
@@ -849,6 +853,13 @@ struct ExternType
         std::vector<Parameter> parameters;
         // The trait's `final` functions, which implementing classes can't define.
         std::set<Name> finals;
+        // The functions scoped to the trait (`function Self.name`) and their types. Implementing classes don't get them as
+        // members: code reads them through the trait (`obj:Trait:name()`, `Class:Trait.name`). The trait's value has the
+        // ones with a body. An optional expected function's type is `F?`.
+        std::map<Name, TypeId> scopedFunctions;
+        // The scoped functions the trait expects (`expect function Self.name`), and whether each is optional. A class
+        // that lists the trait implements them (`function Trait.name`); a trait that needs it declares them.
+        std::map<Name, bool> scopedExpectations;
         // The members `props` has from the traits this one needs (directly or not): every implementing class implements
         // those too, so a trait-typed value has their members. They stay those traits' members everywhere else.
         std::set<Name> fromNeeds;
@@ -1020,6 +1031,8 @@ struct PendingExpansionType
     std::vector<TypeId> typeArguments;
     std::vector<TypePackId> packArguments;
     size_t index;
+    // Luwu try expressions: expands the alias's error hint (TypeFun::errorHint) instead of its type
+    bool errorHint = false;
 
     static size_t nextIndex;
 };
@@ -1290,6 +1303,9 @@ struct TypeFun
      * You must first use TypeChecker::instantiateTypeFun to turn it into a real type.
      */
     TypeId type;
+
+    // Luwu try expressions: `type Result<T> = T ! IoError`. A function whose return type is exactly this alias raises it.
+    std::optional<TypeId> errorHint;
 
     // The location of where this TypeFun was defined, if available
     std::optional<Location> definitionLocation;

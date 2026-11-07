@@ -572,8 +572,8 @@ LUA_API int lua_classof(lua_State* L, int idx);
 // at `classidx`, 0 otherwise. Raises if the value at `classidx` isn't a class.
 LUA_API int lua_classis(lua_State* L, int idx, int classidx);
 
-// Luwu builtin classes: options and results for embedders. Building one raises if the `collections` library isn't open.
-// lua_pushsome pushes `option.some(v)` for the value at `idx` and raises if it is nil or none. An empty option is
+// Luwu try expressions: options and results for embedders. Building one raises if the result library (luaopen_result)
+// isn't open. lua_pushsome pushes `Some(v)` for the value at `idx`, which can be nil or none. An empty option is
 // lua_pushsymnone.
 LUA_API void lua_pushsome(lua_State* L, int idx);
 LUA_API void lua_pushresultok(lua_State* L, int idx);
@@ -581,9 +581,15 @@ LUA_API void lua_pushresulterr(lua_State* L, int idx);
 LUA_API int lua_issome(lua_State* L, int idx);
 LUA_API int lua_isresultok(lua_State* L, int idx);
 LUA_API int lua_isresulterr(lua_State* L, int idx);
-// Pushes the value a `some`, `ok` or `err` at `idx` holds and returns its type. Pushes nothing and returns LUA_TNONE for
+// Pushes the value a `Some`, `Ok` or `Err` at `idx` holds and returns its type. Pushes nothing and returns LUA_TNONE for
 // any other value.
 LUA_API int lua_getpayload(lua_State* L, int idx);
+
+// Luwu bundles: lua_packbundle pops `n` values and pushes a bundle of them, as `bundle.pack` does; it raises past 12
+// values or when the bundle library (luaopen_bundle) isn't open. lua_unpackbundle pushes the values of the bundle at
+// `idx` and returns how many, or pushes nothing and returns -1 for any other value.
+LUA_API void lua_packbundle(lua_State* L, int n);
+LUA_API int lua_unpackbundle(lua_State* L, int idx);
 
 // Luwu object notation: how objects of the class (or the object's class) at `idx` can be written as data. Returns the
 // form the constructor takes, and for LUA_CLASSDATA_POSITIONAL and LUA_CLASSDATA_TABLE pushes an array of the field names

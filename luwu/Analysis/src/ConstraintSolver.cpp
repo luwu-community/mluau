@@ -1594,6 +1594,11 @@ bool ConstraintSolver::tryDispatch(const TypeAliasExpansionConstraint& c, NotNul
         return true;
     }
 
+    // Luwu try expressions: a function's return type that names an alias with a hint raises that hint, expanded with the
+    // same arguments (ConstraintGenerator::returnErrorHint)
+    if (petv->errorHint)
+        tf = TypeFun{tf->typeParams, tf->typePackParams, tf->errorHint.value_or(builtinTypes->neverType), tf->definitionLocation};
+
     // Adding ReduceConstraint on type function for the constraint solver
     if (get<TypeFunctionInstanceType>(follow(tf->type)))
         pushConstraint(NotNull(constraint->scope.get()), constraint->location, ReduceConstraint{tf->type});
@@ -1727,6 +1732,12 @@ bool ConstraintSolver::tryDispatch(const TypeAliasExpansionConstraint& c, NotNul
     InstantiationQueuer queuer{constraint->scope, constraint->location, this};
     queuer.run(target);
     if (target->persistent || target->owningArena != arena)
+    {
+        bindResult(target);
+        return true;
+    }
+    // Luwu try expressions: a hint isn't an instance of the alias, so it doesn't take the alias's name and arguments
+    if (petv->errorHint)
     {
         bindResult(target);
         return true;
@@ -4194,6 +4205,44 @@ bool ConstraintSolver::tryDispatchIterableTable(TypeId iteratorTy, const Iterabl
     {
         unpack(builtinTypes->neverType);
         return true;
+    }
+
+    // Luwu: a local given a table in more than one place is a union of table types where those assignments join
+    // (`data = {}` in one branch of an `if` and `data = { ... }` in the other makes `{ R } | { R }`). When every member
+    // has an indexer, iterating the union gives the union of their keys and of their values. Upstream binds the loop's
+    // variables to the error type, which hides every mistake made with them.
+    if (const UnionType* options = get<UnionType>(iteratorTy))
+    {
+        TypeId keyTy = builtinTypes->neverType;
+        TypeId valueTy = builtinTypes->neverType;
+        bool indexed = true;
+
+        for (TypeId option : options)
+        {
+            option = follow(option);
+            if (isBlocked(option) && !force)
+                return block(option, constraint);
+
+            const TableType* table = get<TableType>(option);
+            if (table && table->state == TableState::Free && !force)
+                return block(option, constraint);
+
+            if (!table || !table->indexer)
+            {
+                indexed = false;
+                break;
+            }
+
+            keyTy = simplifyUnion(constraint->scope, constraint->location, keyTy, table->indexer->indexType);
+            valueTy = simplifyUnion(constraint->scope, constraint->location, valueTy, table->indexer->indexResultType);
+        }
+
+        if (indexed)
+        {
+            TypeId joined =
+                arena->addType(TableType{TableType::Props{}, TableIndexer{keyTy, valueTy}, TypeLevel{}, constraint->scope, TableState::Sealed});
+            return tryDispatchIterableTable(joined, c, constraint, force);
+        }
     }
 
     // Irksome: I don't think we have any way to guarantee that this table

@@ -6,7 +6,7 @@ use crate::traits::{FromLua, IntoLua};
 use crate::util::{check_stack, StackGuard};
 use crate::value::Value;
 
-/// A Luwu `collections.option`, converted to and from Rust's [`Option`].
+/// A Luwu option (`Some(v)` or `none`), converted to and from Rust's [`Option`].
 ///
 /// `Some(v)` becomes `option.some(v)` and `None` becomes the `none` primitive (the empty option). A plain
 /// [`Option`] keeps converting `None` to `nil`.
@@ -17,7 +17,7 @@ use crate::value::Value;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct LuwuOption<T>(pub Option<T>);
 
-/// A Luwu `collections.result`, converted to and from Rust's [`Result`](std::result::Result).
+/// A Luwu result (`Ok(v)` or `Err(e)`), converted to and from Rust's [`Result`](std::result::Result).
 ///
 /// `Ok(v)` becomes `result.ok(v)` and `Err(e)` becomes `result.err(e)`. A plain `Result` returned from a Rust function
 /// keeps raising its error instead.

@@ -22,6 +22,8 @@ enum class LuwonConstructor
     // A class named by a global, `Point(1, 2)`. Whoever builds runtime values from the file decides which classes it may
     // construct.
     Class,
+    // A Luwu bundle, `.(1, 2)`. The parser writes it as a call to `bundle.pack`, which a data file can't name.
+    Bundle,
 };
 
 // A class built into Luwu that a data file constructs by its library's name, `library.name(...)`, without the reader

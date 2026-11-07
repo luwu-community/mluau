@@ -340,6 +340,10 @@ public:
     AstName refinedParam;
     Location refinedParamLocation;
     AstType* refinedType = nullptr;
+
+    // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): written as a `--@[...]` comment. It means
+    // the same as an attribute in the code, but the pretty printer doesn't print it.
+    bool comment = false;
 };
 
 // The `@deprecated` attribute's payload, or nullopt when the array has no `@deprecated`.
@@ -550,6 +554,9 @@ public:
     void visit(AstVisitor* visitor) override;
 
     AstName name;
+    // Luwu Traits (rfcs/classes/traits.md): written `Self` in a class's body, or in a trait function without `self`.
+    // `name` is the class or trait, so `Self` compiles and type checks exactly like its name.
+    bool writtenAsSelf = false;
 };
 
 class AstExprVarargs : public AstExpr
@@ -588,7 +595,7 @@ public:
     AstArray<AstExpr*> args;
     bool self;
     Location argLocation;
-    // Luwu collections: `.(a, b)`, which the parser writes as `collections.pair(a, b)` (Parser::parseDotPositional)
+    // Luwu bundles: `.(a, b)`, which the parser writes as `bundle.pack(a, b)` (Parser::parseDotPositional)
     bool fromDotPositional = false;
     // Luwu match expressions: a call the parser wrote for a type test (`x is Point` is `class.isinstance(x, Point)`),
     // not one in the code. Editor features that show a call's parameters skip it.
@@ -619,6 +626,9 @@ public:
     Location indexLocation;
     Position opPosition;
     char op = '.';
+    // Luwu Traits (rfcs/classes/traits.md): the trait in a qualified read, `obj:Trait:name` or `Class:Trait.name`, which
+    // reads the class's version of the trait's member `name`. `op` is the second operator. nullptr for a plain index.
+    AstExpr* qualifiedTrait = nullptr;
 };
 
 class AstExprIndexExpr : public AstExpr
@@ -881,7 +891,24 @@ public:
     AstArray<AstExpr*> expressions;
 };
 
-// Luwu try expressions: `try expr`, a `collections.result` holding expr's value, or the error evaluating it raised
+// Luwu Traits (rfcs/classes/traits.md): `Self` in a trait method or a trait's field default, the class of the
+// object it's called on or initializes. `Self` everywhere else in a class or trait body is the class or trait itself
+// (AstExprGlobal::writtenAsSelf).
+class AstExprSelfClass : public AstExpr
+{
+public:
+    LUAU_RTTI(AstExprSelfClass)
+
+    AstExprSelfClass(const Location& location, AstExprCall* classOf);
+
+    void visit(AstVisitor* visitor) override;
+
+    // `class.of(self)`, with the method's `self` or the trait's AstStatClass::initSelf. Everything past the parser compiles
+    // and type checks this call.
+    AstExprCall* classOf;
+};
+
+// Luwu try expressions: `try expr`, an `Ok` holding expr's value, or an `Err` holding the error evaluating it raised
 class AstExprTry : public AstExpr
 {
 public:
@@ -1415,6 +1442,8 @@ public:
     AstArray<AstGenericType*> generics;
     AstArray<AstGenericTypePack*> genericPacks;
     AstType* type;
+    // Luwu try expressions: `type Result<T> = T ! IoError`. Only a function's return type may name an alias with a hint.
+    AstType* errorHint = nullptr;
     bool exported;
 
     // Location of the leading 'type' keyword token only.
@@ -1614,6 +1643,12 @@ struct AstClassMethod
     // Luwu Traits (rfcs/classes/traits.md): location of `final` in a trait's `final function`, which no implementing class may
     // define itself. nullopt in a class.
     std::optional<Location> finalLocation = std::nullopt;
+    // Luwu Traits (rfcs/classes/traits.md): location of `Self` in a trait's `function Self.name`, a member scoped to the
+    // trait. Implementing classes don't get it as a member; `obj:Trait:name()` and `Class:Trait.name()` reach it.
+    std::optional<Location> scopeLocation = std::nullopt;
+    // Luwu Traits (rfcs/classes/traits.md): the trait in a class's `function Json.name`, a qualified implementation of that
+    // trait's member `name`. It isn't a member of the class. nullptr otherwise.
+    AstExpr* qualifiedTrait = nullptr;
 };
 
 using AstClassMember = Variant<AstClassProperty, AstClassMethod>;
@@ -1711,6 +1746,9 @@ public:
     // Luwu Traits (rfcs/classes/traits.md): `trait Name ... end` is parsed as a class with this set. A trait's primary
     // constructor holds its trait parameters (`trait Element(tag: string)`), and `keywordLocation` is its `trait`.
     bool isTrait = false;
+    // Luwu Traits (rfcs/classes/traits.md): the object a trait's field defaults initialize, when one of them uses `Self`
+    // (the class of this object). The compiler's `__traitinit` takes it as its `self`.
+    AstLocal* initSelf = nullptr;
     // Luwu Traits (rfcs/classes/traits.md): a class's `implements` list. Always empty on a trait.
     AstArray<AstClassTraitRef> implements{nullptr, 0};
     // Luwu Traits (rfcs/classes/traits.md): the `implements` and `needs` keywords; nullopt when the list is absent
@@ -1841,6 +1879,8 @@ public:
     AstName name;
     Location nameLocation;
     AstArray<AstTypeOrPack> parameters;
+    // Luwu bundles: `.(A, B)`, which the parser writes as `bundle.Bundle2<A, B>` (Parser::parseDotPositionalType)
+    bool fromDotPositional = false;
 };
 
 struct AstTableProp
@@ -2283,6 +2323,10 @@ public:
         return visit(static_cast<AstExpr*>(node));
     }
     virtual bool visit(class AstExprInterpString* node)
+    {
+        return visit(static_cast<AstExpr*>(node));
+    }
+    virtual bool visit(class AstExprSelfClass* node)
     {
         return visit(static_cast<AstExpr*>(node));
     }

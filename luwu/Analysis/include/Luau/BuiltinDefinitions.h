@@ -47,6 +47,20 @@ struct MagicClassFields final : MagicFunction
 // Narrows `class.name`'s declared `string` return to the class's name as a string singleton when the
 // argument is a class or object type, and to a union of singletons for a union of them. Exposed for
 // the same reason as MagicClassFields.
+// Luwu class reflection (rfcs/classes): types `class.member(x, "name")` as `ClassMember<T>`, with `T` the member's type,
+// and reports a name the class doesn't have
+struct MagicClassMember final : MagicFunction
+{
+    std::optional<WithPredicate<TypePackId>> handleOldSolver(
+        struct TypeChecker&,
+        const std::shared_ptr<struct Scope>&,
+        const class AstExprCall&,
+        WithPredicate<TypePackId>
+    ) override;
+    bool infer(const MagicFunctionCallContext& context) override;
+    bool typeCheck(const MagicFunctionTypeCheckContext& context) override;
+};
+
 struct MagicClassName final : MagicFunction
 {
     std::optional<WithPredicate<TypePackId>> handleOldSolver(
@@ -154,11 +168,20 @@ void assignPropDocumentationSymbols(TableType::Props& props, const std::string& 
 
 std::string getBuiltinDefinitionSource();
 
+// Luwu try expressions: whether Analysis has the `Ok`, `Err`, `Some` and `None` globals: the flags the VM opens them
+// with (luaL_openlibs), LuwuDeclareStatements, which parses their declarations, and LuwuGenericNominals, which types
+// their generic classes
+bool resultLibraryEnabled();
+// Luwu class reflection (rfcs/classes): whether `class.member`, `class.ClassMember` and `class.fields` listing
+// ClassMembers are declared
+bool classReflectionEnabled();
 // Luwu collections: whether Analysis has the `collections` library: the flags the VM opens it with
 // (luaL_openlibs), and LuwuDeclareStatements, which parses its declarations
 bool collectionsLibraryEnabled();
 // Luwu collections: the library's declarations, a definition file of its own (see registerBuiltinGlobals)
 std::string getCollectionsDefinitionSource();
+// Luwu bundles: the `bundle` library's declarations, opened with `collections` (see registerBuiltinGlobals)
+std::string getBundleDefinitionSource();
 std::string getTypeFunctionDefinitionSource();
 
 void addGlobalBinding(GlobalTypes& globals, const std::string& name, TypeId ty, const std::string& packageName);

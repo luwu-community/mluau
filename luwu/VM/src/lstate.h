@@ -191,18 +191,23 @@ struct lua_UdataDirectAccessData
 ** `global state', shared by all threads of this state
 */
 // clang-format off
+// Luwu bundles: the most values a bundle holds
+#define LUWU_BUNDLE_MAX 12
+
 // Luwu builtin classes: the classes the VM builds in C++ (luaR_newnativeclass), one slot each in global_State
 enum LuwuBuiltinClass
 {
-    LUWU_BUILTIN_PAIR,
-    LUWU_BUILTIN_TRIPLE,
-    LUWU_BUILTIN_QUAD,
+    // Luwu bundles: one class per size, LUWU_BUILTIN_BUNDLE0 + n holds n values
+    LUWU_BUILTIN_BUNDLE0,
+    LUWU_BUILTIN_BUNDLE12 = LUWU_BUILTIN_BUNDLE0 + LUWU_BUNDLE_MAX,
     LUWU_BUILTIN_ORDEREDMAP,
     LUWU_BUILTIN_VEC,
     LUWU_BUILTIN_VECDEQUE,
     LUWU_BUILTIN_SOME,
     LUWU_BUILTIN_OK,
     LUWU_BUILTIN_ERR,
+    // Luwu class reflection: `class.ClassMember`
+    LUWU_BUILTIN_CLASSMEMBER,
 
     LUWU_BUILTIN__COUNT
 };

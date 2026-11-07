@@ -6,6 +6,7 @@ use serde::ser::Serialize;
 use crate::error::Result;
 use crate::private::Sealed;
 use crate::state::Lua;
+use crate::util::StackGuard;
 use crate::value::Value;
 
 /// Trait for serializing/deserializing Lua values using Serde.
@@ -119,6 +120,41 @@ pub trait LuaSerdeExt: Sealed {
     /// ```
     #[allow(clippy::wrong_self_convention)]
     fn from_value_with<T: DeserializeOwned>(&self, value: Value, options: de::Options) -> Result<T>;
+
+    /// Builds a [`Value`] from a serde [`Deserializer`] while it parses.
+    ///
+    /// The result is what `to_value` gives for the same data, but no Rust value is built first: decoding JSON
+    /// text with `to_value` needs a `serde_json::Value` of the whole document next to the Lua copy. Strings are
+    /// copied once, from the input into Lua.
+    ///
+    /// [`Deserializer`]: serde::Deserializer
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mluau::{Lua, Result, LuaSerdeExt};
+    ///
+    /// fn main() -> Result<()> {
+    ///     let lua = Lua::new();
+    ///     let mut json = serde_json::Deserializer::from_str(r#"{"name": "John Smith", "tags": [1, 2]}"#);
+    ///     let value = lua.deserialize_value(&mut json)?;
+    ///     lua.globals().set("user", value)?;
+    ///     lua.load(r#"
+    ///         assert(user.name == "John Smith")
+    ///         assert(#user.tags == 2)
+    ///     "#).call::<()>(())
+    /// }
+    /// ```
+    fn deserialize_value<'de, D: serde::Deserializer<'de>>(&self, deserializer: D) -> Result<Value>;
+
+    /// Builds a [`Value`] from a serde [`Deserializer`] while it parses, with the options `to_value_with` takes.
+    ///
+    /// [`Deserializer`]: serde::Deserializer
+    fn deserialize_value_with<'de, D: serde::Deserializer<'de>>(
+        &self,
+        deserializer: D,
+        options: ser::Options,
+    ) -> Result<Value>;
 }
 
 impl LuaSerdeExt for Lua {
@@ -149,9 +185,24 @@ impl LuaSerdeExt for Lua {
     {
         T::deserialize(de::Deserializer::new_with_options(value, options))
     }
+
+    fn deserialize_value<'de, D: serde::Deserializer<'de>>(&self, deserializer: D) -> Result<Value> {
+        self.deserialize_value_with(deserializer, ser::Options::default())
+    }
+
+    fn deserialize_value_with<'de, D: serde::Deserializer<'de>>(
+        &self,
+        deserializer: D,
+        options: ser::Options,
+    ) -> Result<Value> {
+        let lua = self.lock();
+        let _sg = unsafe { StackGuard::new(lua.state()) };
+        push::push_deserialized(&lua, deserializer, options)
+    }
 }
 
 pub mod de;
+mod push;
 pub mod ser;
 
 #[doc(inline)]

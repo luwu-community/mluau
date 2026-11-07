@@ -780,20 +780,37 @@ typedef struct LuauClass
     // those functions. Only set while the class statement runs: implementing drops it. Marked in traverseclass.
     struct LuaTable* compiledtraitcopies;
 
+    // Luwu collections: the number field `#` reads for a builtin container (vec, vecdeque, orderedmap) instead of
+    // calling its `__len`, which returns the same number. LUAR_NO_LENGTH_FIELD for every other class.
+    uint32_t lengthfield;
+
+    // Luwu bundles: an object of this class is a table key by the values of its fields, not by its identity, so equal
+    // bundles index the same entry (luaR_keyhash, luaR_keyequal). Only the bundle classes set it: their objects can't
+    // change.
+    bool keybyvalue;
+
+    // Luwu collections: a builtin class's fast methods by member offset, with NULL for the members that have none. NULL
+    // for every other class. Owned by this class.
+    luaR_FastMethod* fastmethods;
+
+    // Luwu Traits (rfcs/classes/traits.md): the class's version of trait members read through a trait (luaR_getqualified),
+    // keyed by the trait, each a table from a member's name to its function: the class's qualified implementations
+    // (`function Json.name`) and its copies of the defaults of scoped members (`function Self.name`). Until the class
+    // implements its traits, it holds only the qualified implementations, unchecked. NULL when there are none. Marked in
+    // traverseclass.
+    struct LuaTable* qualified;
+
+    // Luwu class reflection (rfcs/classes): what `class.member` and `class.fields` give through the class, made the first
+    // time: the ClassMember of each member at its offset + 1, and the field lists under "public" and "all". NULL until
+    // then. Marked in traverseclass.
+    struct LuaTable* reflection;
+
     // Luwu Destructuring (rfcs/destructuring.md): what a positional pattern `.(a, b)` reads from an object of this class.
     // `positionalmembers[i]` is the offset of the member at position i: a primary constructor's parameters, in order.
     // `numberofpositional` is -1 for a class whose objects can't be destructured positionally (no primary constructor),
     // and `positionalmembers` is NULL while it's 0 or less. Owned by this class object; freed in luaR_freeclass.
     uint32_t* positionalmembers;
     int numberofpositional;
-
-    // Luwu collections: the number field `#` reads for a builtin container (vec, vecdeque, orderedmap) instead of
-    // calling its `__len`, which returns the same number. LUAR_NO_LENGTH_FIELD for every other class.
-    uint32_t lengthfield;
-
-    // Luwu collections: a builtin class's fast methods by member offset, with NULL for the members that have none. NULL
-    // for every other class. Owned by this class.
-    luaR_FastMethod* fastmethods;
 
 } LuauClass;
 
@@ -826,13 +843,13 @@ typedef struct LuauObject
 enum LuwuStorageKind
 {
     LUAR_STORAGE_NONE,
-    // `vec`: entries 1 to count in items[0] to items[count - 1]
+    // `Vec`: entries 1 to count in items[0] to items[count - 1]
     LUAR_STORAGE_VEC,
-    // `vecdeque`: a ring. The entry i places from the front is in items[(head + i) & (capacity - 1)].
+    // `VecDeque`: a ring. The entry i places from the front is in items[(head + i) & (capacity - 1)].
     LUAR_STORAGE_RING,
 };
 
-// Luwu collections: the entries of a `vec` or `vecdeque`, in a block the object owns from its first value on. The
+// Luwu collections: the entries of a `Vec` or `VecDeque`, in a block the object owns from its first value on. The
 // object's first member points to it as light userdata, and is nil before the first value. It's allocated with luaM_
 // in the object's memory category and freed with the object (luaR_freeobject). traverseobject marks the element type and the live entries; the slots
 // after them are never read.
@@ -841,7 +858,7 @@ typedef struct LuauStorage
     uint32_t count;
     // The number of slots in `items`, always a power of two
     uint32_t capacity;
-    // A ring's front slot; always 0 for a `vec`, so the ring's formula finds a `vec`'s entries too
+    // A ring's front slot; always 0 for a `Vec`, so the ring's formula finds a `Vec`'s entries too
     uint32_t head;
     // The type the first value fixed (see lcollectionslib.cpp): the tag every entry has, or LUAR_STORAGE_ENUM when the
     // entries are the values of a builtin enum. Entries tagged LUA_TOBJECT are objects of `elementclass`.
@@ -853,7 +870,7 @@ typedef struct LuauStorage
     TValue items[1];
 } LuauStorage;
 
-// Luwu collections: LuauStorage::elementtag for a builtin enum, which no value's tag matches
+// Luwu try expressions: LuauStorage::elementtag for a builtin enum, which no value's tag matches
 #define LUAR_STORAGE_ENUM 0xff
 
 // Luwu collections: the member of a builtin container that points to its LuauStorage

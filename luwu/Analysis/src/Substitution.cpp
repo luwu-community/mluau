@@ -46,6 +46,7 @@ static TypeId shallowClone(TypeId ty, TypeArena& dest, const TxnLog* log, bool t
         else if constexpr (std::is_same_v<T, PendingExpansionType>)
         {
             PendingExpansionType clone = PendingExpansionType{a.prefix, a.name, a.typeArguments, a.packArguments};
+            clone.errorHint = a.errorHint;
             return dest.addType(std::move(clone));
         }
         else if constexpr (std::is_same_v<T, AnyType>)
@@ -174,6 +175,7 @@ static TypeId shallowClone(TypeId ty, TypeArena& dest, const TxnLog* log, bool t
             clone.traitIntersection = a.traitIntersection;
             // Luwu: a class or trait a type function made is still the same one
             clone.generatedKey = a.generatedKey;
+            clone.printsAsBundle = a.printsAsBundle;
             if (FFlag::LuwuGenericNominals)
             {
                 clone.hasUnresolvedGenerics = a.hasUnresolvedGenerics;
@@ -379,6 +381,8 @@ void Tarjan::visitChildren(TypeId ty, int index)
                 visitChild(*etv->traitInfo->selfMarker);
             for (const auto& [_, field] : etv->traitInfo->selfFieldTemplates)
                 visitChild(field);
+            for (const auto& [_, function] : etv->traitInfo->scopedFunctions)
+                visitChild(function);
             for (const auto& [_, function] : etv->traitInfo->selfFunctions)
             {
                 visitChild(function.generic);
@@ -1083,6 +1087,8 @@ void Substitution::replaceChildren(TypeId ty)
                 etv->traitInfo->selfMarker = replace(*etv->traitInfo->selfMarker);
             for (auto& [_, field] : etv->traitInfo->selfFieldTemplates)
                 field = replace(field);
+            for (auto& [_, function] : etv->traitInfo->scopedFunctions)
+                function = replace(function);
             for (auto& [_, function] : etv->traitInfo->selfFunctions)
             {
                 function.generic = replace(function.generic);

@@ -123,6 +123,9 @@ LUAI_FUNC bool luaR_isvminternalfunction(lua_State* L, const Closure* cl);
  */
 LUAI_FUNC bool luaR_closureownsprivateaccess(const LuauClass* classdef, const Closure* cl);
 
+// Luwu Classes (rfcs/classes): the closure of the Luwu code a VM-internal C function acts for, or NULL
+LUAI_FUNC const Closure* luaR_callinglua(lua_State* L);
+
 /**
  * Errors (via luaG_privateaccesserror) if the member at `offset` is private and `cl` is not one
  * of `classdef`'s own methods, or (via luaG_blockedinitaccesserror) if it is `__init`
@@ -226,13 +229,32 @@ LUAI_FUNC LuauClass* luaR_newnativeclass(lua_State* L, const char* name, const l
  */
 LUAI_FUNC LuauObject* luaR_checknativeself(lua_State* L, const LuauClass* classdef, const char* method);
 
+// Luwu builtin classes: an `__init` that fills the object's fields from its arguments in order. A field with no
+// argument for it stays nil.
+LUAI_FUNC int luaR_fieldsinit(lua_State* L);
+
+// Luwu builtin classes: pops the value on top of the stack and adds it to `b` the way a constructor call in `__tostring`
+// shows it: strings quoted, everything else as `tostring` gives it
+LUAI_FUNC void luaR_addshowntop(struct luaL_Strbuf* b);
+
+// Luwu try expressions: a new `Some`, `Ok` or `Err` (`kind`) holding `value`, for the C API and `try`. Raises if the
+// library isn't open.
+LUAI_FUNC LuauObject* luaR_newpayload(lua_State* L, LuwuBuiltinClass kind, const TValue* value);
+
+// Luwu try expressions: LOP_WRAPRESULT. Replaces the value in `ra` with an `Ok` holding it, or with `caught` an `Err`
+// holding the error in `ra` and where it was raised in `ra + 1` to `ra + 3`. Doesn't run the collector.
+LUAI_FUNC void luaR_wrapresult(lua_State* L, StkId ra, bool caught);
+
+// Luwu try expressions: the value a `Some`, `Ok` or `Err` holds, or NULL for any other value
+LUAI_FUNC const TValue* luaR_payload(lua_State* L, const TValue* value);
+
 /**
  * Luwu collections: sets up a generic for loop over the object at `ra` when it's a builtin container, and returns
  * false otherwise. The loop calls neither `__iter` nor anything per step: `ra` becomes a boolean, which FORGLOOP hands
  * to luaR_collectionnext, and `ra + 1` the container. `ra + 2` is the loop's state:
- *  - a `vec` or `vecdeque` gets `ra` = true and the number of entries visited, as light userdata like a table loop's
+ *  - a `Vec` or `VecDeque` gets `ra` = true and the number of entries visited, as light userdata like a table loop's
  *    index (luaR_storagenext);
- *  - an `orderedmap` gets `ra` = false and the previous key, nil at the start. `ra`'s extra field keeps that key's
+ *  - an `OrderedMap` gets `ra` = false and the previous key, nil at the start. `ra`'s extra field keeps that key's
  *    position, so a step only looks the key up when the entry there changed.
  */
 LUAI_FUNC bool luaR_collectionprep(lua_State* L, StkId ra);
@@ -244,14 +266,7 @@ LUAI_FUNC bool luaR_collectionprep(lua_State* L, StkId ra);
  */
 LUAI_FUNC bool luaR_collectionnext(lua_State* L, StkId ra);
 
-// Luwu collections: a new `some`, `ok` or `err` (`kind`) holding `value`, for the C API. Raises if the library isn't open
-// or a `some` gets nil or none.
-LUAI_FUNC LuauObject* luaR_newpayload(lua_State* L, LuwuBuiltinClass kind, const TValue* value);
-
-// Luwu collections: the value a `some`, `ok` or `err` holds, or NULL for any other value
-LUAI_FUNC const TValue* luaR_payload(lua_State* L, const TValue* value);
-
-// Luwu collections: the storage block of a `vec` or `vecdeque`, or NULL before its first value. Its `__init` sets the
+// Luwu collections: the storage block of a `Vec` or `VecDeque`, or NULL before its first value. Its `__init` sets the
 // object's storage kind and leaves the storage member nil. Native code reads light userdata there as a block.
 LUAU_FORCEINLINE LuauStorage* luaR_storage(LuauObject* object)
 {
@@ -280,14 +295,14 @@ LUAU_FORCEINLINE size_t luaR_objectmemory(const LuauObject* object)
     return luaR_objectsize(object->numberofmembers) + (storage ? luaR_storagesize(storage->capacity) : 0);
 }
 
-// Luwu collections: the slot of the entry `offset` places from the front of a `vec` or `vecdeque`
+// Luwu collections: the slot of the entry `offset` places from the front of a `Vec` or `VecDeque`
 LUAU_FORCEINLINE TValue* luaR_storageentry(LuauStorage* storage, uint32_t offset)
 {
     LUAU_ASSERT(offset < storage->count);
     return &storage->items[(storage->head + offset) & (storage->capacity - 1)];
 }
 
-// Luwu collections: one step of a loop over a `vec` or `vecdeque`, the case of luaR_collectionnext that FORGLOOP runs
+// Luwu collections: one step of a loop over a `Vec` or `VecDeque`, the case of luaR_collectionnext that FORGLOOP runs
 // inline
 LUAU_FORCEINLINE bool luaR_storagenext(lua_State* L, LuauObject* container, StkId ra)
 {
@@ -305,7 +320,7 @@ LUAU_FORCEINLINE bool luaR_storagenext(lua_State* L, LuauObject* container, StkI
 }
 
 // Luwu collections: the length `#` gives `object` without calling `__len`, or -1 when its class has no such length. A
-// `vec` and a `vecdeque` read their storage block, an `orderedmap` its length field (LuauClass::lengthfield).
+// `Vec` and a `VecDeque` read their storage block, an `OrderedMap` its length field (LuauClass::lengthfield).
 LUAU_FORCEINLINE double luaR_objectlength(const LuauObject* object)
 {
     if (object->storagekind != LUAR_STORAGE_NONE)
@@ -376,8 +391,33 @@ LUAI_FUNC void luaR_addcompiledtraitcopy(lua_State* L, LuauClass* classdef, cons
  */
 LUAI_FUNC Closure* luaR_newtraitinitrunner(lua_State* L);
 
+/**
+ * Luwu Traits (rfcs/classes/traits.md): records `fn` as `classdef`'s qualified implementation of the member `name` of
+ * the trait `trait` (`function Json.name`, LBC_NEWCLASSMEMBER_QUALIFIED). luaR_implementtraits checks it. Ignored once
+ * the class has implemented its traits.
+ */
+LUAI_FUNC void luaR_addqualified(lua_State* L, LuauClass* classdef, const TValue* trait, TString* name, const TValue* fn);
+
+/**
+ * Luwu Traits (rfcs/classes/traits.md): sets `ra` to the class's version of the member `name` of `trait`, for
+ * `obj:Trait:name()` and `Class:Trait.name` (LOP_GETQUALIFIED). `receiver` is an object or a class. Raises when it
+ * doesn't implement the trait, or the trait has no such function.
+ */
+LUAI_FUNC void luaR_getqualified(lua_State* L, StkId ra, const TValue* receiver, const TValue* trait, TString* name);
+
 // Luwu Traits (rfcs/classes/traits.md): whether `classdef` implements `trait`, listed or implied through `needs`.
 LUAI_FUNC bool luaR_implements(const LuauClass* classdef, const LuauClass* trait);
+
+// Luwu bundles: an object whose class is LuauClass::keybyvalue is a table key by its fields. luaR_keyhash gives equal
+// objects equal hashes, and luaR_keyequal compares the fields raw (no `__eq`), nested bundles by their fields too.
+LUAI_FUNC unsigned int luaR_keyhash(const LuauObject* object);
+LUAI_FUNC bool luaR_keyequal(const LuauObject* a, const LuauObject* b);
+
+// Luwu bundles: the number of values in the bundle `value`, or -1 when it isn't a bundle
+LUAI_FUNC int luaR_bundlesize(lua_State* L, const TValue* value);
+// Luwu bundles: raises for an assignment to a bundle's field, naming `with` instead of a constructor nothing can call.
+// Returns when the object isn't a bundle.
+LUAI_FUNC void luaR_checkbundleassign(lua_State* L, const LuauObject* object, const TValue* key);
 
 // A member's offset is cached in its instruction's 8-bit C operand (the slot the fast paths check). A
 // larger offset doesn't fit: it is never cached, and that member is looked up by name every time.

@@ -457,6 +457,12 @@ private:
     // Luwu Traits (rfcs/classes/traits.md): checks the arguments of each `implements` entry against its trait's parameters,
     // in the scope the class's field initializers are checked in
     void checkTraitArguments(const ScopePtr& initializerScope, AstStatClass* cls);
+    // Luwu Traits (rfcs/classes/traits.md): a class's `function Json.name`, checked like an override of trait Json's `name`
+    // with `self` the class
+    void checkQualifiedImplementation(const ScopePtr& scope, AstStatClass* cls, ClassDeclRecord* record, const AstClassMethod& method, bool declared);
+    // Luwu Traits (rfcs/classes/traits.md): the scoped functions the class's listed traits expect, which it implements as
+    // `function Trait.name`, and the ones its needed traits expect, which a trait declares as `function Self.name`
+    void checkScopedExpectations(const ScopePtr& scope, AstStatClass* cls);
     void prototypeClass(
         const ScopePtr& scope,
         AstStatClass* classDecl,
@@ -628,6 +634,14 @@ private:
         std::optional<LiteralCheck> check;
     };
     ResolvedAnnotation resolveLiteralCheckAnnotation(const ScopePtr& scope, AstType* annotation, bool inTypeArguments, bool replaceErrorWithFresh);
+    // A local's annotation, resolved once: an element of a positional pattern on a `.(...)` value has it resolved
+    // early, for the bundle's expected type (expectedBundleType)
+    ResolvedAnnotation resolveLocalAnnotation(const ScopePtr& scope, AstLocal* local);
+    DenseHashMap<AstLocal*, ResolvedAnnotation> bundleElementAnnotations{nullptr};
+    std::optional<TypeId> expectedBundleType(const ScopePtr& scope, AstStatLocal* statLocal);
+    // The element annotations of the positional pattern a `.(...)` value is destructured by: each value's expected type
+    DenseHashMap<const AstExprCall*, std::vector<TypeId>> dotPositionalElementTypes{nullptr};
+    void expectDotPositionalElements(AstExpr* expr, const std::vector<TypeId>& elements);
     // Luwu literal types: an alias of a union with a literal member (`type Length = CssLength | Token | number`), as
     // resolveLiteralCheckAnnotation resolves the union written out
     std::optional<ResolvedAnnotation> literalUnionOfType(TypeId ty);
@@ -687,6 +701,17 @@ private:
 
     // Specializations of 'resolveType' below
     TypeId resolveReferenceType(const ScopePtr& scope, AstType* ty, AstTypeReference* ref, bool inTypeArguments, bool replaceErrorWithFresh);
+    // Luwu try expressions: the return annotation being resolved, when it's exactly one alias reference: the one place an
+    // alias with an error hint may go
+    AstTypeReference* hintedAliasReturn = nullptr;
+    TypePackId resolveReturnTypePack(
+        const ScopePtr& scope,
+        AstTypePack* returns,
+        bool inTypeArguments,
+        bool replaceErrorWithFresh,
+        std::optional<Polarity> initialPolarity = std::nullopt
+    );
+    std::optional<TypeId> returnErrorHint(const ScopePtr& scope, AstTypePack* returns, std::optional<TypeId> declared, bool inTypeArguments);
     TypeId resolveTableType(const ScopePtr& scope, AstType* ty, AstTypeTable* tab, bool inTypeArguments, bool replaceErrorWithFresh);
     TypeId resolveFunctionType(const ScopePtr& scope, AstType* ty, AstTypeFunction* fn, bool inTypeArguments, bool replaceErrorWithFresh);
 

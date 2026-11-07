@@ -30,7 +30,7 @@ namespace CodeGen
 namespace X64
 {
 
-// Luwu collections: where a `vec`'s or `vecdeque`'s storage member is in the object
+// Luwu collections: where a `Vec`'s or `VecDeque`'s storage member is in the object
 static const int kStorageMemberOffset = int(LUAR_OBJECT_MEMBERS_OFFSET + LUAR_STORAGE_MEMBER * sizeof(TValue));
 
 IrLoweringX64::IrLoweringX64(LogBuilder* logger, AssemblyBuilderX64& build, ModuleHelpers& helpers, IrFunction& function, LoweringStats* stats)
@@ -3176,7 +3176,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         break;
     case IrCmd::FORGLOOP_FALLBACK:
     {
-        // Luwu collections: a `vec` or `vecdeque` steps inline
+        // Luwu collections: a `Vec` or `VecDeque` steps inline
         if (FFlag::LuwuClasses)
             emitInstForGLoopStorage(regs, build, vmRegOp(OP_A(inst)), intOp(OP_B(inst)), labelOp(OP_C(inst)), labelOp(OP_D(inst)));
 
@@ -3352,6 +3352,9 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
     case IrCmd::FALLBACK_NEWCLASSMEMBER:
         emitFallback(regs, build, offsetof(NativeContext, executeNEWCLASSMEMBER), uintOp(OP_A(inst)));
         break;
+    case IrCmd::FALLBACK_GETQUALIFIED:
+        emitFallback(regs, build, offsetof(NativeContext, executeGETQUALIFIED), uintOp(OP_A(inst)));
+        break;
     case IrCmd::FALLBACK_INITTRAITS:
         emitFallback(regs, build, offsetof(NativeContext, executeINITTRAITS), uintOp(OP_A(inst)));
         break;
@@ -3369,6 +3372,9 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
         break;
     case IrCmd::FALLBACK_POP:
         emitFallback(regs, build, offsetof(NativeContext, executePOP), uintOp(OP_A(inst)));
+        break;
+    case IrCmd::FALLBACK_WRAPRESULT:
+        emitFallback(regs, build, offsetof(NativeContext, executeWRAPRESULT), uintOp(OP_A(inst)));
         break;
     case IrCmd::FALLBACK_FORGPREP:
         emitFallback(regs, build, offsetof(NativeContext, executeFORGPREP), uintOp(OP_A(inst)));
@@ -4242,6 +4248,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
     case IrCmd::SUBSTITUTE:
     case IrCmd::MARK_USED:
     case IrCmd::MARK_DEAD:
+    case IrCmd::MARK_TRY_READS:
         CODEGEN_ASSERT(!"Pseudo instructions should not be lowered");
         break;
     }

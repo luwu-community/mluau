@@ -109,10 +109,12 @@ void initFunctions(NativeContext& context)
     context.executeNEWOBJECT = executeNEWOBJECT;
     context.executeNEWCLASSMEMBER = executeNEWCLASSMEMBER;
     context.executeINITTRAITS = executeINITTRAITS;
-    context.executeGETPOSITIONAL = executeGETPOSITIONAL;
     context.executePRESIZETABLE = executePRESIZETABLE;
+    context.executeGETQUALIFIED = executeGETQUALIFIED;
+    context.executeGETPOSITIONAL = executeGETPOSITIONAL;
     context.executePUSH = executePUSH;
     context.executePOP = executePOP;
+    context.executeWRAPRESULT = executeWRAPRESULT;
     context.executeGETVARARGSMultRet = executeGETVARARGSMultRet;
     context.executeGETVARARGSConst = executeGETVARARGSConst;
     context.executeDUPCLOSURE = executeDUPCLOSURE;

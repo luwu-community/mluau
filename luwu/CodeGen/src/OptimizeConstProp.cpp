@@ -1550,6 +1550,7 @@ static void handleBuiltinEffects(ConstPropState& state, LuauBuiltinFunction bfid
     case LBF_RAWGET:
     case LBF_RAWEQUAL:
     case LBF_CLASS_ISINSTANCE:
+    case LBF_CLASS_OF:
     case LBF_TABLE_UNPACK:
     case LBF_VECTOR:
     case LBF_BIT32_COUNTLZ:
@@ -1626,12 +1627,11 @@ static void handleBuiltinEffects(ConstPropState& state, LuauBuiltinFunction bfid
     case LBF_STRING_STARTSWITH:
     case LBF_STRING_ENDSWITH:
     case LBF_STRING_CONTAINS:
-    case LBF_COLLECTIONS_PAIR:
-    case LBF_COLLECTIONS_TRIPLE:
-    case LBF_COLLECTIONS_QUAD:
-    case LBF_COLLECTIONS_OPTION_SOME:
-    case LBF_COLLECTIONS_RESULT_OK:
-    case LBF_COLLECTIONS_RESULT_ERR:
+    case LBF_OPTION_SOME:
+    case LBF_RESULT_OK:
+    case LBF_RESULT_ERR:
+    case LBF_BUNDLE_PACK:
+    case LBF_BUNDLE_UNPACK:
         break;
     case LBF_BUFFER_WRITEU8:
     case LBF_BUFFER_WRITEU16:
@@ -3556,6 +3556,7 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
     case IrCmd::SUBSTITUTE:
     case IrCmd::MARK_USED:
     case IrCmd::MARK_DEAD:
+    case IrCmd::MARK_TRY_READS:
     case IrCmd::ADJUST_STACK_TO_REG: // Changes stack top, but not the values
     case IrCmd::ADJUST_STACK_TO_TOP: // Changes stack top, but not the values
     case IrCmd::CHECK_FASTCALL_RES:  // Changes stack top, but not the values
@@ -3712,6 +3713,15 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
         // writes no registers and runs no Luau code, but reallocates the table's array and hash parts
         state.invalidateHeapTableData();
         state.invalidateTableArraySize();
+        break;
+    case IrCmd::FALLBACK_WRAPRESULT:
+        // writes the result, and its allocation can run the collector
+        state.invalidate(OP_B(inst));
+        state.invalidateHeapTableData();
+        break;
+    case IrCmd::FALLBACK_GETQUALIFIED:
+        // writes the function, and runs nothing
+        state.invalidate(OP_B(inst));
         break;
     case IrCmd::FALLBACK_NEWOBJECT:
         // Construction writes the instance (and, for a user __init, the frame it lays out above it),

@@ -714,3 +714,96 @@ fn test_arbitrary_precision() {
         "{\n  [\"$serde_json::private::Number\"] = \"124.4\",\n}"
     );
 }
+
+#[test]
+fn test_deserialize_value() -> Result<(), Box<dyn StdError>> {
+    let lua = Lua::new();
+    let json = r#"{"name": "John Smith", "age": 20, "pay": 12.5, "big": 9007199254740993, "neg": -3,
+        "tags": ["a", "b"], "empty": [], "nested": {"ok": true, "none": null}, "escaped": "line\nbreak é"}"#;
+
+    // the dev-dependency serde_json has `arbitrary_precision`, which reports numbers as one-key maps
+    let options = SerializeOptions::new().detect_serde_json_arbitrary_precision(true);
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    let streamed = lua.deserialize_value_with(&mut deserializer, options)?;
+    deserializer.end()?;
+    let through_value = lua.to_value_with(&serde_json::from_str::<serde_json::Value>(json)?, options)?;
+
+    lua.globals().set("streamed", streamed)?;
+    lua.globals().set("through_value", through_value)?;
+    lua.load(
+        r#"
+        local function same(a, b, path)
+            assert(type(a) == type(b), `{path}: {type(a)} vs {type(b)}`)
+            if type(a) ~= "table" then
+                assert(a == b, `{path}: {a} vs {b}`)
+                return
+            end
+            assert(getmetatable(a) == getmetatable(b), `{path}: metatables differ`)
+            for k, v in b do
+                same(a[k], v, `{path}.{k}`)
+            end
+            for k in a do
+                assert(b[k] ~= nil, `{path}.{k} is extra`)
+            end
+        end
+        same(streamed, through_value, "root")
+        assert(streamed.nested.none == none)
+        assert(streamed.escaped == "line\nbreak é")
+        assert(#streamed.tags == 2 and streamed.tags[2] == "b")
+        assert(next(streamed.empty) == nil and getmetatable(streamed.empty) ~= nil)
+    "#,
+    )
+    .call::<()>(())?;
+
+    let options = SerializeOptions::new()
+        .set_array_metatable(false)
+        .serialize_unit_to_null(false);
+    let mut deserializer = serde_json::Deserializer::from_str(r#"[null, []]"#);
+    let value = lua.deserialize_value_with(&mut deserializer, options)?;
+    lua.globals().set("value", value)?;
+    lua.load(r#"assert(value[1] == nil and getmetatable(value) == nil and getmetatable(value[2]) == nil)"#)
+        .call::<()>(())?;
+
+    Ok(())
+}
+
+#[test]
+fn test_deserialize_value_errors() -> Result<(), Box<dyn StdError>> {
+    let lua = Lua::new();
+
+    // a parse error after values were pushed comes back as an error and leaves the stack as it was
+    let mut deserializer = serde_json::Deserializer::from_str(r#"{"a": [1, 2, {"b": tru}]}"#);
+    match lua.deserialize_value(&mut deserializer) {
+        Err(Error::DeserializeError(message)) => assert!(message.contains("expected ident"), "{message}"),
+        other => panic!("expected a DeserializeError, got {other:?}"),
+    }
+
+    // a NaN key raises a Lua error inside the protected call
+    let nan_key = serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(vec![(f64::NAN, 1)].into_iter());
+    match lua.deserialize_value(nan_key) {
+        Err(Error::RuntimeError(message)) => assert!(message.contains("NaN"), "{message}"),
+        other => panic!("expected a RuntimeError, got {other:?}"),
+    }
+
+    // a panic in the deserializer passes through the protected call and leaves Lua usable
+    struct Panics;
+    impl<'de> serde::Deserializer<'de> for Panics {
+        type Error = serde::de::value::Error;
+        fn deserialize_any<V: serde::de::Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+            panic!("deserializer panicked")
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf option unit
+            unit_struct newtype_struct seq tuple tuple_struct map struct enum identifier ignored_any
+        }
+    }
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lua.deserialize_value(Panics)));
+    assert!(panicked.is_err());
+
+    // Lua still works and the stack is balanced (StackGuard panics otherwise)
+    let mut deserializer = serde_json::Deserializer::from_str(r#"[1, 2]"#);
+    let value = lua.deserialize_value(&mut deserializer)?;
+    assert_eq!(value.as_table().unwrap().raw_len(), 2);
+
+    Ok(())
+}

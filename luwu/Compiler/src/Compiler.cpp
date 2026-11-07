@@ -24,8 +24,8 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <unordered_map>
+#include <string_view>
 
 #include <math.h>
 
@@ -448,7 +448,7 @@ struct Compiler
 
             return getFunctionExpr(lv->init);
         }
-        else if (AstExprIndexName* expr = node->as<AstExprIndexName>())
+        else if (AstExprIndexName* expr = node->as<AstExprIndexName>(); expr && !expr->qualifiedTrait)
         {
             if (AstExpr* value = tryIndexConstantTable(expr))
                 return getFunctionExpr(value);
@@ -833,8 +833,8 @@ struct Compiler
         if (!expr)
             return node->is<AstExprVarargs>();
 
-        // Luwu try expressions: compiled to one value (compileTryResultMethod)
-        if (isTryResultMethodCall(expr))
+        // Luwu try expressions: compiled to one value (compileTryResultMethod, compileTryResultVariantTest)
+        if (isTryResultCall(expr))
             return false;
 
         // conservative version, optimized for compilation throughput
@@ -877,8 +877,8 @@ struct Compiler
     {
         if (AstExprCall* expr = node->as<AstExprCall>())
         {
-            // Luwu try expressions: compiled to one value (compileTryResultMethod)
-            if (isTryResultMethodCall(expr))
+            // Luwu try expressions: compiled to one value (compileTryResultMethod, compileTryResultVariantTest)
+            if (isTryResultCall(expr))
             {
                 compileExprTemp(node, target);
                 return false;
@@ -1743,7 +1743,7 @@ struct Compiler
             if (const AstClassProperty* prop = member.get_if<AstClassProperty>(); prop && prop->name == name)
                 return prop->visibility == AstClassMemberVisibility::Private;
 
-            if (const AstClassMethod* m = member.get_if<AstClassMethod>(); m && m->functionName == name)
+            if (const AstClassMethod* m = member.get_if<AstClassMethod>(); m && m->functionName == name && !m->qualifiedTrait)
                 return m->visibility == AstClassMemberVisibility::Private;
         }
 
@@ -2086,7 +2086,7 @@ struct Compiler
             if (AstExprTypeAssertion* t = expr->as<AstExprTypeAssertion>())
                 return isTableTyped(t->annotation);
 
-            if (AstExprIndexName* idx = expr->as<AstExprIndexName>())
+            if (AstExprIndexName* idx = expr->as<AstExprIndexName>(); idx && !idx->qualifiedTrait)
                 return isProvenSelf(idx->expr) && isTableTyped(self->findClassFieldType(cls, idx->index));
 
             if (AstExprLocal* le = expr->as<AstExprLocal>())
@@ -2099,7 +2099,7 @@ struct Compiler
         bool callsKnownMethod(AstExprCall* call) override
         {
             AstExprIndexName* idx = call->func->as<AstExprIndexName>();
-            return idx && isProvenSelf(idx->expr) && self->findInstanceMethod(cls, idx->index);
+            return idx && !idx->qualifiedTrait && isProvenSelf(idx->expr) && self->findInstanceMethod(cls, idx->index);
         }
 
         bool isPrivatelyConstructed(AstExprCall* call)
@@ -2737,7 +2737,7 @@ struct Compiler
         {
             if (const AstClassMethod* m = member.get_if<AstClassMethod>())
             {
-                if (m->functionName == name && classMethodOwner.contains(m->function))
+                if (m->functionName == name && classMethodOwner.contains(m->function) && !m->qualifiedTrait)
                     return m->function;
             }
         }
@@ -2826,7 +2826,7 @@ struct Compiler
 
             return {};
         }
-        else if (AstExprIndexName* idx = recv->as<AstExprIndexName>())
+        else if (AstExprIndexName* idx = recv->as<AstExprIndexName>(); idx && !idx->qualifiedTrait)
         {
             // a declared field type is an annotation, however well the base it was read from is known:
             // nothing checks what a field actually holds
@@ -2850,8 +2850,9 @@ struct Compiler
         if (!expr->self)
             return nullptr;
 
+        // Luwu Traits (rfcs/classes/traits.md): `obj:Trait:name()` reaches a member the class's body may not hold
         AstExprIndexName* idx = expr->func->as<AstExprIndexName>();
-        if (!idx)
+        if (!idx || idx->qualifiedTrait)
             return nullptr;
 
         ReceiverClass receiver = resolveReceiverClass(idx->expr);
@@ -3868,6 +3869,10 @@ struct Compiler
         if (!method || !importable || !isStringLibraryFunction(method->index))
             return nullptr;
 
+        // Luwu Traits (rfcs/classes/traits.md): `s:Trait:sub()` calls the trait's function, never the string library's
+        if (method->qualifiedTrait)
+            return nullptr;
+
         if (AstExprCall** cached = stringMethodCalls.find(expr))
             return *cached;
 
@@ -3996,6 +4001,78 @@ struct Compiler
         }
     }
 
+    // Luwu collections: the `.(key, value)` bundles an `OrderedMap(...)` call builds for its entries, passed as its
+    // arguments or as the items of a list literal. Empty when the call passes anything else.
+    std::vector<AstExprCall*> orderedMapEntryBundles(AstExprCall* expr)
+    {
+        if (!FFlag::DebugLuwuCollections || expr->self)
+            return {};
+
+        Builtin builtin = getBuiltin(expr->func, globals, variables);
+        if (!builtin.isMethod("collections", "OrderedMap"))
+            return {};
+
+        std::vector<AstExpr*> entries(expr->args.begin(), expr->args.end());
+        AstExprTable* list = expr->args.size == 1 ? expr->args.data[0]->as<AstExprTable>() : nullptr;
+        if (list)
+        {
+            entries.clear();
+            for (const AstExprTable::Item& item : list->items)
+            {
+                if (item.kind != AstExprTable::Item::Kind::List)
+                    return {};
+                entries.push_back(item.value);
+            }
+        }
+
+        std::vector<AstExprCall*> bundles;
+        for (AstExpr* entry : entries)
+        {
+            if (bundleConstructionSize(entry) != 2)
+                return {};
+            bundles.push_back(entry->as<AstExprCall>());
+        }
+        return bundles;
+    }
+
+    // Luwu collections: `OrderedMap(.(k, v), ...)` and `OrderedMap({ .(k, v), ... })` compile to `OrderedMap()` and a
+    // `set` call per entry, so neither the bundles nor the list are built
+    bool tryCompileOrderedMapFromBundles(AstExprCall* expr, uint8_t target)
+    {
+        if (options.optimizationLevel < 1)
+            return false;
+
+        std::vector<AstExprCall*> bundles = orderedMapEntryBundles(expr);
+        if (bundles.empty())
+            return false;
+
+        RegScope rs(this);
+        uint8_t map = allocReg(expr, 1u);
+        compileExprTemp(expr->func, map);
+        bytecode.emitABC(LOP_CALL, map, 1, 2);
+
+        BytecodeBuilder::StringRef setName = sref(AstName("set"));
+        int32_t setId = bytecode.addConstantString(setName);
+        if (setId < 0)
+            CompileError::raise(expr->location, "Exceeded constant limit; simplify the code to compile");
+
+        for (AstExprCall* bundle : bundles)
+        {
+            RegScope entryScope(this);
+            uint8_t regs = allocReg(bundle, 4u);
+            compileExprTempTop(bundle->args.data[0], uint8_t(regs + 2));
+            compileExprTempTop(bundle->args.data[1], uint8_t(regs + 3));
+
+            setDebugLine(bundle);
+            bytecode.emitABC(LOP_NAMECALL, regs, map, uint8_t(BytecodeBuilder::getStringHash(setName)));
+            bytecode.emitAux(setId);
+            bytecode.emitABC(LOP_CALL, regs, 4, 1);
+        }
+
+        bytecode.emitABC(LOP_MOVE, target, map, 0);
+        return true;
+    }
+
     void compileExprCall(AstExprCall* expr, uint8_t target, uint8_t targetCount, bool targetTop = false, bool multRet = false)
     {
         LUAU_ASSERT(targetCount < 255);
@@ -4021,6 +4098,18 @@ struct Compiler
 
             uint8_t value = targetCount > 0 ? target : allocReg(expr, 1u);
             compileTryResultMethod(expr, resultMethod, getLocalReg(resultLocal->local), value);
+            for (unsigned i = 1; i < targetCount; ++i)
+                bytecode.emitABC(LOP_LOADNIL, uint8_t(target + i), 0, 0);
+            return;
+        }
+
+        if (std::optional<bool> testsOk = tryResultVariantTest(expr, resultLocal); testsOk && tryResultLocals.contains(resultLocal->local))
+        {
+            LUAU_ASSERT(!multRet);
+            if (targetCount == 0)
+                return;
+
+            compileTryResultVariantTest(*testsOk, getLocalReg(resultLocal->local), target);
             for (unsigned i = 1; i < targetCount; ++i)
                 bytecode.emitABC(LOP_LOADNIL, uint8_t(target + i), 0, 0);
             return;
@@ -4063,6 +4152,9 @@ struct Compiler
             if (tryCompileNewObject(expr, target))
                 return;
         }
+
+        if (!expr->self && !multRet && targetCount == 1 && tryCompileOrderedMapFromBundles(expr, target))
+            return;
 
         // Luwu Classes (rfcs/classes): inline `obj:method()` calls whose receiver class is
         // statically known and whose body can be inlined here (see tryResolveMethodCall).
@@ -4123,16 +4215,7 @@ struct Compiler
             Builtin builtin = getBuiltin(expr->func, globals, variables);
             bool lastMult = expr->args.size > 0 && isExprMultRet(expr->args.data[expr->args.size - 1]);
 
-            if (builtin.nestedMethod.value)
-                bytecode.addDebugRemark(
-                    "builtin %s.%s.%s/%d%s",
-                    builtin.object.value,
-                    builtin.method.value,
-                    builtin.nestedMethod.value,
-                    int(expr->args.size),
-                    lastMult ? "+" : ""
-                );
-            else if (builtin.object.value)
+            if (builtin.object.value)
                 bytecode.addDebugRemark("builtin %s.%s/%d%s", builtin.object.value, builtin.method.value, int(expr->args.size), lastMult ? "+" : "");
             else if (builtin.method.value)
                 bytecode.addDebugRemark("builtin %s/%d%s", builtin.method.value, int(expr->args.size), lastMult ? "+" : "");
@@ -4210,6 +4293,13 @@ struct Compiler
             {
                 selfreg = uint8_t(reg);
             }
+            else if (fi->qualifiedTrait)
+            {
+                // Luwu Traits (rfcs/classes/traits.md): GETQUALIFIED reads the trait from `regs`, so the receiver goes
+                // where the call takes it
+                selfreg = uint8_t(regs + 1);
+                compileExprTempTop(fi->expr, selfreg);
+            }
             else
             {
                 // Note: to be able to compile very deeply nested self call chains (obj:method1():method2():...), we need to be able to do this in
@@ -4219,6 +4309,10 @@ struct Compiler
 
                 compileExprTempTop(fi->expr, selfreg);
             }
+
+            // Luwu Traits (rfcs/classes/traits.md): the trait of `obj:Trait:name(...)` goes in the function's register
+            if (fi->qualifiedTrait)
+                compileExprTemp(fi->qualifiedTrait, regs);
         }
         else if (bfid < 0)
         {
@@ -4240,9 +4334,27 @@ struct Compiler
             AstExprIndexName* fi = expr->func->as<AstExprIndexName>();
             LUAU_ASSERT(fi);
 
-            emitNamecall(fi, regs, selfreg);
+            if (fi->qualifiedTrait)
+            {
+                // Luwu Traits (rfcs/classes/traits.md): `obj:Trait:name(...)`; the trait is in `regs`
+                setDebugLine(fi->indexLocation);
 
-            hintTemporaryExprRegType(fi->expr, selfreg, LBC_TYPE_TABLE, /* instLength */ 2);
+                int32_t cid = bytecode.addConstantString(sref(fi->index));
+                if (cid < 0)
+                    CompileError::raise(fi->location, "Exceeded constant limit; simplify the code to compile");
+
+                bytecode.emitABC(LOP_GETQUALIFIED, regs, selfreg, regs);
+                bytecode.emitAux(cid);
+
+                if (selfreg != regs + 1)
+                    bytecode.emitABC(LOP_MOVE, uint8_t(regs + 1), selfreg, 0);
+            }
+            else
+            {
+                emitNamecall(fi, regs, selfreg);
+
+                hintTemporaryExprRegType(fi->expr, selfreg, LBC_TYPE_TABLE, /* instLength */ 2);
+            }
         }
         else if (bfid >= 0)
         {
@@ -4615,7 +4727,7 @@ struct Compiler
         {
             if (const AstClassProperty* prop = member.get_if<AstClassProperty>())
                 plan->fieldSlots[prop->name] = ownFields++;
-            else if (const AstClassMethod* method = member.get_if<AstClassMethod>())
+            else if (const AstClassMethod* method = member.get_if<AstClassMethod>(); method && !method->qualifiedTrait)
                 ownMethods.insert(method->functionName);
         }
 
@@ -5157,6 +5269,11 @@ struct Compiler
                     },
                     [&](const AstClassMethod& method)
                     {
+                        // Luwu Traits (rfcs/classes/traits.md): a qualified implementation isn't a member of the class; it
+                        // is registered with its trait below
+                        if (method.qualifiedTrait)
+                            return;
+
                         // Luwu Traits (rfcs/classes/traits.md): an expected function has a slot in the trait's shape, so
                         // the VM knows what implementing classes must define, but no value.
                         if (method.expectLocation)
@@ -5170,6 +5287,8 @@ struct Compiler
                                 flags |= LBC_CLASSMEMBER_PRIVATE;
                             if (method.isOptional)
                                 flags |= LBC_CLASSMEMBER_OPTIONAL;
+                            if (method.scopeLocation)
+                                flags |= LBC_CLASSMEMBER_SCOPED;
                             shape.methodFlags.emplace_back(flags);
                             return;
                         }
@@ -5197,6 +5316,8 @@ struct Compiler
                         bool takesSelf = method.function->args.size > 0 && method.function->args.data[0]->name == "self";
                         if (decl->isTrait && takesSelf)
                             flags |= LBC_CLASSMEMBER_TAKESSELF;
+                        if (method.scopeLocation)
+                            flags |= LBC_CLASSMEMBER_SCOPED;
                         shape.methodFlags.emplace_back(flags);
 
                         bytecode.emitABC(LOP_NEWCLASSMEMBER, dest, 0, temp);
@@ -5338,6 +5459,28 @@ struct Compiler
                 checkConstant(nameCid, copy.function->location);
 
                 bytecode.emitABC(LOP_NEWCLASSMEMBER, dest, LBC_NEWCLASSMEMBER_TRAITCOPY, copyRegs);
+                bytecode.emitAux(nameCid);
+            }
+        }
+
+        // Luwu Traits (rfcs/classes/traits.md): the class's qualified implementations, `function Json.name`, each with its trait
+        {
+            RegScope rsQualified(this);
+            uint8_t qualifiedRegs = allocReg(decl, 2u);
+
+            for (const AstClassMember& member : decl->members)
+            {
+                const AstClassMethod* method = member.get_if<AstClassMethod>();
+                if (!method || !method->qualifiedTrait)
+                    continue;
+
+                compileExprFunction(method->function, qualifiedRegs);
+                compileExprTemp(method->qualifiedTrait, uint8_t(qualifiedRegs + 1));
+
+                int nameCid = bytecode.addConstantString(sref(method->functionName));
+                checkConstant(nameCid, method->nameLocation);
+
+                bytecode.emitABC(LOP_NEWCLASSMEMBER, dest, LBC_NEWCLASSMEMBER_QUALIFIED, qualifiedRegs);
                 bytecode.emitAux(nameCid);
             }
         }
@@ -5593,7 +5736,7 @@ struct Compiler
             condition = group->expr;
 
         AstExprCall* isinstance = condition->as<AstExprCall>();
-        if (!isinstance || isinstance->args.size != 2)
+        if (!isinstance || isinstance->args.size != 2 || isTryResultCall(isinstance))
             return nullptr;
 
         auto isRereadable = [&](AstExpr* arg)
@@ -5649,6 +5792,25 @@ struct Compiler
         const int* bfid = builtins.find(call);
         if (!bfid || *bfid != LBF_CLASS_ISINSTANCE || call->args.size != 2)
             return false;
+
+        // Luwu try expressions: a result kept in registers is tested by its flag
+        AstExprLocal* resultLocal = nullptr;
+        if (std::optional<bool> testsOk = tryResultVariantTest(call, resultLocal); testsOk && tryResultLocals.contains(resultLocal->local))
+        {
+            uint8_t reg = getLocalReg(resultLocal->local);
+            uint8_t tested = uint8_t(reg + kTryResultOkFlag);
+            bool jumpIfTruthy = *testsOk == onlyTruth;
+            if (target)
+            {
+                compileTryResultVariantTest(*testsOk, reg, *target);
+                tested = *target;
+                jumpIfTruthy = onlyTruth;
+            }
+
+            skipJump.push_back(bytecode.emitLabel());
+            bytecode.emitAD(jumpIfTruthy ? LOP_JUMPIF : LOP_JUMPIFNOT, tested, 0);
+            return true;
+        }
 
         bool classIsKnown = isClassBoundAt(call->args.data[1]);
 
@@ -7181,7 +7343,7 @@ struct Compiler
     static constexpr uint8_t kTryResultOkFlag = LBC_TRYRESULT_OKFLAG;
 
     // Luwu try expressions: evaluates expr into reg in a protected range. An error raised there resumes at the handler,
-    // with the error in reg and where it was raised in the three registers after it. The result is a `collections.result`
+    // with the error in reg and where it was raised in the three registers after it. The result is an `Ok` or `Err`
     // object (see LOP_WRAPRESULT), or with `inRegisters` the flag in reg + kTryResultOkFlag.
     void compileTryRange(AstExprTry* expr, uint8_t reg, bool inRegisters)
     {
@@ -7238,7 +7400,7 @@ struct Compiler
         pushLocal(stat->vars.data[0], reg, allocpc);
     }
 
-    // The field of a `collections.result` a try result's register holds: value and error at 0, then module, line and
+    // The field of a result a try result's register holds: value and error at 0, then module, line and
     // traceback. -1 for a name that isn't a field.
     static int tryResultField(AstName name)
     {
@@ -7273,10 +7435,54 @@ struct Compiler
         return nullptr;
     }
 
-    bool isTryResultMethodCall(AstExprCall* call)
+    // Luwu try expressions: which result class `cls` names, when it certainly names one: true for `Ok`, false for `Err`.
+    // A result kept in registers has no object to test against a class, so this is where the compiler assumes `cls` is
+    // the builtin class. It only does where it folds builtins (optimization level 2), which assumes the same of `math`.
+    // `cls` resolves through aliases (getBuiltin), so `local Success = Ok` works. Renaming or moving `Ok` and `Err`
+    // changes the names here and in getBuiltinFunctionId (Builtins.cpp), and nothing else.
+    std::optional<bool> builtinResultVariant(AstExpr* cls)
+    {
+        if (!builtinsFold)
+            return std::nullopt;
+
+        Builtin builtin = getBuiltin(cls, globals, variables);
+        if (builtin.isGlobal("Ok"))
+            return true;
+        if (builtin.isGlobal("Err"))
+            return false;
+        return std::nullopt;
+    }
+
+    // Luwu try expressions: `class.isinstance(r, Ok)` or `class.isinstance(r, Err)`, which a result kept in registers
+    // answers from its flag. `is Ok.(value)` desugars to it. Gives whether it tests for Ok and sets `local` to r.
+    std::optional<bool> tryResultVariantTest(AstExprCall* call, AstExprLocal*& local)
+    {
+        const int* bfid = builtins.find(call);
+        if (!bfid || *bfid != LBF_CLASS_ISINSTANCE || call->args.size != 2)
+            return std::nullopt;
+
+        local = call->args.data[0]->as<AstExprLocal>();
+        if (!local || local->upvalue)
+            return std::nullopt;
+
+        return builtinResultVariant(call->args.data[1]);
+    }
+
+    // Luwu try expressions: a method call or a variant test that a result kept in registers answers itself
+    bool isTryResultCall(AstExprCall* call)
     {
         AstExprLocal* local = nullptr;
-        return tryResultMethodCall(call, local) && tryResultLocals.contains(local->local);
+        if (tryResultMethodCall(call, local) && tryResultLocals.contains(local->local))
+            return true;
+
+        return tryResultVariantTest(call, local) && tryResultLocals.contains(local->local);
+    }
+
+    // Luwu try expressions: the result of a variant test (tryResultVariantTest) into `target`. The flag is true for an
+    // ok, so testing for err negates it.
+    void compileTryResultVariantTest(bool testsOk, uint8_t reg, uint8_t target)
+    {
+        bytecode.emitABC(testsOk ? LOP_MOVE : LOP_NOT, target, uint8_t(reg + kTryResultOkFlag), 0);
     }
 
     // Luwu try expressions: a method of a try result kept in registers. `ok` and `err` are a RESULTGET. `expect` gives an
@@ -7324,13 +7530,49 @@ struct Compiler
         patchJump(call, doneJump, doneLabel);
     }
 
-    // Luwu try expressions: a field of a try result kept in registers. The other variant's fields don't exist on it, so
-    // reading one builds the real object and reads from that, which raises what reading the object would.
+    // Luwu try expressions: a field of a try result kept in registers
     void compileTryResultField(AstExprIndexName* expr, uint8_t reg, uint8_t target, bool targetTemp)
     {
-        bool okField = expr->index == "value";
         int field = tryResultField(expr->index);
         LUAU_ASSERT(field >= 0);
+
+        auto readObject = [&](uint8_t object)
+        {
+            BytecodeBuilder::StringRef name = sref(expr->index);
+            int32_t cid = bytecode.addConstantString(name);
+            if (cid < 0)
+                CompileError::raise(expr->location, "Exceeded constant limit; simplify the code to compile");
+            bytecode.emitABC(LOP_GETTABLEKS, target, object, uint8_t(BytecodeBuilder::getStringHash(name)));
+            bytecode.emitAux(cid);
+        };
+        compileTryResultRead(expr, field, /* okField= */ expr->index == "value", reg, target, targetTemp, readObject);
+    }
+
+    // Luwu try expressions: element `position` of a try result kept in registers, read by a positional pattern
+    // (`r is ok.(value)`). The first is an ok's value or an err's error, which share a register, so it needs no check. The
+    // rest are an err's module, line and traceback.
+    void compileTryResultPositional(AstExpr* expr, size_t position, uint8_t reg, uint8_t target)
+    {
+        LUAU_ASSERT(position < kTryResultRegisters - 1);
+        if (position == 0)
+        {
+            bytecode.emitABC(LOP_MOVE, target, reg, 0);
+            return;
+        }
+
+        auto readObject = [&](uint8_t object)
+        {
+            bytecode.emitABC(LOP_GETPOSITIONAL, target, object, uint8_t(position));
+        };
+        compileTryResultRead(expr, int(position), /* okField= */ false, reg, target, /* targetTemp= */ false, readObject);
+    }
+
+    // Luwu try expressions: register `field` of a try result kept in registers, which holds a field of the ok variant or
+    // of the err one. The other variant doesn't have it, so reading it there builds the real object and reads from that
+    // with `readObject`, which raises what reading the object would.
+    template<typename ReadObject>
+    void compileTryResultRead(AstExpr* expr, int field, bool okField, uint8_t reg, uint8_t target, bool targetTemp, ReadObject readObject)
+    {
         uint8_t okFlag = uint8_t(reg + kTryResultOkFlag);
 
         // The field is read before the check when target is a temporary, so the right variant takes one jump. A local's
@@ -7362,13 +7604,7 @@ struct Compiler
             for (unsigned i = 0; i < count; ++i)
                 bytecode.emitABC(LOP_MOVE, uint8_t(object + i), uint8_t(reg + i), 0);
             bytecode.emitABC(LOP_WRAPRESULT, object, okField ? LBC_WRAPRESULT_ERR : LBC_WRAPRESULT_OK, 0);
-
-            BytecodeBuilder::StringRef name = sref(expr->index);
-            int32_t cid = bytecode.addConstantString(name);
-            if (cid < 0)
-                CompileError::raise(expr->location, "Exceeded constant limit; simplify the code to compile");
-            bytecode.emitABC(LOP_GETTABLEKS, target, object, uint8_t(BytecodeBuilder::getStringHash(name)));
-            bytecode.emitAux(cid);
+            readObject(object);
         }
 
         size_t doneLabel = bytecode.emitLabel();
@@ -7712,6 +7948,22 @@ struct Compiler
         return options.optimizationLevel >= 1 && getGlobalState(globals, expr->name) == Global::Default;
     }
 
+    // Luwu Traits (rfcs/classes/traits.md): `Class:Trait.name`
+    void compileExprQualifiedIndex(AstExprIndexName* expr, uint8_t target)
+    {
+        RegScope rs(this);
+        uint8_t receiver = compileExprAuto(expr->expr, rs);
+        uint8_t trait = compileExprAuto(expr->qualifiedTrait, rs);
+
+        int32_t cid = bytecode.addConstantString(sref(expr->index));
+        if (cid < 0)
+            CompileError::raise(expr->location, "Exceeded constant limit; simplify the code to compile");
+
+        setDebugLine(expr->indexLocation);
+        bytecode.emitABC(LOP_GETQUALIFIED, target, receiver, trait);
+        bytecode.emitAux(cid);
+    }
+
     void compileExprIndexName(AstExprIndexName* expr, uint8_t target, bool targetTemp = false)
     {
         setDebugLine(expr); // normally compileExpr sets up line info, but compileExprIndexName can be called directly
@@ -7724,6 +7976,9 @@ struct Compiler
         if (AstExprLocal* local = expr->expr->as<AstExprLocal>(); local && tryResultLocals.contains(local->local))
             return compileTryResultField(expr, getLocalReg(local->local), target, targetTemp);
 
+        if (expr->qualifiedTrait)
+            return compileExprQualifiedIndex(expr, target);
+
         // Optimization: index chains that start from global variables can be compiled into GETIMPORT statement
         AstExprGlobal* importRoot = 0;
         AstExprIndexName* import1 = 0;
@@ -7731,7 +7986,8 @@ struct Compiler
 
         if (AstExprIndexName* index = expr->expr->as<AstExprIndexName>())
         {
-            importRoot = index->expr->as<AstExprGlobal>();
+            // Luwu Traits (rfcs/classes/traits.md): `(Class:Trait.name).x` is no import chain
+            importRoot = index->qualifiedTrait ? nullptr : index->expr->as<AstExprGlobal>();
             import1 = index;
             import2 = expr;
         }
@@ -7859,6 +8115,10 @@ struct Compiler
             // fewer elements than a function has registers
             LUAU_ASSERT(cv.type == Constant::Type_Number && cv.valueNumber >= 1 && cv.valueNumber <= 256);
             size_t position = size_t(cv.valueNumber) - 1;
+
+            // Luwu try expressions: an element of a try result kept in registers
+            if (AstExprLocal* local = expr->expr->as<AstExprLocal>(); local && tryResultLocals.contains(local->local))
+                return compileTryResultPositional(expr, position, getLocalReg(local->local), target);
 
             if (std::optional<ProvenPositionalField> proven = provenPositionalField(expr->expr, position))
             {
@@ -8207,6 +8467,11 @@ struct Compiler
         else if (AstExprInstantiate* expr = node->as<AstExprInstantiate>())
         {
             compileExpr(expr->expr, target, targetTemp);
+        }
+        // Luwu Traits (rfcs/classes/traits.md): `Self` in a trait method is its `class.of(self)` call
+        else if (AstExprSelfClass* expr = node->as<AstExprSelfClass>())
+        {
+            compileExpr(expr->classOf, target, targetTemp);
         }
         else if (AstExprTry* expr = node->as<AstExprTry>())
         {
@@ -9094,11 +9359,14 @@ struct Compiler
         return true;
     }
 
-    // Luwu collections: the position of the bundle element `name` (`first` to `fourth`) in a bundle of `size`, or -1
+    // Luwu bundles: the position of the bundle element `name` (`first` to `twelfth`) in a bundle of `size`, or -1
     static int bundleElementIndex(AstName name, unsigned size)
     {
-        static const char* const kElements[] = {"first", "second", "third", "fourth"};
-        for (unsigned i = 0; i < size; i++)
+        static const char* const kElements[] = {
+            "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth", "eleventh", "twelfth",
+        };
+        static constexpr unsigned kElementCount = sizeof(kElements) / sizeof(kElements[0]);
+        for (unsigned i = 0; i < size && i < kElementCount; i++)
         {
             if (name == kElements[i])
                 return int(i);
@@ -9158,7 +9426,7 @@ struct Compiler
         }
     }
 
-    // Luwu collections: `const .{ first, second } = collections.pair(a, b)` creates no object. The hidden local a
+    // Luwu bundles: `const .{ first, second } = bundle.Pair(a, b)` creates no object. The hidden local a
     // destructuring desugars to gets one register per element, and its field reads become those registers (see
     // compileExprIndexName). A `do` expression unfolds the same way when every `give` builds the same kind of bundle.
     // Like a fastcall, this assumes `collections` is the builtin library when the module never assigns it; anything the
@@ -9544,27 +9812,27 @@ struct Compiler
         loops.pop_back();
     }
 
-    // Luwu collections: the size of the bundle `expr` constructs, a `collections.pair`, `triple` or `quad` call with one
-    // argument per element, or 0 for anything else
+    // Luwu bundles: the most values a bundle holds (LUWU_BUNDLE_MAX in the VM)
+    static constexpr unsigned kMaxBundleValues = 12;
+
+    // Luwu bundles: the size of the bundle `expr` constructs, a `bundle.pack` call (which `.(a, b)` is) whose last argument
+    // isn't a multiret. 0 for anything else.
     unsigned bundleConstructionSize(AstExpr* expr)
     {
         AstExprCall* call = expr->as<AstExprCall>();
-        if (!FFlag::DebugLuwuCollections || !call || call->self)
+        if (!FFlag::DebugLuwuCollections || !call || call->self || call->args.size > kMaxBundleValues)
             return 0;
 
         Builtin builtin = getBuiltin(call->func, globals, variables);
-        unsigned size = 0;
-        if (builtin.isMethod("collections", "pair"))
-            size = 2;
-        else if (builtin.isMethod("collections", "triple"))
-            size = 3;
-        else if (builtin.isMethod("collections", "quad"))
-            size = 4;
+        if (!builtin.isMethod("bundle", "pack"))
+            return 0;
 
-        return call->args.size == size ? size : 0;
+        bool spreads = call->args.size > 0 && isExprMultRet(call->args.data[call->args.size - 1]);
+        return spreads ? 0 : unsigned(call->args.size);
     }
 
-    // Luwu collections: the largest table literal in a loop header (`for _, v in { a, b }`) that is unfolded
+    // Luwu collections: the most elements a loop header unfolds, from a table literal (`for _, v in { a, b }`) or a
+    // bundle's construction
     static constexpr size_t kMaxUnfoldedLoopItems = 4;
 
     // Luwu collections: the elements of the value a `for ... in` loop unfolds instead of building it (see
@@ -9579,7 +9847,8 @@ struct Compiler
     UnfoldedLoopValue unfoldedLoopValue(AstExpr* value)
     {
         UnfoldedLoopValue unfolded;
-        if (bundleConstructionSize(value) > 0)
+        unsigned bundleSize = bundleConstructionSize(value);
+        if (bundleSize > 0 && bundleSize <= kMaxUnfoldedLoopItems)
         {
             AstExprCall* call = value->as<AstExprCall>();
             unfolded.elements.assign(call->args.begin(), call->args.end());
@@ -9628,7 +9897,7 @@ struct Compiler
         return visitor.found;
     }
 
-    // Luwu collections: `for i, v in collections.pair(a, b)`, and `for i, v in { a, b }` with up to four plain items,
+    // Luwu collections: `for i, v in bundle.Pair(a, b)`, and `for i, v in { a, b }` with up to four plain items,
     // build no bundle or table. Each element goes into a register and the body is compiled once per element. Each copy
     // binds `v` to its element's register and `i` to its position, and a closure in one copy captures that copy's `v`.
     // A table literal's `nil` items are skipped the way iterating the table skips them. Like a fastcall, this assumes
@@ -10692,13 +10961,19 @@ struct Compiler
     };
 
     // Luwu try expressions: finds the locals holding a `try` result that are only ever read as `r.value`, `r.error`,
-    // `r.module`, `r.line` or `r.traceback`, or used as `r:ok()`, `r:err()` or `r:expect()` (tryResultMethodCall). Such a
-    // result needs no object: its registers hold all of it. Any other use
-    // of the local (passing it, a method call, writing through it, a closure capturing it) needs the object.
+    // `r.module`, `r.line` or `r.traceback`, used as `r:ok()`, `r:err()` or `r:expect()` (tryResultMethodCall), or tested
+    // with `class.isinstance(r, Ok)` (tryResultVariantTest). Such a result needs no object: its registers hold all of it.
+    // Any other use of the local (passing it, a method call, writing through it, a closure capturing it) needs the object.
     struct TryResultLocalsVisitor : AstVisitor
     {
+        Compiler& compiler;
         DenseHashSet<AstLocal*> candidates{nullptr};
         DenseHashSet<AstLocal*> escaped{nullptr};
+
+        explicit TryResultLocalsVisitor(Compiler& compiler)
+            : compiler(compiler)
+        {
+        }
 
         bool visit(AstStatLocal* node) override
         {
@@ -10719,7 +10994,11 @@ struct Compiler
 
         bool visit(AstExprCall* node) override
         {
+            // the class names a builtin, so it reads no local, and the tested local doesn't escape
             AstExprLocal* local = nullptr;
+            if (compiler.tryResultVariantTest(node, local))
+                return false;
+
             if (!tryResultMethodCall(node, local))
                 return true;
 
@@ -10733,6 +11012,17 @@ struct Compiler
         {
             escaped.insert(node->local);
             return false;
+        }
+
+        // Luwu try expressions: an element of a positional pattern, at most the four a result has (compileTryResultPositional)
+        bool visit(AstExprIndexExpr* node) override
+        {
+            AstExprLocal* local = node->expr->as<AstExprLocal>();
+            AstExprConstantNumber* position = node->index->as<AstExprConstantNumber>();
+            bool element = node->positional && local && !local->upvalue && position && position->value <= kTryResultRegisters - 1;
+
+            // the local itself isn't visited, so it doesn't count as escaping
+            return !element;
         }
 
         bool visit(AstStatAssign* node) override
@@ -11240,7 +11530,8 @@ struct Compiler
         {
             AstClassPrimaryConstructor* params = node->primaryConstructor;
             size_t functionDepth = node->name->functionDepth + 1;
-            AstLocal* self = buildSynthesizedLocal("self", node->location, functionDepth);
+            // `Self` in a default reads the parser's initSelf
+            AstLocal* self = node->initSelf ? node->initSelf : buildSynthesizedLocal("self", node->location, functionDepth);
             std::vector<AstStat*> body;
             DenseHashSet<AstName> restated{AstName()};
 
@@ -12112,20 +12403,6 @@ void compileOrThrow(BytecodeBuilder& bytecode, const ParseResult& parseResult, A
     if (FFlag::LuwuClasses)
         compiler.buildTraitFunctionCopies(root, classSynthesisAllocator, functions);
 
-    // Luwu try expressions: needs `variables`, from trackValues
-    if (FFlag::DebugLuwuTryExpressions && options.optimizationLevel >= 1)
-    {
-        Compiler::TryResultLocalsVisitor visitor;
-        root->visit(&visitor);
-        for (AstLocal* local : visitor.candidates)
-        {
-            const Variable* variable = compiler.variables.find(local);
-            bool written = variable && variable->written;
-            if (!written && !local->isExported && !visitor.escaped.contains(local))
-                compiler.tryResultLocals.insert(local);
-        }
-    }
-
     // this visitor tracks calls to getfenv/setfenv and disables some optimizations when they are found
     if (options.optimizationLevel >= 1 && (names.get("getfenv").value || names.get("setfenv").value))
     {
@@ -12159,6 +12436,20 @@ void compileOrThrow(BytecodeBuilder& bytecode, const ParseResult& parseResult, A
     {
         // this pass tracks which calls are builtins and can be compiled more efficiently
         analyzeBuiltins(compiler.builtins, compiler.globals, compiler.variables, options, root, names);
+
+        // Luwu try expressions: needs `variables` and `builtins`
+        if (FFlag::DebugLuwuTryExpressions)
+        {
+            Compiler::TryResultLocalsVisitor visitor(compiler);
+            root->visit(&visitor);
+            for (AstLocal* local : visitor.candidates)
+            {
+                const Variable* variable = compiler.variables.find(local);
+                bool written = variable && variable->written;
+                if (!written && !local->isExported && !visitor.escaped.contains(local))
+                    compiler.tryResultLocals.insert(local);
+            }
+        }
 
         // this pass determines which locals hold constant tables that are never mutated
         buildTableConstantMap(compiler.tableConstants, compiler.variables, root);

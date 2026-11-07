@@ -1935,6 +1935,8 @@ void TypeChecker2::visit(AstStatTypeAlias* stat)
         return;
 
     visit(stat->type);
+    if (stat->errorHint)
+        visit(stat->errorHint);
 }
 
 void TypeChecker2::visit(AstStatTypeFunction* stat)
@@ -2029,7 +2031,7 @@ static std::optional<Location> classMemberLocation(AstStatClass* stat, const Nam
     {
         if (const AstClassProperty* prop = member.get_if<AstClassProperty>(); prop && name == prop->name.value)
             return prop->nameLocation;
-        if (const AstClassMethod* method = member.get_if<AstClassMethod>(); method && name == method->functionName.value)
+        if (const AstClassMethod* method = member.get_if<AstClassMethod>(); method && name == method->functionName.value && !method->qualifiedTrait)
             return method->nameLocation;
     }
 
@@ -2714,7 +2716,7 @@ void TypeChecker2::checkTraitOverrides(AstStatClass* stat)
     {
         if (const AstClassProperty* prop = member.get_if<AstClassProperty>(); prop && !prop->expectLocation)
             declared.push_back({prop->name.value, prop->nameLocation, /* isField */ true});
-        else if (const AstClassMethod* method = member.get_if<AstClassMethod>(); method && !method->expectLocation)
+        else if (const AstClassMethod* method = member.get_if<AstClassMethod>(); method && !method->expectLocation && !method->qualifiedTrait)
             declared.push_back({method->functionName.value, method->nameLocation, /* isField */ false});
     }
 
@@ -3328,6 +3330,9 @@ void TypeChecker2::visit(AstExpr* expr, ValueContext context)
         return visit(e);
     else if (auto e = expr->as<AstExprInterpString>())
         return visit(e);
+    // Luwu Traits (rfcs/classes/traits.md): `Self` in a trait method is its `class.of(self)` call
+    else if (auto e = expr->as<AstExprSelfClass>())
+        return visit(e->classOf, context);
     else if (auto e = expr->as<AstExprTry>())
         return visit(e->expr, ValueContext::RValue);
     else if (auto e = expr->as<AstExprError>())
@@ -4724,6 +4729,23 @@ void TypeChecker2::visitExprName(
     checkConstPropertyAssignment(leftType, expr, propName, context, location);
 }
 
+// Luwu Traits (rfcs/classes/traits.md): the type of the function `name` scoped to the trait whose value has type
+// `traitValue` (`function Self.name`)
+static std::optional<TypeId> scopedFunctionOf(TypeId traitValue, const std::string& name)
+{
+    const ExternType* value = get<ExternType>(follow(traitValue));
+    const Obj* object = value && value->relation ? get_if<Obj>(&*value->relation) : nullptr;
+    const ExternType* trait = object ? get<ExternType>(follow(object->ty)) : nullptr;
+    if (!trait || !trait->traitInfo)
+        return std::nullopt;
+
+    auto scoped = trait->traitInfo->scopedFunctions.find(name);
+    if (scoped == trait->traitInfo->scopedFunctions.end())
+        return std::nullopt;
+
+    return scoped->second;
+}
+
 // Luwu: with class compat, the `class` library's definitions have both languages' names (EmbeddedBuiltinDefinitions), and
 // each module sees only its own: upstream's `classof` in a Luau module, Luwu's `of`, `name`, `fields` and `implements` in a
 // Luwu module.
@@ -4737,6 +4759,19 @@ static bool isOtherLanguagesClassMember(Language language, std::string_view memb
 
 void TypeChecker2::visit(AstExprIndexName* indexName, ValueContext context)
 {
+    // Luwu Traits (rfcs/classes/traits.md): `obj:Trait:name` reads `Trait.name`, or the trait's scoped function `name`, which
+    // the trait's value may not have
+    if (indexName->qualifiedTrait)
+    {
+        visit(indexName->expr, ValueContext::RValue);
+
+        if (scopedFunctionOf(lookupType(indexName->qualifiedTrait), indexName->index.value))
+            visit(indexName->qualifiedTrait, ValueContext::RValue);
+        else
+            visitExprName(indexName->qualifiedTrait, indexName->location, indexName->index.value, context, builtinTypes->stringType, '.');
+        return;
+    }
+
     AstExprGlobal* global = indexName->expr->as<AstExprGlobal>();
     bool otherLanguagesClassMember =
         global && global->name == "class" && luauClassCompat() && isOtherLanguagesClassMember(module->language, indexName->index.value);
@@ -5060,6 +5095,193 @@ void TypeChecker2::visit(AstExprTable* expr)
     }
 }
 
+// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): an instance of a generic class (`History<number>`) shares
+// its class's metatable, whose metamethods still mention the class's own generics, so they can't be checked against
+// the instance's type arguments.
+static bool hasUninstantiatedMetamethods(TypeId containerTy)
+{
+    const ExternType* externType = get<ExternType>(follow(containerTy));
+    return externType && (!externType->instantiatedTypeParams.empty() || !externType->instantiatedTypePackParams.empty());
+}
+
+// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): how push and pop errors name each operator
+struct PushPopOperator
+{
+    const char* op;
+    // what the operator does to the container: "push to" or "pop from"
+    const char* action;
+    const char* metamethod;
+};
+
+static const PushPopOperator kPush{"<+", "push to", "__push"};
+static const PushPopOperator kPop{"<-", "pop from", "__pop"};
+
+// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): the element type of a container `op` stores into or
+// removes from raw, which is an array. Reports why when the container isn't one, and returns nullopt.
+std::optional<TypeId> TypeChecker2::pushedOrPoppedElement(TypeId containerTy, const PushPopOperator& op, const Location& location)
+{
+    ErrorVec dummy;
+    TypeId tableTy = follow(containerTy);
+
+    if (const MetatableType* metatable = get<MetatableType>(tableTy))
+    {
+        if (findMetatableEntry(builtinTypes, dummy, containerTy, "__newindex", location))
+        {
+            reportError(
+                GenericError{format(
+                    "'%s' skips the '__newindex' metamethod of '%s'; give its metatable a '%s' to handle it",
+                    op.op,
+                    toString(containerTy).c_str(),
+                    op.metamethod
+                )},
+                location
+            );
+            return std::nullopt;
+        }
+
+        tableTy = follow(metatable->table);
+    }
+
+    if (const TableType* table = get<TableType>(tableTy))
+    {
+        if (std::optional<TypeId> element = rawArrayElement(*table, builtinTypes))
+            return element;
+
+        reportError(
+            GenericError{format(
+                "'%s' isn't an array; '%s' only works on arrays and on values with a '%s' metamethod",
+                toString(containerTy).c_str(),
+                op.op,
+                op.metamethod
+            )},
+            location
+        );
+        return std::nullopt;
+    }
+
+    // a union, an intersection or a generic could be anything; its uses say more than this one does
+    bool structureUnknown = get<UnionType>(tableTy) || get<IntersectionType>(tableTy) || get<GenericType>(tableTy);
+    if (structureUnknown && !isOptional(containerTy))
+        return std::nullopt;
+
+    if (isOptional(containerTy))
+        reportError(OptionalValueAccess{containerTy}, location);
+    else if (get<ExternType>(tableTy))
+        reportError(GenericError{format("'%s' has no '%s' metamethod for '%s' to call", toString(containerTy).c_str(), op.metamethod, op.op)}, location);
+    else
+        reportError(
+            GenericError{format("Expected '%s' to %s a container, got '%s' instead", op.op, op.action, toString(containerTy).c_str())}, location
+        );
+
+    return std::nullopt;
+}
+
+// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): a container with `__push` takes every value in one call,
+// and an array takes values of its element type. nil pushes nothing, so `T?` fits `{T}`.
+void TypeChecker2::visit(AstStatPush* stat)
+{
+    visit(stat->target, ValueContext::RValue);
+    for (AstExpr* value : stat->values)
+        visit(value, ValueContext::RValue);
+
+    TypeId containerTy = lookupType(stat->target);
+    if (isErrorSuppressing(stat->target->location, containerTy))
+        return;
+
+    // the values in order, with the expression each came from; a call or `...` last contributes its whole pack
+    struct PushedValue
+    {
+        TypeId type;
+        Location location;
+        AstExpr* expr = nullptr;
+    };
+    std::vector<PushedValue> values;
+    std::optional<TypePackId> tail;
+    for (size_t i = 0; i < stat->values.size; ++i)
+    {
+        AstExpr* value = stat->values.data[i];
+        bool multRet = i + 1 == stat->values.size && (value->is<AstExprCall>() || value->is<AstExprVarargs>());
+        if (!multRet)
+        {
+            values.push_back({lookupType(value), value->location, value});
+            continue;
+        }
+
+        auto [head, packTail] = flatten(lookupPack(value));
+        for (TypeId ty : head)
+            values.push_back({ty, value->location});
+        tail = packTail;
+    }
+
+    ErrorVec dummy;
+    if (std::optional<TypeId> pushFn = findMetatableEntry(builtinTypes, dummy, containerTy, kPush.metamethod, stat->location))
+    {
+        if (hasUninstantiatedMetamethods(containerTy))
+            return;
+
+        std::vector<TypeId> args{containerTy};
+        for (const PushedValue& value : values)
+            args.push_back(value.type);
+
+        TypePackId argsPack = module->internalTypes->addTypePack(TypePack{std::move(args), tail});
+        TypeId expectedFunction = module->internalTypes->addType(FunctionType{argsPack, builtinTypes->anyTypePack});
+        testIsSubtype(*pushFn, expectedFunction, stat->location);
+        return;
+    }
+
+    std::optional<TypeId> element = pushedOrPoppedElement(containerTy, kPush, stat->target->location);
+    if (!element)
+        return;
+
+    // nil pushes nothing, so only the rest of each value's type has to fit
+    auto checkValue = [&](TypeId ty, const Location& location, AstExpr* expr)
+    {
+        if (isNil(follow(ty)))
+            return;
+
+        // A table literal is checked the way an annotated local's value is, so it may leave out optional fields
+        if (expr && expr->is<AstExprTable>())
+        {
+            testPotentialLiteralIsSubtype(expr, *element);
+            return;
+        }
+
+        testIsSubtype(stripNil(builtinTypes, *module->internalTypes, ty), *element, location);
+    };
+
+    for (const PushedValue& value : values)
+        checkValue(value.type, value.location, value.expr);
+
+    if (tail)
+    {
+        if (const VariadicTypePack* variadic = get<VariadicTypePack>(follow(*tail)))
+            checkValue(variadic->ty, stat->values.data[stat->values.size - 1]->location, nullptr);
+    }
+}
+
+// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): see popTypeFunction for the result's type
+void TypeChecker2::visit(AstExprPop* expr)
+{
+    visit(expr->expr, ValueContext::RValue);
+
+    TypeId containerTy = lookupType(expr->expr);
+    if (isErrorSuppressing(expr->expr->location, containerTy))
+        return;
+
+    ErrorVec dummy;
+    if (std::optional<TypeId> popFn = findMetatableEntry(builtinTypes, dummy, containerTy, kPop.metamethod, expr->location))
+    {
+        if (hasUninstantiatedMetamethods(containerTy))
+            return;
+
+        TypePackId argsPack = module->internalTypes->addTypePack({containerTy});
+        TypeId expectedFunction = module->internalTypes->addType(FunctionType{argsPack, builtinTypes->anyTypePack});
+        testIsSubtype(*popFn, expectedFunction, expr->location);
+        return;
+    }
+
+    pushedOrPoppedElement(containerTy, kPop, expr->expr->location);
+}
 
 TypePackId TypeChecker2::returnedPack(AstStatReturn* ret)
 {
@@ -5369,194 +5591,6 @@ void TypeChecker2::reportReturnedStringTypos(const std::vector<AstStatReturn*>& 
     }
 }
 
-// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): an instance of a generic class (`History<number>`) shares
-// its class's metatable, whose metamethods still mention the class's own generics, so they can't be checked against
-// the instance's type arguments.
-static bool hasUninstantiatedMetamethods(TypeId containerTy)
-{
-    const ExternType* externType = get<ExternType>(follow(containerTy));
-    return externType && (!externType->instantiatedTypeParams.empty() || !externType->instantiatedTypePackParams.empty());
-}
-
-// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): how push and pop errors name each operator
-struct PushPopOperator
-{
-    const char* op;
-    // what the operator does to the container: "push to" or "pop from"
-    const char* action;
-    const char* metamethod;
-};
-
-static const PushPopOperator kPush{"<+", "push to", "__push"};
-static const PushPopOperator kPop{"<-", "pop from", "__pop"};
-
-// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): the element type of a container `op` stores into or
-// removes from raw, which is an array. Reports why when the container isn't one, and returns nullopt.
-std::optional<TypeId> TypeChecker2::pushedOrPoppedElement(TypeId containerTy, const PushPopOperator& op, const Location& location)
-{
-    ErrorVec dummy;
-    TypeId tableTy = follow(containerTy);
-
-    if (const MetatableType* metatable = get<MetatableType>(tableTy))
-    {
-        if (findMetatableEntry(builtinTypes, dummy, containerTy, "__newindex", location))
-        {
-            reportError(
-                GenericError{format(
-                    "'%s' skips the '__newindex' metamethod of '%s'; give its metatable a '%s' to handle it",
-                    op.op,
-                    toString(containerTy).c_str(),
-                    op.metamethod
-                )},
-                location
-            );
-            return std::nullopt;
-        }
-
-        tableTy = follow(metatable->table);
-    }
-
-    if (const TableType* table = get<TableType>(tableTy))
-    {
-        if (std::optional<TypeId> element = rawArrayElement(*table, builtinTypes))
-            return element;
-
-        reportError(
-            GenericError{format(
-                "'%s' isn't an array; '%s' only works on arrays and on values with a '%s' metamethod",
-                toString(containerTy).c_str(),
-                op.op,
-                op.metamethod
-            )},
-            location
-        );
-        return std::nullopt;
-    }
-
-    // a union, an intersection or a generic could be anything; its uses say more than this one does
-    bool structureUnknown = get<UnionType>(tableTy) || get<IntersectionType>(tableTy) || get<GenericType>(tableTy);
-    if (structureUnknown && !isOptional(containerTy))
-        return std::nullopt;
-
-    if (isOptional(containerTy))
-        reportError(OptionalValueAccess{containerTy}, location);
-    else if (get<ExternType>(tableTy))
-        reportError(GenericError{format("'%s' has no '%s' metamethod for '%s' to call", toString(containerTy).c_str(), op.metamethod, op.op)}, location);
-    else
-        reportError(
-            GenericError{format("Expected '%s' to %s a container, got '%s' instead", op.op, op.action, toString(containerTy).c_str())}, location
-        );
-
-    return std::nullopt;
-}
-
-// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): a container with `__push` takes every value in one call,
-// and an array takes values of its element type. nil pushes nothing, so `T?` fits `{T}`.
-void TypeChecker2::visit(AstStatPush* stat)
-{
-    visit(stat->target, ValueContext::RValue);
-    for (AstExpr* value : stat->values)
-        visit(value, ValueContext::RValue);
-
-    TypeId containerTy = lookupType(stat->target);
-    if (isErrorSuppressing(stat->target->location, containerTy))
-        return;
-
-    // the values in order, with the expression each came from; a call or `...` last contributes its whole pack
-    struct PushedValue
-    {
-        TypeId type;
-        Location location;
-        AstExpr* expr = nullptr;
-    };
-    std::vector<PushedValue> values;
-    std::optional<TypePackId> tail;
-    for (size_t i = 0; i < stat->values.size; ++i)
-    {
-        AstExpr* value = stat->values.data[i];
-        bool multRet = i + 1 == stat->values.size && (value->is<AstExprCall>() || value->is<AstExprVarargs>());
-        if (!multRet)
-        {
-            values.push_back({lookupType(value), value->location, value});
-            continue;
-        }
-
-        auto [head, packTail] = flatten(lookupPack(value));
-        for (TypeId ty : head)
-            values.push_back({ty, value->location});
-        tail = packTail;
-    }
-
-    ErrorVec dummy;
-    if (std::optional<TypeId> pushFn = findMetatableEntry(builtinTypes, dummy, containerTy, kPush.metamethod, stat->location))
-    {
-        if (hasUninstantiatedMetamethods(containerTy))
-            return;
-
-        std::vector<TypeId> args{containerTy};
-        for (const PushedValue& value : values)
-            args.push_back(value.type);
-
-        TypePackId argsPack = module->internalTypes->addTypePack(TypePack{std::move(args), tail});
-        TypeId expectedFunction = module->internalTypes->addType(FunctionType{argsPack, builtinTypes->anyTypePack});
-        testIsSubtype(*pushFn, expectedFunction, stat->location);
-        return;
-    }
-
-    std::optional<TypeId> element = pushedOrPoppedElement(containerTy, kPush, stat->target->location);
-    if (!element)
-        return;
-
-    // nil pushes nothing, so only the rest of each value's type has to fit
-    auto checkValue = [&](TypeId ty, const Location& location, AstExpr* expr)
-    {
-        if (isNil(follow(ty)))
-            return;
-
-        // A table literal is checked the way an annotated local's value is, so it may leave out optional fields
-        if (expr && expr->is<AstExprTable>())
-        {
-            testPotentialLiteralIsSubtype(expr, *element);
-            return;
-        }
-
-        testIsSubtype(stripNil(builtinTypes, *module->internalTypes, ty), *element, location);
-    };
-
-    for (const PushedValue& value : values)
-        checkValue(value.type, value.location, value.expr);
-
-    if (tail)
-    {
-        if (const VariadicTypePack* variadic = get<VariadicTypePack>(follow(*tail)))
-            checkValue(variadic->ty, stat->values.data[stat->values.size - 1]->location, nullptr);
-    }
-}
-
-// Luwu Push and Pop Operators (rfcs/push-pop-operators.md): see popTypeFunction for the result's type
-void TypeChecker2::visit(AstExprPop* expr)
-{
-    visit(expr->expr, ValueContext::RValue);
-
-    TypeId containerTy = lookupType(expr->expr);
-    if (isErrorSuppressing(expr->expr->location, containerTy))
-        return;
-
-    ErrorVec dummy;
-    if (std::optional<TypeId> popFn = findMetatableEntry(builtinTypes, dummy, containerTy, kPop.metamethod, expr->location))
-    {
-        if (hasUninstantiatedMetamethods(containerTy))
-            return;
-
-        TypePackId argsPack = module->internalTypes->addTypePack({containerTy});
-        TypeId expectedFunction = module->internalTypes->addType(FunctionType{argsPack, builtinTypes->anyTypePack});
-        testIsSubtype(*popFn, expectedFunction, expr->location);
-        return;
-    }
-
-    pushedOrPoppedElement(containerTy, kPop, expr->expr->location);
-}
-
 void TypeChecker2::visit(AstExprUnary* expr)
 {
     std::optional<InConditionalContext> inContext;
@@ -5856,18 +5890,26 @@ TypeId TypeChecker2::visit(AstExprBinary* expr, AstNode* overrideKey)
     }
     if (auto it = kBinaryOpMetamethods.find(expr->op); it != kBinaryOpMetamethods.end())
     {
-        std::optional<TypeId> leftMt = getMetatable(leftType, builtinTypes);
-        std::optional<TypeId> rightMt = getMetatable(rightType, builtinTypes);
+        // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): each instantiation of a generic class holds a copy of
+        // its template's metatable, so `.(1, 2) < .(1, 3)` compares the template's
+        auto metatableOf = [builtinTypes = this->builtinTypes](TypeId ty)
+        {
+            const ExternType* externType = get<ExternType>(follow(ty));
+            return getMetatable(externType && externType->genericTemplate ? *externType->genericTemplate : ty, builtinTypes);
+        };
+
+        std::optional<TypeId> leftMt = metatableOf(leftType);
+        std::optional<TypeId> rightMt = metatableOf(rightType);
         bool matches = leftMt == rightMt;
 
 
         if (isEquality && !matches)
         {
-            auto testUnion = [&matches, builtinTypes = this->builtinTypes](const UnionType* utv, std::optional<TypeId> otherMt)
+            auto testUnion = [&matches, &metatableOf](const UnionType* utv, std::optional<TypeId> otherMt)
             {
                 for (TypeId option : utv)
                 {
-                    if (getMetatable(follow(option), builtinTypes) == otherMt)
+                    if (metatableOf(option) == otherMt)
                     {
                         matches = true;
                         break;
@@ -8862,7 +8904,8 @@ bool TypeChecker2::checkIndexTypeFromType(
     return false;
 }
 
-// Luwu collections: the table of methods `none` has while the library exists (`get` and `expect`, from makeNoneMetatable)
+// Luwu try expressions: the table of methods `none` has while the result library exists (`get` and `expect`, from
+// makeNoneMetatable)
 static std::optional<TypeId> noneMethods(TypeId ty)
 {
     const PrimitiveType* none = get<PrimitiveType>(ty);
@@ -8879,6 +8922,7 @@ static std::optional<TypeId> noneMethods(TypeId ty)
 
     return follow(*index->second.readTy);
 }
+
 
 PropertyType TypeChecker2::hasIndexTypeFromType(
     TypeId ty,

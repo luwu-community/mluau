@@ -308,7 +308,12 @@ AstExprIndexName::AstExprIndexName(
 void AstExprIndexName::visit(AstVisitor* visitor)
 {
     if (visitor->visit(this))
+    {
         expr->visit(visitor);
+
+        if (qualifiedTrait)
+            qualifiedTrait->visit(visitor);
+    }
 }
 
 AstExprIndexExpr::AstExprIndexExpr(const Location& location, AstExpr* expr, AstExpr* index)
@@ -782,6 +787,18 @@ void AstExprInterpString::visit(AstVisitor* visitor)
         for (AstExpr* expr : expressions)
             expr->visit(visitor);
     }
+}
+
+AstExprSelfClass::AstExprSelfClass(const Location& location, AstExprCall* classOf)
+    : AstExpr(ClassIndex(), location)
+    , classOf(classOf)
+{
+}
+
+void AstExprSelfClass::visit(AstVisitor* visitor)
+{
+    if (visitor->visit(this))
+        classOf->visit(visitor);
 }
 
 AstExprTry::AstExprTry(const Location& location, const Location& tryLocation, AstExpr* expr)
@@ -1277,6 +1294,9 @@ void AstStatTypeAlias::visit(AstVisitor* visitor)
         }
 
         type->visit(visitor);
+
+        if (errorHint)
+            errorHint->visit(visitor);
     }
 }
 
@@ -1447,6 +1467,9 @@ void AstStatClass::visit(AstVisitor* visitor)
                     },
                     [&](const AstClassMethod& method)
                     {
+                        if (method.qualifiedTrait)
+                            method.qualifiedTrait->visit(visitor);
+
                         method.function->visit(visitor);
                     }
                 },

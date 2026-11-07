@@ -301,6 +301,8 @@ public:
             return pushTable(*value.table);
         case LuwonValue::Kind::Object:
             return pushObject(value);
+        case LuwonValue::Kind::Bundle:
+            return pushBundle(value);
         }
 
         LUAU_UNREACHABLE();
@@ -575,6 +577,21 @@ private:
         }
 
         return callProtected(L, 2, 1, error);
+    }
+
+    bool pushBundle(const LuwonValue& bundle)
+    {
+        if (!lua_checkstack(L, int(bundle.args.size())))
+            return fail("stack overflow");
+
+        for (const LuwonValue& value : bundle.args)
+        {
+            if (!push(value))
+                return false;
+        }
+
+        lua_packbundle(L, int(bundle.args.size()));
+        return true;
     }
 };
 
@@ -957,12 +974,41 @@ private:
     // other one a data file may construct from what its `__todata` returns or else from its fields.
     bool convertObject(int idx, LuwonValue& out, const std::string& path)
     {
+        if (std::optional<bool> converted = convertBundle(idx, out, path))
+            return *converted;
         if (std::optional<bool> converted = convertBuiltinObject(idx, out, path))
             return *converted;
         if (std::optional<bool> converted = convertTagged(idx, out, path))
             return *converted;
 
         return convertByFields(idx, out, path);
+    }
+
+    // A bundle as `.(...)`. Returns nullopt for any other object.
+    std::optional<bool> convertBundle(int idx, LuwonValue& out, const std::string& path)
+    {
+        int top = lua_gettop(L);
+        int size = lua_unpackbundle(L, idx);
+        if (size < 0)
+            return std::nullopt;
+
+        out = LuwonValue{LuwonValue::Kind::Bundle};
+        depth++;
+        for (int i = 1; i <= size; i++)
+        {
+            LuwonValue value;
+            if (!convert(top + i, value, format("%s.(value %d)", path.c_str(), i)))
+            {
+                depth--;
+                lua_settop(L, top);
+                return false;
+            }
+            out.args.push_back(std::move(value));
+        }
+        depth--;
+
+        lua_settop(L, top);
+        return true;
     }
 
     // The object at `idx` as a call to `name` with the values its `__todata`, on top of the stack, returns for it.

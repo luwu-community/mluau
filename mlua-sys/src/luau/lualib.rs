@@ -19,6 +19,8 @@ pub const LUA_INTLIBNAME: *const c_char = cstr!("integer");
 pub const LUA_CLASSLIBNAME: *const c_char = cstr!("class");
 #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
 pub const LUA_COLLECTIONSLIBNAME: *const c_char = cstr!("collections");
+#[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+pub const LUA_BUNDLELIBNAME: *const c_char = cstr!("bundle");
 #[cfg(feature = "luwu-classes")]
 pub const LUA_LUWONLIBNAME: *const c_char = cstr!("luwon");
 
@@ -39,6 +41,12 @@ unsafe extern "C-unwind" {
     pub fn luaopen_class(L: *mut lua_State) -> c_int;
     #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
     pub fn luaopen_collections(L: *mut lua_State) -> c_int;
+    // Luwu bundles: `bundle.pack`, `bundle.unpack` and `bundle.concat`, which `.(a, b)` calls
+    #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+    pub fn luaopen_bundle(L: *mut lua_State) -> c_int;
+    // Luwu try expressions: the `Ok`, `Err`, `Some` and `None` globals
+    #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+    pub fn luaopen_result(L: *mut lua_State) -> c_int;
     // Luwu object notation: lives in luwu's Config library, next to the parser it reads `.luwon` text with
     #[cfg(feature = "luwu-classes")]
     pub fn luaopen_luwon(L: *mut lua_State) -> c_int;

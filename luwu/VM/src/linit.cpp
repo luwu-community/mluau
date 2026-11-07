@@ -9,6 +9,7 @@ LUAU_FASTFLAG(LuauIntegerLibrary)
 LUAU_FASTFLAG(LuwuClasses)
 LUAU_FASTFLAG(DebugLuwuCollections)
 LUAU_FASTFLAG(LuwuNonePrimitive)
+LUAU_FASTFLAG(DebugLuwuTryExpressions)
 
 static const luaL_Reg lualibs[] = {
     {"", luaopen_base},
@@ -63,12 +64,23 @@ void luaL_openlibs(lua_State* L)
         lua_call(L, 1, 0);
     }
 
-    // Luwu collections: builtin classes, so it needs classes on, and `none`, which is the empty option
-    if (FFlag::LuwuClasses && FFlag::DebugLuwuCollections && FFlag::LuwuNonePrimitive)
+    // Luwu collections and bundles: builtin classes, so they need classes on
+    if (FFlag::LuwuClasses && FFlag::DebugLuwuCollections)
     {
         lua_pushcfunction(L, luaopen_collections, NULL);
         lua_pushstring(L, LUA_COLLECTIONSLIBNAME);
         lua_call(L, 1, 0);
+
+        lua_pushcfunction(L, luaopen_bundle, NULL);
+        lua_pushstring(L, LUA_BUNDLELIBNAME);
+        lua_call(L, 1, 0);
+    }
+
+    // Luwu try expressions: options and results are builtin classes, and `none` is the empty option
+    if (FFlag::LuwuClasses && FFlag::LuwuNonePrimitive && FFlag::DebugLuwuTryExpressions)
+    {
+        lua_pushcfunction(L, luaopen_result, NULL);
+        lua_call(L, 0, 0);
     }
 }
 

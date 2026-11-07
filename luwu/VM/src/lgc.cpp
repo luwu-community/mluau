@@ -493,6 +493,10 @@ static void traverseclass(global_State* g, LuauClass* classdef)
         markobject(g, classdef->traitdefaults);
     if (classdef->compiledtraitcopies)
         markobject(g, classdef->compiledtraitcopies);
+    if (classdef->qualified)
+        markobject(g, classdef->qualified);
+    if (classdef->reflection)
+        markobject(g, classdef->reflection);
 }
 
 static void traverseobject(global_State* g, LuauObject* object)
@@ -501,7 +505,7 @@ static void traverseobject(global_State* g, LuauObject* object)
     for (uint32_t i = 0; i < object->numberofmembers; i++)
         markvalue(g, &luaR_members(object)[i]);
 
-    // Luwu collections: a `vec`'s or `vecdeque`'s entries, in one or two runs of the ring
+    // Luwu collections: a `Vec`'s or `VecDeque`'s entries, in one or two runs of the ring
     if (LuauStorage* storage = luaR_storage(object))
     {
         if (storage->elementclass)

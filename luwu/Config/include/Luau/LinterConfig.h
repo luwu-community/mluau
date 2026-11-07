@@ -98,26 +98,27 @@ struct LintWarning
         Code_DuplicateKey = 63,            // Luwu: a key or index repeated in a table literal (part of TableLiteral)
         Code_DuplicateProperty = 64,       // Luwu: a property declared twice in a table type (part of TableLiteral)
         Code_DuplicateReadWrite = 65,      // Luwu: a table type property given its read or write type twice (part of TableLiteral)
-        Code_ReturnSelf = 66,              // Luwu Traits: a trait method returning `self` typed as the trait, not `Self`
-        Code_ReturnOnNextLine = 67,        // Luwu: a `return` in a `do` expression whose value starts on the next line
-        Code_OrContinue = 68,              // Luwu: `x or continue`, which reads a binding named `continue`
-        Code_KeywordShadow = 69,           // Luwu: a binding named after a contextual keyword (`class`, `continue`, ...)
-        Code_BuiltinShadow = 70,           // Luwu: a binding that hides a builtin global (`type`, `typeof`, `table`, ...)
-        Code_BindingSwallowsCondition = 71, // Luwu: `if local x = f() and x > 1`, where the `and` is part of the bound value
-        Code_Style = 72,                   // Luwu: the group of layout lints; turning it off turns off all of its parts
+        Code_ExtraArguments = 66,          // Luwu: a call to a written function passing more arguments than it takes
+        Code_ReturnSelf = 67,              // Luwu Traits: a trait method returning `self` typed as the trait, not `Self`
+        Code_ReturnOnNextLine = 68,        // Luwu: a `return` in a `do` expression whose value starts on the next line
+        Code_OrContinue = 69,              // Luwu: `x or continue`, which reads a binding named `continue`
+        Code_KeywordShadow = 70,           // Luwu: a binding named after a contextual keyword (`class`, `continue`, ...)
+        Code_BuiltinShadow = 71,           // Luwu: a binding that hides a builtin global (`type`, `typeof`, `table`, ...)
+        Code_BindingSwallowsCondition = 72, // Luwu: `if local x = f() and x > 1`, where the `and` is part of the bound value
+        Code_Style = 73,                   // Luwu: the group of layout lints; turning it off turns off all of its parts
         // Luwu: parts of Style that can be turned off on their own (ConstLocal, SameLineStatement and MultiLineStatement too)
-        Code_OneLineStatement = 73,        // `if x then y end`, `while c do f() end`, `function f() return 1 end` on one line
-        Code_OneLineGuard = 74,            // `if not x then return end` on one line, in a Luau file
-        Code_InlineOrLeave = 75,           // `x or return` ending a line much longer than the lines around it
-        Code_LuaGuard = 76,                // `if not x then return end` on one line, in a Luwu file, which can write `x or return`
-        Code_OrReturnComma = 77,           // Luwu: `f(x or return a, b)`, where `b` is the next argument, not a second return value
-        Code_MisleadingIndentation = 78,   // Luwu: a `do` expression's block reaching lines indented like the code after it
+        Code_OneLineStatement = 74,        // `if x then y end`, `while c do f() end`, `function f() return 1 end` on one line
+        Code_OneLineGuard = 75,            // `if not x then return end` on one line, in a Luau file
+        Code_InlineOrLeave = 76,           // `x or return` ending a line much longer than the lines around it
+        Code_LuaGuard = 77,                // `if not x then return end` on one line, in a Luwu file, which can write `x or return`
+        Code_OrReturnComma = 78,           // Luwu: `f(x or return a, b)`, where `b` is the next argument, not a second return value
+        Code_MisleadingIndentation = 79,   // Luwu: a `do` expression's block reaching lines indented like the code after it
+        Code_AmbiguousContinuation = 80,   // Luwu: a line starting with `-` or a string that continues the expression above it
+        Code_UnflippedGuard = 81,          // Luwu: `x == nil or return` followed by code using `x`, which is always nil there
 
-        Code_LuaStringHelper = 79,         // Luwu: `s:sub(1, #p) == p` and the like, which `s:startswith(p)` and friends do
-        Code_StringOperations = 80,        // Luwu: a string library call that `""` makes pointless or wrong (`s:startswith("")`)
-        Code_AmbiguousContinuation = 81,   // Luwu: a line starting with `-` or a string that continues the expression above it
-        Code_UnflippedGuard = 82,          // Luwu: `x == nil or return` followed by code using `x`, which is always nil there
-        Code_UncaughtErrors = 83,          // Luwu: a call to a function with error hints outside a `try`. Off by default.
+        Code_LuaStringHelper = 82,         // Luwu: `s:sub(1, #p) == p` and the like, which `s:startswith(p)` and friends do
+        Code_StringOperations = 83,        // Luwu: a string library call that `""` makes pointless or wrong (`s:startswith("")`)
+        Code_UncaughtErrors = 84,          // Luwu: a call to a function with error hints outside a `try`. Off by default.
 
         Code__Count
     };
@@ -233,6 +234,7 @@ inline constexpr const char* kWarningNames[] = {
     "DuplicateKey",
     "DuplicateProperty",
     "DuplicateReadWrite",
+    "ExtraArguments",
     "ReturnSelf",
     "ReturnOnNextLine",
     "OrContinue",
@@ -246,10 +248,10 @@ inline constexpr const char* kWarningNames[] = {
     "LuaGuard",
     "OrReturnComma",
     "MisleadingIndentation",
-    "LuaStringHelper",
-    "StringOperations",
     "AmbiguousContinuation",
     "UnflippedGuard",
+    "LuaStringHelper",
+    "StringOperations",
     "UncaughtErrors",
 };
 // clang-format on

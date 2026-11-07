@@ -149,6 +149,27 @@ impl Lua {
             })?;
         }
 
+        // The `bundle` library, which `.(a, b)` values build their bundles with (DebugLuwuCollections, enabled above)
+        #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+        {
+            let lua = self.lock();
+            let state = lua.state();
+            protect_lua!(state, 0, 0, |state| {
+                ffi::luaL_requiref(state, ffi::LUA_BUNDLELIBNAME, ffi::luaopen_bundle, 1)
+            })?;
+        }
+
+        // Options and results: the `Ok`, `Err` and `Some` classes and `None` as globals, which `try` builds its results
+        // from (DebugLuwuTryExpressions, enabled above). They need classes and the `none` primitive.
+        #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
+        {
+            let lua = self.lock();
+            let state = lua.state();
+            protect_lua!(state, 0, 0, |state| {
+                ffi::luaopen_result(state);
+            })?;
+        }
+
         // The `luwon` library reads and writes `.luwon` data files. luwu's `luaL_openlibs` doesn't open it, since the
         // VM doesn't link the parser it needs.
         #[cfg(feature = "luwu-classes")]

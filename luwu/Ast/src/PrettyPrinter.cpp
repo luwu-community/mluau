@@ -638,7 +638,12 @@ struct Printer
         }
         else if (const auto& a = expr.as<AstExprGlobal>())
         {
-            writer.identifier(a->name.value);
+            // Luwu Traits (rfcs/classes/traits.md): `Self` names the class or trait it refers to
+            writer.identifier(a->writtenAsSelf ? "Self" : a->name.value);
+        }
+        else if (expr.is<AstExprSelfClass>())
+        {
+            writer.identifier("Self");
         }
         else if (expr.is<AstExprVarargs>())
         {
@@ -646,7 +651,7 @@ struct Printer
         }
         else if (const auto& a = expr.as<AstExprCall>())
         {
-            // Luwu collections: the callee `.(a, b)` calls isn't in the source
+            // Luwu bundles: the callee `.(a, b)` calls isn't in the source
             if (a->fromDotPositional)
             {
                 advance(a->location.begin);
@@ -684,6 +689,14 @@ struct Printer
         else if (const auto& a = expr.as<AstExprIndexName>())
         {
             visualize(*a->expr);
+
+            // Luwu Traits (rfcs/classes/traits.md): `obj:Trait:name`, `Class:Trait.name`
+            if (a->qualifiedTrait)
+            {
+                writer.symbol(":");
+                visualize(*a->qualifiedTrait);
+            }
+
             advance(a->opPosition);
             writer.symbol(std::string(1, a->op));
             advance(a->indexLocation.begin);
@@ -1668,6 +1681,8 @@ struct Printer
                 }
 
                 visualizeTypeAnnotation(*a->type);
+                if (a->errorHint)
+                    visualizeErrorHint(*a->errorHint, cstNode ? cstNode->errorHintPosition : Position::missing());
             }
         }
         else if (const auto& t = program.as<AstStatTypeFunction>())
@@ -1838,6 +1853,18 @@ struct Printer
                             }
                             writer.advance(method.keywordLocation.begin);
                             writer.keyword("function");
+                            // Luwu Traits (rfcs/classes/traits.md): `function Self.name`, `function Json.name`
+                            if (method.scopeLocation)
+                            {
+                                writer.advance(method.scopeLocation->begin);
+                                writer.identifier("Self");
+                                writer.symbol(".");
+                            }
+                            else if (method.qualifiedTrait)
+                            {
+                                visualize(*method.qualifiedTrait);
+                                writer.symbol(".");
+                            }
                             writer.advance(method.nameLocation.begin);
                             writer.identifier(method.functionName.value);
                             visualizeFunctionBody(*method.function);
@@ -2302,6 +2329,11 @@ struct Printer
 
     void visualizeAttribute(AstAttr& attribute)
     {
+        // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): a `--@[...]` comment is dropped
+        // like every other comment
+        if (attribute.comment)
+            return;
+
         advance(attribute.location.begin);
         if (FFlag::LuauCstAttr)
         {
@@ -2442,7 +2474,29 @@ struct Printer
     void visualizeTypeAnnotation(AstType& typeAnnotation)
     {
         advance(typeAnnotation.location.begin);
-        if (const auto& a = typeAnnotation.as<AstTypeReference>())
+        if (const auto& a = typeAnnotation.as<AstTypeReference>(); a && a->fromDotPositional)
+        {
+            // Luwu bundles: `.(A, B)` names its class nowhere in the source
+            const auto cstNode = lookupCstNode<CstTypeReference>(a);
+            CommaSeparatorInserter comma(writer, cstNode ? cstNode->parametersCommaPositions.begin() : nullptr);
+
+            writer.symbol(".");
+            if (cstNode)
+                advance(cstNode->openParametersPosition);
+            writer.symbol("(");
+            for (auto o : a->parameters)
+            {
+                comma();
+                if (o.type)
+                    visualizeTypeAnnotation(*o.type);
+            }
+
+            if (cstNode)
+                maybeAdvanceAndWrite(cstNode->closeParametersPosition, ")");
+            else
+                writer.symbol(")");
+        }
+        else if (const auto& a = typeAnnotation.as<AstTypeReference>())
         {
             const auto cstNode = lookupCstNode<CstTypeReference>(a);
 

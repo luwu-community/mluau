@@ -1754,6 +1754,49 @@ int lua_istrait(lua_State* L, int idx)
     return ttisclass(o) && classvalue(o)->istrait;
 }
 
+void lua_packbundle(lua_State* L, int n)
+{
+    api_checknelems(L, n);
+    if (n > LUWU_BUNDLE_MAX)
+        luaG_runerror(L, "a bundle holds at most %d values, but got %d", LUWU_BUNDLE_MAX, n);
+
+    LuauClass* classdef = L->global->builtinclasses[LUWU_BUILTIN_BUNDLE0 + n];
+    if (!classdef)
+        luaG_runerror(L, "open the bundle library (luaopen_bundle) before building a bundle");
+
+    luaC_checkGC(L);
+    luaC_threadbarrier(L);
+
+    // A new object is white, so storing into it needs no barrier
+    LuauObject* bundle = luaR_newobjectuninit(L, classdef);
+    TValue* members = luaR_members(bundle);
+    for (int i = 0; i < n; i++)
+        setobj(L, &members[i], L->top - n + i);
+
+    L->top -= n;
+    setobjectvalue(L, L->top, bundle);
+    api_incr_top(L);
+}
+
+int lua_unpackbundle(lua_State* L, int idx)
+{
+    const TValue* value = index2addr(L, idx);
+    int size = luaR_bundlesize(L, value);
+    if (size < 0)
+        return -1;
+
+    // the bundle is on the heap, so growing the stack doesn't move it
+    const LuauObject* bundle = objectvalue(value);
+    lua_rawcheckstack(L, size);
+    luaC_threadbarrier(L);
+    for (int i = 0; i < size; i++)
+    {
+        setobj2s(L, L->top, &luaR_members(bundle)[i]);
+        api_incr_top(L);
+    }
+    return size;
+}
+
 void lua_newobject(lua_State* L, int idx)
 {
     StkId cls = index2addr(L, idx);
@@ -1877,65 +1920,6 @@ const char* lua_getclassname(lua_State* L, int idx)
     return classdef ? getstr(classdef->name) : NULL;
 }
 
-static void pushpayload(lua_State* L, LuwuBuiltinClass kind, int idx)
-{
-    luaC_checkGC(L);
-    luaC_threadbarrier(L);
-    ensure_stack(L, 1);
-    LuauObject* object = luaR_newpayload(L, kind, index2addr(L, idx));
-    setobjectvalue(L, L->top, object);
-    api_incr_top(L);
-}
-
-void lua_pushsome(lua_State* L, int idx)
-{
-    pushpayload(L, LUWU_BUILTIN_SOME, idx);
-}
-
-void lua_pushresultok(lua_State* L, int idx)
-{
-    pushpayload(L, LUWU_BUILTIN_OK, idx);
-}
-
-void lua_pushresulterr(lua_State* L, int idx)
-{
-    pushpayload(L, LUWU_BUILTIN_ERR, idx);
-}
-
-static bool isbuiltinobject(lua_State* L, int idx, LuwuBuiltinClass kind)
-{
-    const TValue* o = index2addr(L, idx);
-    return ttisobject(o) && objectvalue(o)->lclass == L->global->builtinclasses[kind];
-}
-
-int lua_issome(lua_State* L, int idx)
-{
-    return isbuiltinobject(L, idx, LUWU_BUILTIN_SOME);
-}
-
-int lua_isresultok(lua_State* L, int idx)
-{
-    return isbuiltinobject(L, idx, LUWU_BUILTIN_OK);
-}
-
-int lua_isresulterr(lua_State* L, int idx)
-{
-    return isbuiltinobject(L, idx, LUWU_BUILTIN_ERR);
-}
-
-int lua_getpayload(lua_State* L, int idx)
-{
-    const TValue* payload = luaR_payload(L, index2addr(L, idx));
-    if (!payload)
-        return LUA_TNONE;
-
-    luaC_threadbarrier(L);
-    ensure_stack(L, 1);
-    setobj2s(L, L->top, payload);
-    api_incr_top(L);
-    return ttype(payload);
-}
-
 // Whether the class has members that are functions, other than the constructor and the defaults a POD class computes
 static bool classhasmethods(const LuauClass* classdef)
 {
@@ -2007,6 +1991,66 @@ int lua_classis(lua_State* L, int idx, int classidx)
 
     const TValue* o = index2addr(L, idx);
     return ttisobject(o) && objectvalue(o)->lclass == classvalue(cls);
+}
+
+static void pushpayload(lua_State* L, LuwuBuiltinClass kind, int idx)
+{
+    luaC_checkGC(L);
+    luaC_threadbarrier(L);
+    ensure_stack(L, 1);
+    LuauObject* object = luaR_newpayload(L, kind, index2addr(L, idx));
+    setobjectvalue(L, L->top, object);
+    api_incr_top(L);
+}
+
+void lua_pushsome(lua_State* L, int idx)
+{
+    pushpayload(L, LUWU_BUILTIN_SOME, idx);
+}
+
+void lua_pushresultok(lua_State* L, int idx)
+{
+    pushpayload(L, LUWU_BUILTIN_OK, idx);
+}
+
+void lua_pushresulterr(lua_State* L, int idx)
+{
+    pushpayload(L, LUWU_BUILTIN_ERR, idx);
+}
+
+static bool isbuiltinobject(lua_State* L, int idx, LuwuBuiltinClass kind)
+{
+    const TValue* o = index2addr(L, idx);
+    return ttisobject(o) && objectvalue(o)->lclass == L->global->builtinclasses[kind];
+}
+
+int lua_issome(lua_State* L, int idx)
+{
+    return isbuiltinobject(L, idx, LUWU_BUILTIN_SOME);
+}
+
+int lua_isresultok(lua_State* L, int idx)
+{
+    return isbuiltinobject(L, idx, LUWU_BUILTIN_OK);
+}
+
+int lua_isresulterr(lua_State* L, int idx)
+{
+    return isbuiltinobject(L, idx, LUWU_BUILTIN_ERR);
+}
+
+int lua_getpayload(lua_State* L, int idx)
+{
+    const TValue* payload = luaR_payload(L, index2addr(L, idx));
+    if (!payload)
+        return LUA_TNONE;
+
+    luaC_threadbarrier(L);
+    ensure_stack(L, 1);
+    setobj2s(L, L->top, payload);
+    api_incr_top(L);
+    return ttype(payload);
+
 }
 
 static const char* aux_upvalue(StkId fi, int n, TValue** val)

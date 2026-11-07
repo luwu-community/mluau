@@ -72,11 +72,13 @@
 //   and constant field defaults in LBC_CONSTANT_CLASS_SHAPE, LBC_TYPE_CLASS/LBC_TYPE_OBJECT and
 //   LBF_CLASS_ISINSTANCE.
 //   Luwu Traits (rfcs/classes/traits.md): the shape flags varint in LBC_CONSTANT_CLASS_SHAPE (LBC_CLASSSHAPE_TRAIT,
-//   LBC_CLASSSHAPE_IMPLEMENTS), the EXPECTED, OPTIONAL and FINAL member flags, and NEWCLASSMEMBER's IMPLEMENTS form.
+//   LBC_CLASSSHAPE_IMPLEMENTS), the EXPECTED, OPTIONAL and FINAL member flags, NEWCLASSMEMBER's IMPLEMENTS form and
+//   LBF_CLASS_OF.
 //   Luwu Destructuring: GETPOSITIONAL, and LBC_CLASSMEMBER_POSITIONAL with its position in LBC_CONSTANT_CLASS_SHAPE.
-//   Luwu collections: LBF_COLLECTIONS_PAIR to LBF_COLLECTIONS_RESULT_ERR.
+//   Luwu try expressions: LBF_OPTION_SOME to LBF_RESULT_ERR.
 //   Luwu try expressions: WRAPRESULT, RESULTGET, and each function's protected ranges after its inlining cost: a varint count,
 //   then per range the varints start pc, end pc (exclusive) and handler pc, and a byte for the target register.
+//   Luwu bundles: LBF_BUNDLE_PACK and LBF_BUNDLE_UNPACK.
 
 // # Bytecode type information history
 // Version 1: (from bytecode version 4) Type information for function signature. Currently supported.
@@ -468,6 +470,8 @@ enum LuauOpcode
     // Luwu Traits (rfcs/classes/traits.md): B is LBC_NEWCLASSMEMBER_IMPLEMENTS for a class's `implements` list, emitted once,
     // after every member of the class is registered. AUX is the number of entries N; registers C..C+N-1 hold the
     // listed trait values, and C+N..C+2N-1 how many trait arguments each entry passes, as numbers.
+    // Luwu Traits (rfcs/classes/traits.md): B is LBC_NEWCLASSMEMBER_QUALIFIED for a qualified implementation, `function
+    // Json.name`: C holds the function, C+1 the trait, and AUX names it. Emitted before the IMPLEMENTS form, which checks it.
     // Luwu Traits (rfcs/classes/traits.md): B is LBC_NEWCLASSMEMBER_TRAITCOPY for the class's own copy of a trait's
     // function, which the compiler made because the trait is declared in the same file. C holds the copy, C+1 the trait,
     // and AUX names the trait's function as a constant string. Emitted before the IMPLEMENTS form, which uses the copy
@@ -583,15 +587,6 @@ enum LuauOpcode
     // D: jump offset (-32768..32767) past the CALL, taken when the class has no trait initializers
     LOP_INITTRAITS,
 
-    // GETPOSITIONAL: Luwu Destructuring (rfcs/destructuring.md): the element at position C + 1 of a positional pattern
-    // `.(a, b)`. For an object, the member at that position of its class (LuauClass::positionalmembers), read with the
-    // same private-access check as reading it by name; a class without a primary constructor, or a position past its
-    // last parameter, raises. For any other value, B[C + 1], like GETTABLEN.
-    // A: target register
-    // B: register holding the value
-    // C: position - 1 (0..255)
-    LOP_GETPOSITIONAL,
-
     // PRESIZETABLE: Luwu Table Comprehensions (rfcs/table-comprehensions.md): sizes the table a comprehension builds from
     // what its loop iterates, so filling it doesn't rehash, and trims it afterwards. Emitted after the loop's registers are
     // loaded and before its FORNPREP/FORGPREP, and once more after the loop. A size is a capacity hint, never a result:
@@ -619,6 +614,24 @@ enum LuauOpcode
     // C: register holding the element count so far
     LOP_APPENDTABLE,
 
+    // GETQUALIFIED: Luwu Traits (rfcs/classes/traits.md): reads the class's version of a trait's member, for
+    // `obj:Trait:name(...)` and `Class:Trait.name`: the class's qualified implementation, its copy of a scoped default, or
+    // else the class's member of that name (luaR_getqualified). Raises when B's class doesn't implement the trait.
+    // A: target register
+    // B: register holding the object or class
+    // C: register holding the trait
+    // AUX: the member's name as a constant string
+    LOP_GETQUALIFIED,
+
+    // GETPOSITIONAL: Luwu Destructuring (rfcs/destructuring.md): the element at position C + 1 of a positional pattern
+    // `.(a, b)`. For an object, the member at that position of its class (LuauClass::positionalmembers), read with the
+    // same private-access check as reading it by name; a class without a primary constructor, or a position past its
+    // last parameter, raises. For any other value, B[C + 1], like GETTABLEN.
+    // A: target register
+    // B: register holding the value
+    // C: position - 1 (0..255)
+    LOP_GETPOSITIONAL,
+
     // PUSH: Luwu Push and Pop Operators (rfcs/push-pop-operators.md): `A <+ values`. Calls A's `__push` once with every
     // non-nil value when it has one; otherwise A must be a table, and each non-nil value is stored raw at its length + 1,
     // like table.insert.
@@ -634,9 +647,9 @@ enum LuauOpcode
     // B: register holding the container
     LOP_POP,
 
-    // WRAPRESULT: Luwu try expressions: wraps a value in a `collections.result`, an `ok` or an `err`. A `try` expression
-    // ends with the `ok` form, and its protected range's handler starts with the `err` form: when the VM resumes there,
-    // it has put the caught error in A and where it was raised in A + 1 to A + 3 (module, line, traceback).
+    // WRAPRESULT: Luwu try expressions: wraps a value in an `Ok` or an `Err`. A `try` expression ends with the `Ok` form,
+    // and its protected range's handler starts with the `Err` form: when the VM resumes there, it has put the caught
+    // error in A and where it was raised in A + 1 to A + 3 (module, line, traceback).
     // A: register holding the value, and receiving the result
     // B: LBC_WRAPRESULT_OK or LBC_WRAPRESULT_ERR
     LOP_WRAPRESULT,
@@ -798,6 +811,10 @@ enum LuwuBytecodeTag
 // straight into each new instance, instead of being produced by the synthesized `__defaults` closure.
 // Implies LBC_CLASSMEMBER_HASDEFAULT.
 #define LBC_CLASSMEMBER_CONSTDEFAULT (1 << 3)
+// Luwu Traits (rfcs/classes/traits.md): set on a trait's function declared `function Self.name`, which implementing
+// classes don't get as a member: they read it through the trait (luaR_getqualified). Shares its bit with
+// LBC_CLASSMEMBER_CONSTDEFAULT, which only fields carry.
+#define LBC_CLASSMEMBER_SCOPED (1 << 3)
 // Set on the `__init` a primary constructor implies (`class Cat(name: string)`). Such an `__init`
 // only assigns fields from its parameters, which is what lets a construction site initialize the
 // instance positionally (LOP_NEWOBJECT's FIELDS form) instead of calling it: the VM checks this bit
@@ -827,6 +844,9 @@ enum LuwuBytecodeTag
 #define LBC_NEWCLASSMEMBER_IMPLEMENTS 1
 // Luwu Traits (rfcs/classes/traits.md): operand B of LOP_NEWCLASSMEMBER for a class's compiled copy of a trait's function
 #define LBC_NEWCLASSMEMBER_TRAITCOPY 2
+// Luwu Traits (rfcs/classes/traits.md): operand B of LOP_NEWCLASSMEMBER for a class's qualified implementation of a trait's
+// function, `function Json.name`: C holds the function, C+1 the trait, and AUX names the function as a constant string
+#define LBC_NEWCLASSMEMBER_QUALIFIED 3
 
 // Luwu Traits (rfcs/classes/traits.md): bits of the shape flags varint of LBC_CONSTANT_CLASS_SHAPE, written after the member
 // counts.
@@ -1075,18 +1095,22 @@ enum LuauBuiltinFunction
     // Luwu Classes (rfcs/classes): class.isinstance(value, class) -> boolean
     LBF_CLASS_ISINSTANCE,
 
+    // Luwu Traits (rfcs/classes/traits.md): class.of(value) -> class?, which `Self` in a trait method calls
+    LBF_CLASS_OF,
+
     // Luwu String Extensions (rfcs/string-extensions.md): string.startswith/endswith/contains(s, needle, ...) -> boolean
     LBF_STRING_STARTSWITH,
     LBF_STRING_ENDSWITH,
     LBF_STRING_CONTAINS,
 
-    // Luwu collections: constructing a builtin class without a call frame
-    LBF_COLLECTIONS_PAIR,
-    LBF_COLLECTIONS_TRIPLE,
-    LBF_COLLECTIONS_QUAD,
-    LBF_COLLECTIONS_OPTION_SOME,
-    LBF_COLLECTIONS_RESULT_OK,
-    LBF_COLLECTIONS_RESULT_ERR,
+    // Luwu try expressions: constructing a `Some`, `Ok` or `Err` without a call frame
+    LBF_OPTION_SOME,
+    LBF_RESULT_OK,
+    LBF_RESULT_ERR,
+
+    // Luwu bundles: `bundle.pack` and `bundle.unpack` without a call frame
+    LBF_BUNDLE_PACK,
+    LBF_BUNDLE_UNPACK,
 };
 
 // Capture type, used in LOP_CAPTURE
