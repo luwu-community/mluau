@@ -361,9 +361,9 @@ struct Printer
         advance(pattern.location->begin);
         writer.symbol(".");
 
-        if (pattern.positional)
+        if (pattern.positional || pattern.array)
         {
-            writer.symbol("(");
+            writer.symbol(pattern.array ? "[" : "(");
 
             CommaSeparatorInserter elementComma(writer, nullptr);
             for (const AstDestructureField& element : pattern.fields)
@@ -373,7 +373,7 @@ struct Printer
             }
 
             advanceBefore(pattern.location->end, 1);
-            writer.symbol(")");
+            writer.symbol(pattern.array ? "]" : ")");
             return;
         }
 
@@ -384,7 +384,21 @@ struct Printer
         {
             comma();
             advance(field.keyLocation.begin);
-            writer.identifier(field.key.value);
+            if (field.keyIsPosition)
+            {
+                visualize(*field.keyExpr);
+            }
+            else if (field.keyExpr)
+            {
+                writer.symbol("[");
+                visualize(*field.keyExpr);
+                advanceBefore(field.keyLocation.end, 1);
+                writer.symbol("]");
+            }
+            else
+            {
+                writer.identifier(field.key.value);
+            }
 
             if (field.asLocation)
             {
@@ -702,6 +716,13 @@ struct Printer
             advance(a->indexLocation.begin);
             writer.write(a->index.value);
         }
+        else if (const auto& a = expr.as<AstExprIndexExpr>(); a && a->positional)
+        {
+            // Luwu Destructuring (rfcs/destructuring.md): `x.1`
+            visualize(*a->expr);
+            writer.symbol(".");
+            visualize(*a->index);
+        }
         else if (const auto& a = expr.as<AstExprIndexExpr>())
         {
             const auto cstNode = lookupCstNode<CstExprIndexExpr>(a);
@@ -977,9 +998,18 @@ struct Printer
             writer.keyword("if");
             visualizeElseIfExpr(*a);
         }
+        else if (const auto& a = expr.as<AstExprMatch>())
+        {
+            visualizeMatchSubject(a->subject);
+            for (const AstMatchArm& arm : a->arms)
+            {
+                visualizeMatchArmHead(arm);
+                visualize(*arm.value);
+            }
+        }
         else if (const auto& a = expr.as<AstExprDo>())
         {
-            // Luwu Do Expressions (rfcs/do-expressions.md): the shorthand (`x or return v`) is just its statement
+            // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the shorthand (`x or return v`) is just its statement
             if (!a->shorthand)
                 writer.keyword("do");
 
@@ -988,7 +1018,7 @@ struct Printer
         }
         else if (const auto& a = expr.as<AstExprTableComprehension>())
         {
-            // Luwu Table Comprehensions (rfcs/table-comprehensions.md): prints the clauses back from the loop they are
+            // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): prints the clauses back from the loop they are
             // stored as (see AstExprTableComprehension)
             writer.symbol("{");
 
@@ -1067,28 +1097,7 @@ struct Printer
             const auto cstNode = lookupCstNode<CstExprTable>(a);
             const CstExprTable::Item* cstItem = cstNode && cstNode->items.size == 1 ? cstNode->items.begin() : nullptr;
 
-            if (a->item->key)
-            {
-                std::string assignment = a->item->accumulate ? toString(*a->item->accumulate) + "=" : "=";
-
-                if (cstItem)
-                {
-                    maybeAdvanceAndWrite(cstItem->indexerOpenPosition, "[", true);
-                    visualize(*a->item->key);
-                    maybeAdvanceAndWrite(cstItem->indexerClosePosition, "]");
-                    maybeAdvanceAndWrite(cstItem->equalsPosition, assignment);
-                }
-                else
-                {
-                    writer.symbol("[");
-                    visualize(*a->item->key);
-                    writer.symbol("]");
-                    writer.maybeSpace(a->item->value->location.begin, 1);
-                    writer.symbol(assignment);
-                }
-            }
-
-            visualize(*a->item->value);
+            visualizeComprehensionItem(*a->item, cstItem);
 
             Position endPos = expr.location.end;
             if (endPos.column > 0)
@@ -1193,6 +1202,33 @@ struct Printer
             advance(newPos);
     }
 
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): `value`, `[key] = value` or `[key] op= value`
+    void visualizeComprehensionItem(const AstStatComprehensionItem& item, const CstExprTable::Item* cstItem)
+    {
+        if (item.key)
+        {
+            std::string assignment = item.accumulate ? toString(*item.accumulate) + "=" : "=";
+
+            if (cstItem)
+            {
+                maybeAdvanceAndWrite(cstItem->indexerOpenPosition, "[", true);
+                visualize(*item.key);
+                maybeAdvanceAndWrite(cstItem->indexerClosePosition, "]");
+                maybeAdvanceAndWrite(cstItem->equalsPosition, assignment);
+            }
+            else
+            {
+                writer.symbol("[");
+                visualize(*item.key);
+                writer.symbol("]");
+                writer.maybeSpace(item.value->location.begin, 1);
+                writer.symbol(assignment);
+            }
+        }
+
+        visualize(*item.value);
+    }
+
     void visualize(AstStat& program)
     {
         // Luwu Destructuring (rfcs/destructuring.md): the first statement a destructuring declaration desugars to
@@ -1233,10 +1269,33 @@ struct Printer
                 writeEnd(program.location);
             }
         }
+        else if (const auto& a = program.as<AstStatIf>(); a && a->isLeaveGuard)
+        {
+            // Luwu Guards (rfcs/control-flow/guards.md): `continue if x`
+            LUAU_ASSERT(a->thenbody->body.size == 1);
+            visualize(*a->thenbody->body.data[0]);
+            advance(a->ifLocation.begin);
+            writer.keyword("if");
+            visualize(*a->condition);
+        }
         else if (const auto& a = program.as<AstStatIf>())
         {
             writer.keyword("if");
             visualizeElseIf(*a);
+        }
+        else if (const auto& a = program.as<AstStatMatch>())
+        {
+            visualizeMatchSubject(a->subject);
+            for (const AstMatchArm& arm : a->arms)
+            {
+                visualizeMatchArmHead(arm);
+                visualizeBlock(*arm.body);
+            }
+            if (a->hasEnd)
+            {
+                advanceBefore(a->location.end, 3);
+                writer.keyword("end");
+            }
         }
         else if (const auto& a = program.as<AstStatWhile>())
         {
@@ -1268,9 +1327,16 @@ struct Printer
             writer.keyword("continue");
         else if (const auto& a = program.as<AstStatGive>())
         {
-            // Luwu Do Expressions (rfcs/do-expressions.md)
+            // Luwu Do Expressions (rfcs/control-flow/do-expressions.md)
             writer.keyword("give");
-            visualize(*a->value);
+
+            const auto cstNode = a->item ? lookupCstNode<CstExprTable>(a->item) : nullptr;
+            const CstExprTable::Item* cstItem = cstNode && cstNode->items.size == 1 ? cstNode->items.begin() : nullptr;
+
+            if (a->item)
+                visualizeComprehensionItem(*a->item, cstItem);
+            else
+                visualize(*a->value);
         }
         else if (const auto& a = program.as<AstStatReturn>())
         {
@@ -2165,7 +2231,7 @@ struct Printer
         }
     }
 
-    // Luwu If Local (rfcs/if-local.md): prints a loop's `when` chain, if its body holds one (AstStatFor::whenGuard),
+    // Luwu If Local (rfcs/control-flow/if-local.md): prints a loop's `when` chain, if its body holds one (AstStatFor::whenGuard),
     // and returns the block as written. Destructured fields at the start of the body print with the loop's bindings, and
     // print nothing themselves.
     AstStatBlock* visualizeLoopWhen(AstStatBlock& body, AstStatIf* guard)
@@ -2184,7 +2250,60 @@ struct Printer
         return guard->thenbody;
     }
 
-    // Luwu If Local (rfcs/if-local.md): a `when` chain prints clause by clause. A binding prints through its
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `match value` or `match const name = value`
+    void visualizeMatchSubject(const AstMatchSubject& subject)
+    {
+        writer.keyword("match");
+
+        AstStatLocal* declaration = subject.declaration;
+        bool named = declaration && declaration->keywordLocation.has_value();
+        if (!named)
+        {
+            visualize(*subject.value);
+            return;
+        }
+
+        writer.keyword(declaration->vars.data[0]->isConst ? "const" : "local");
+        writer.identifier(declaration->vars.data[0]->name.value);
+        writer.symbol("=");
+        visualize(*subject.value);
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): an arm up to its value or block. A `case` arm's pattern
+    // is stored as the test it means, so every arm with a condition prints as a `when` chain, which tests the same thing.
+    void visualizeMatchArmHead(const AstMatchArm& arm)
+    {
+        advance(arm.keywordLocation.begin);
+        if (arm.kind == AstMatchArm::Else)
+        {
+            writer.keyword("else");
+            return;
+        }
+
+        writer.keyword("when");
+        if (arm.clauses.size == 0)
+        {
+            visualize(*arm.condition);
+        }
+        else
+        {
+            for (size_t i = 0; i < arm.clauses.size; ++i)
+            {
+                const AstIfClause& clause = arm.clauses.data[i];
+                if (i != 0)
+                    writer.keyword("when");
+
+                if (clause.declaration)
+                    visualize(static_cast<AstStat&>(*clause.declaration));
+                else
+                    visualize(*clause.expr);
+            }
+        }
+
+        writer.keyword("then");
+    }
+
+    // Luwu If Local (rfcs/control-flow/if-local.md): a `when` chain prints clause by clause. A binding prints through its
     // declaration, which also prints a destructuring pattern back as written.
     void visualizeIfCondition(AstExpr& condition, const AstArray<AstIfClause>& clauses)
     {
@@ -2489,6 +2608,8 @@ struct Printer
                 comma();
                 if (o.type)
                     visualizeTypeAnnotation(*o.type);
+                else if (o.typePack)
+                    visualizeTypePackAnnotation(*o.typePack, false);
             }
 
             if (cstNode)

@@ -277,25 +277,12 @@ static const char* declarationKind(TypeId t)
     return isTrait ? "trait" : "class";
 }
 
-// Luwu bundles: the position of the bundle field `key` on `t` (1 for `first`), or 0 when `t` isn't a bundle or has no such
-// field
-static int bundleFieldPosition(TypeId t, const std::string& key)
+// Luwu bundles: whether `t` is a bundle class instance
+static bool isBundleType(TypeId t)
 {
-    static const char* const kFieldNames[] = {
-        "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth", "eleventh", "twelfth",
-    };
-
     const ExternType* etv = get<ExternType>(follow(t));
     const ExternType* declared = etv && etv->genericTemplate ? get<ExternType>(follow(*etv->genericTemplate)) : etv;
-    if (!declared || !declared->printsAsBundle)
-        return 0;
-
-    for (size_t i = 0; i < sizeof(kFieldNames) / sizeof(kFieldNames[0]); i++)
-    {
-        if (key == kFieldNames[i])
-            return int(i + 1);
-    }
-    return 0;
+    return declared && declared->printsAsBundle;
 }
 
 // Luwu Traits (rfcs/classes/traits.md): a trait's value where any class is expected (`class.isinstance(x, Trait)`), or a
@@ -901,6 +888,26 @@ static TypeId unionIn(TypeId ty)
         found = follow(part);
     }
     return found;
+}
+
+// Luwu bundles: what changes a bundle's size, when a cast from one size of bundle to another was tried
+static std::optional<std::string> bundleCastHelp(const TypesAreUnrelated& e)
+{
+    const ExternType* left = get<ExternType>(follow(e.left));
+    const ExternType* right = get<ExternType>(follow(e.right));
+    std::optional<BundleShape> from = left ? bundleShape(left) : std::nullopt;
+    std::optional<BundleShape> to = right ? bundleShape(right) : std::nullopt;
+    bool sizesDiffer = from && to && !from->rest && !to->rest && from->head.size() != to->head.size();
+    if (!sizesDiffer)
+        return std::nullopt;
+
+    size_t given = from->head.size();
+    size_t wanted = to->head.size();
+    if (given > wanted)
+        return "A cast never changes a bundle's size: use ':sub(1, " + std::to_string(wanted) + ")' to keep the first " +
+               MismatchWording::countValues(wanted);
+    return "A cast never changes a bundle's size: use 'bundle.concat' to add the " + MismatchWording::countValues(wanted - given) +
+           " it's missing";
 }
 
 static std::optional<std::string> missingUnionPropertyHelp(const MissingUnionProperty& e)
@@ -1716,7 +1723,10 @@ struct ErrorConverter
 
     std::string operator()(const TypesAreUnrelated& e) const
     {
-        return "Cannot cast '" + toString(e.left) + "' into '" + toString(e.right) + "' because the types are unrelated";
+        std::string message = "Cannot cast '" + toString(e.left) + "' into '" + toString(e.right) + "' because the types are unrelated";
+        if (std::optional<std::string> help = bundleCastHelp(e))
+            message += "\n\n" + *help;
+        return message;
     }
 
     std::string operator()(const NormalizationTooComplex&) const
@@ -1948,6 +1958,9 @@ struct ErrorConverter
         case PropertyAccessViolation::CannotRead:
             return "Property " + stringKey + " of " + kind + " '" + toString(e.table) + "' is write-only";
         case PropertyAccessViolation::CannotWrite:
+            // Luwu bundles: a write to a position, which only a changed copy can do
+            if (isBundleType(e.table))
+                return "A bundle can't be changed; b:with(position, value) makes a copy with that position replaced";
             return "Property " + stringKey + " of " + kind + " '" + toString(e.table) + "' is read-only";
         }
 
@@ -1965,10 +1978,6 @@ struct ErrorConverter
 
     std::string operator()(const ConstPropertyAssignment& e) const
     {
-        // Luwu bundles: no code can call a bundle's constructor, so name the copy `with` makes
-        if (int position = bundleFieldPosition(e.table, e.key))
-            return "A bundle can't be changed; b:with(" + std::to_string(position) + ", value) makes a copy with '" + e.key + "' replaced";
-
         return "Field '" + e.key + "' of " + declarationKind(e.table) + " '" + e.className +
                "' is constant; assigning to it outside of '__init' will raise a runtime error";
     }
@@ -2081,6 +2090,13 @@ struct ErrorConverter
 
     std::string operator()(const PositionalDestructuring& e) const
     {
+        if (e.bundleSize)
+            return "'" + e.className + "' has no position " + std::to_string(e.position + 1) + "; it holds " + MismatchWording::countValues(*e.bundleSize);
+        if (e.notObject && e.inPattern)
+            return "'" + e.className + "' has no positions; destructure it by index with '.[...]' instead";
+        if (e.notObject)
+            return "'" + e.className + "' has no positions; index it with '[" + std::to_string(e.position + 1) + "]' instead";
+
         if (!e.parameters)
             return "'" + e.className + "' can't be destructured positionally without a primary constructor; take its fields by name with '.{...}'";
 
@@ -2570,7 +2586,8 @@ bool ConstructorReadByName::operator==(const ConstructorReadByName& rhs) const
 
 bool PositionalDestructuring::operator==(const PositionalDestructuring& rhs) const
 {
-    return className == rhs.className && position == rhs.position && parameters == rhs.parameters;
+    return className == rhs.className && position == rhs.position && parameters == rhs.parameters && notObject == rhs.notObject &&
+           inPattern == rhs.inPattern && bundleSize == rhs.bundleSize;
 }
 
 bool PrivateConstructorAccess::operator==(const PrivateConstructorAccess& rhs) const

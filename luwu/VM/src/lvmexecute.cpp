@@ -4139,7 +4139,7 @@ reentry:
 
             VM_CASE(LOP_PRESIZETABLE)
             {
-                // Luwu Table Comprehensions (rfcs/table-comprehensions.md): sizes or trims the table a comprehension builds
+                // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): sizes or trims the table a comprehension builds
                 Instruction insn = *pc++;
                 StkId ra = VM_REG(LUAU_INSN_A(insn));
                 StkId rb = VM_REG(LUAU_INSN_B(insn));
@@ -4152,7 +4152,7 @@ reentry:
 
             VM_CASE(LOP_APPENDTABLE)
             {
-                // Luwu Table Comprehensions (rfcs/table-comprehensions.md): adds a non-nil value at the next index
+                // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): adds a non-nil value at the next index
                 Instruction insn = *pc++;
                 StkId ra = VM_REG(LUAU_INSN_A(insn));
                 StkId rb = VM_REG(LUAU_INSN_B(insn));
@@ -4234,23 +4234,11 @@ reentry:
 
             VM_CASE(LOP_GETPOSITIONAL)
             {
-                // Luwu Destructuring (rfcs/destructuring.md): one element of a positional pattern `.(a, b)`
+                // Luwu Destructuring (rfcs/destructuring.md): a read of a position, `x.1` or an element of `.(a, b)`
                 Instruction insn = *pc++;
                 StkId ra = VM_REG(LUAU_INSN_A(insn));
                 StkId rb = VM_REG(LUAU_INSN_B(insn));
                 int c = LUAU_INSN_C(insn);
-
-                // fast path: an array element of a table without a metatable, like GETTABLEN's
-                if (ttistable(rb))
-                {
-                    LuaTable* h = hvalue(rb);
-
-                    if (LUAU_LIKELY(unsigned(c) < unsigned(h->sizearray) && !h->metatable))
-                    {
-                        setobj2s(L, ra, &h->array[c]);
-                        VM_NEXT();
-                    }
-                }
 
                 VM_PROTECT(luaV_getpositional(L, rb, c, ra));
                 VM_NEXT();

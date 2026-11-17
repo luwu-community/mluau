@@ -1727,7 +1727,7 @@ static bool isValidBreakContinueContext(const std::vector<AstNode*>& ancestry, P
     return false;
 }
 
-// Luwu Do Expressions (rfcs/do-expressions.md): is the position a statement in a `do` expression's block, where `give`
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): is the position a statement in a `do` expression's block, where `give`
 // can go? A function boundary in between means no.
 static bool isInDoExprBody(const std::vector<AstNode*>& ancestry)
 {
@@ -1872,6 +1872,9 @@ static AutocompleteEntryMap autocompleteStatement(
         else if (AstExprFunction* exprFunction = (*it)->as<AstExprFunction>(); exprFunction && !exprFunction->body->hasEnd)
             result.emplace("end", AutocompleteEntry{AutocompleteEntryKind::Keyword});
         else if (AstStatClass* statClass = (*it)->as<AstStatClass>(); statClass && !statClass->hasEnd)
+            result.emplace("end", AutocompleteEntry{AutocompleteEntryKind::Keyword});
+        // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
+        else if (AstStatMatch* statMatch = (*it)->as<AstStatMatch>(); statMatch && !statMatch->hasEnd)
             result.emplace("end", AutocompleteEntry{AutocompleteEntryKind::Keyword});
         if (AstStatBlock* exprBlock = (*it)->as<AstStatBlock>(); exprBlock && !exprBlock->hasEnd)
             result.emplace("end", AutocompleteEntry{AutocompleteEntryKind::Keyword});
@@ -2038,7 +2041,7 @@ static AutocompleteContext autocompleteExpression(
         result["not"] = {AutocompleteEntryKind::Keyword};
         result["function"] = {AutocompleteEntryKind::Keyword, std::nullopt, false, false, correctForFunction};
 
-        // Luwu Do Expressions (rfcs/do-expressions.md): `do` starts a value too. Without it, typing `do` here fuzzy-matches
+        // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `do` starts a value too. Without it, typing `do` here fuzzy-matches
         // names like `DirectoryPath` and the editor completes to them.
         if (FFlag::LuwuDoExpr)
             result["do"] = {AutocompleteEntryKind::Keyword, std::nullopt, false, false};
@@ -2157,6 +2160,37 @@ static std::optional<AutocompleteEntryMap> convertRequireSuggestionsToAutocomple
         result[std::move(suggestion.label)] = std::move(entry);
     }
     return result;
+}
+
+// Luwu bundles: the expected type of the position the innermost node of `ancestry` fills in a bundle literal `.(a, b)`,
+// from the expected type of the whole bundle. nullopt outside a bundle literal or without a bundle type expected.
+static std::optional<TypeId> bundlePositionExpectedType(
+    TypeArena& arena,
+    const Module& module,
+    const std::vector<AstNode*>& ancestry,
+    const ScopePtr& scope
+)
+{
+    if (ancestry.size() < 2)
+        return std::nullopt;
+
+    AstExpr* value = ancestry.back()->asExpr();
+    AstExprCall* bundle = ancestry[ancestry.size() - 2]->as<AstExprCall>();
+    if (!value || !bundle || !isBundlePackCall(bundle))
+        return std::nullopt;
+
+    const TypeId* expected = module.astExpectedTypes.find(bundle);
+    std::optional<std::vector<TypeId>> positions =
+        expected ? expectedBundlePositions(&arena, scope.get(), *expected, bundle, value) : std::nullopt;
+    if (!positions)
+        return std::nullopt;
+
+    for (size_t i = 0; i < bundle->args.size && i < positions->size(); i++)
+    {
+        if (bundle->args.data[i] == value)
+            return (*positions)[i];
+    }
+    return std::nullopt;
 }
 
 static std::optional<AutocompleteEntryMap> autocompleteStringParams(
@@ -2501,13 +2535,13 @@ static AutocompleteResult autocompleteWhileLoopKeywords(std::vector<AstNode*> an
     ret["and"] = {AutocompleteEntryKind::Keyword};
     ret["or"] = {AutocompleteEntryKind::Keyword};
 
-    // Luwu If Local (rfcs/if-local.md)
+    // Luwu If Local (rfcs/control-flow/if-local.md)
     if (FFlag::LuwuIfLocal)
         ret["when"] = {AutocompleteEntryKind::Keyword};
     return {std::move(ret), std::move(ancestry), AutocompleteContext::Keyword};
 }
 
-// Luwu If Local (rfcs/if-local.md): the keywords after a loop's header, when the cursor is past its last part (the
+// Luwu If Local (rfcs/control-flow/if-local.md): the keywords after a loop's header, when the cursor is past its last part (the
 // bounds, the values, the condition or the last clause of its `when` chain) and before its `do`: `do` and `when`, plus
 // `give` and `for` for a table comprehension's clause. Nothing when the cursor isn't there, or the part before it
 // is unfinished.
@@ -2808,13 +2842,13 @@ struct DestructureCursor
     // For a pattern in a `for` loop's bindings: the loop. `block` is then its body, which starts with the fields.
     const AstStatForIn* loop = nullptr;
 
-    // Luwu match expressions: for the `.{...}` after a type test (`x is Point.{x, y}`), the test's call. Its fields are
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): for the `{...}` or `(...)` after a type test's class (`x is Point {x, y}`), the test's call. Its fields are
     // declared by the clauses of the condition it's in, which are in `clauseDeclarations`.
     const AstExprCall* typeTest = nullptr;
     std::vector<const AstStatLocal*> clauseDeclarations;
 };
 
-// Luwu match expressions: the declarations in the `when` chains of the conditions around the cursor
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the declarations in the `when` chains of the conditions around the cursor
 static std::vector<const AstStatLocal*> clauseDeclarationsIn(const std::vector<AstNode*>& ancestry)
 {
     std::vector<const AstStatLocal*> declarations;
@@ -2857,8 +2891,10 @@ static std::optional<DestructureCursor> findDestructureCursorInPattern(const Ast
         if (std::optional<DestructureCursor> inner = findDestructureCursorInPattern(target, position))
             return inner;
 
-        // An annotation is a type position; the ordinary type completion handles it
+        // An annotation is a type position, and a key in brackets an expression; the ordinary completion handles both
         if (target.local->annotation && target.local->annotation->location.containsClosed(position))
+            return std::nullopt;
+        if (field.keyExpr && !field.keyIsPosition && field.keyLocation.containsClosed(position))
             return std::nullopt;
 
         bool namedAfterAs = field.asLocation && target.local->name != kDestructuredLocalName;
@@ -2866,8 +2902,8 @@ static std::optional<DestructureCursor> findDestructureCursorInPattern(const Ast
             return DestructureCursor{DestructureCursor::BindingName, &pattern};
     }
 
-    // Every element of a positional pattern `.(a, b)` declares a local
-    if (pattern.positional)
+    // Every element of a positional pattern `.(a, b)` or an array pattern `.[a, b]` declares a local
+    if (pattern.positional || pattern.array)
         return DestructureCursor{DestructureCursor::BindingName, &pattern};
 
     return DestructureCursor{DestructureCursor::Key, &pattern};
@@ -2952,9 +2988,9 @@ static const AstTypeDestructure* findTypeDestructure(const std::vector<AstNode*>
     return nullptr;
 }
 
-// Luwu match expressions: the type of the value a type test's pattern level destructures. The whole pattern takes the
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the type of the value a type test's pattern level destructures. The whole pattern takes the
 // objects of the tested class, whatever the tested value's own type; a nested level takes its field's value.
-// Luwu match expressions: the type of the property `name` of `ty`, a class's object or a table
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the type of the property `name` of `ty`, a class's object or a table
 static std::optional<TypeId> propertyTypeOf(TypeId ty, const std::string& name)
 {
     ty = follow(ty);
@@ -2969,7 +3005,7 @@ static std::optional<TypeId> propertyTypeOf(TypeId ty, const std::string& name)
     return follow(*prop->readTy);
 }
 
-// Luwu match expressions: the type of `target`, a level of a type test's pattern, found by walking down from `level`,
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the type of `target`, a level of a type test's pattern, found by walking down from `level`,
 // whose value has type `levelType`: by field name in a `.{...}`, by primary constructor parameter in a `.(...)`. The
 // pattern's own reads don't see the type test's refinement while autocomplete checks the code, so their types can't be used.
 static std::optional<TypeId> typeTestLevelType(const AstDestructurePattern& level, TypeId levelType, const AstDestructurePattern* target)
@@ -3206,7 +3242,7 @@ AutocompleteResult autocomplete_(
         return {std::move(props), ancestry, AutocompleteContext::Property};
     }
 
-    // Luwu If Local (rfcs/if-local.md): `for ... when ... do`, `while local ... when ... do` and comprehension clauses
+    // Luwu If Local (rfcs/control-flow/if-local.md): `for ... when ... do`, `while local ... when ... do` and comprehension clauses
     if (FFlag::LuwuIfLocal || FFlag::LuwuTableComprehensions)
     {
         if (std::optional<AutocompleteResult> loopKeywords = autocompleteLoopHeaderKeywords(ancestry, position))
@@ -3353,7 +3389,7 @@ AutocompleteResult autocomplete_(
         {
             AutocompleteResult result = autocompleteExpression(*module, builtinTypes, typeArena, ancestry, scopeAtPosition, position);
 
-            // Luwu If Local (rfcs/if-local.md): a condition can start with a binding
+            // Luwu If Local (rfcs/control-flow/if-local.md): a condition can start with a binding
             if (FFlag::LuwuIfLocal && statWhile->clauses.size == 0 && statWhile->condition->is<AstExprError>())
             {
                 result.entryMap["local"] = {AutocompleteEntryKind::Keyword};
@@ -3387,7 +3423,7 @@ AutocompleteResult autocomplete_(
         {
             AutocompleteResult result = autocompleteExpression(*module, builtinTypes, typeArena, ancestry, scopeAtPosition, position);
 
-            // Luwu If Local (rfcs/if-local.md): a condition can start with a binding
+            // Luwu If Local (rfcs/control-flow/if-local.md): a condition can start with a binding
             if (FFlag::LuwuIfLocal && statIf->clauses.size == 0)
             {
                 result.entryMap["local"] = {AutocompleteEntryKind::Keyword};
@@ -3408,7 +3444,7 @@ AutocompleteResult autocomplete_(
         ret["and"] = {AutocompleteEntryKind::Keyword};
         ret["or"] = {AutocompleteEntryKind::Keyword};
 
-        // Luwu If Local (rfcs/if-local.md)
+        // Luwu If Local (rfcs/control-flow/if-local.md)
         if (FFlag::LuwuIfLocal)
             ret["when"] = {AutocompleteEntryKind::Keyword};
         return {std::move(ret), ancestry, AutocompleteContext::Keyword};
@@ -3531,6 +3567,11 @@ AutocompleteResult autocomplete_(
 
         if (auto it = module->astExpectedTypes.find(node->asExpr()))
             autocompleteStringSingleton(*it, false, node, position, result);
+
+        // Luwu bundles: a string in a bundle literal `.(a, b)` completes what its position of the bundle's expected type
+        // allows. The bundle is a `bundle.pack` call, whose own argument check records `unknown` for the string.
+        if (std::optional<TypeId> expected = bundlePositionExpectedType(*typeArena, *module, ancestry, scopeAtPosition))
+            autocompleteStringSingleton(*expected, false, node, position, result);
 
         return {std::move(result), ancestry, AutocompleteContext::String};
     }

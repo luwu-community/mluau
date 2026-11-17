@@ -8,6 +8,8 @@
 #include "Luau/Error.h"
 #include "Luau/TimeTrace.h"
 
+#include <algorithm>
+#include <cmath>
 #include <optional>
 
 LUAU_FASTFLAG(DebugLuauFreezeArena)
@@ -434,6 +436,8 @@ ControlFlow DataFlowGraphBuilder::visit(AstStat* s)
         return visit(b);
     else if (auto i = s->as<AstStatIf>())
         return visit(i);
+    else if (auto m = s->as<AstStatMatch>())
+        return visit(m);
     else if (auto w = s->as<AstStatWhile>())
         return visit(w);
     else if (auto r = s->as<AstStatRepeat>())
@@ -489,7 +493,7 @@ ControlFlow DataFlowGraphBuilder::visit(AstStat* s)
         handle->ice("Unknown AstStat in DataFlowGraphBuilder::visit");
 }
 
-// Luwu If Local (rfcs/if-local.md): visits a `when` chain in the scope of the branch it guards. A binding's
+// Luwu If Local (rfcs/control-flow/if-local.md): visits a `when` chain in the scope of the branch it guards. A binding's
 // declaration is an ordinary `local`; its def also gets the refinement key the binding is narrowed through.
 void DataFlowGraphBuilder::visitIfClauses(const AstArray<AstIfClause>& clauses)
 {
@@ -531,6 +535,12 @@ ControlFlow DataFlowGraphBuilder::visit(AstStatIf* i)
         elsecf = visit(i->elsebody);
     }
 
+    return joinBranches(thenScope, elseScope, thencf, elsecf);
+}
+
+// What the code after a two-way branch sees, and how the whole statement leaves
+ControlFlow DataFlowGraphBuilder::joinBranches(DfgScope* thenScope, DfgScope* elseScope, ControlFlow thencf, ControlFlow elsecf)
+{
     DfgScope* scope = currentScope();
     // If the control flow from the `if` or `else` block is non-linear,
     // then we should assume that the _other_ branch is the one taken.
@@ -547,6 +557,67 @@ ControlFlow DataFlowGraphBuilder::visit(AstStatIf* i)
         return ControlFlow::Returns;
     else
         return ControlFlow::None;
+}
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the header's declaration of the subject, or the local the
+// arms test
+void DataFlowGraphBuilder::visitMatchSubject(const AstMatchSubject& subject)
+{
+    if (subject.declaration)
+        visit(subject.declaration);
+    else
+        visitExpr(subject.value);
+}
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the arms run like an `if` chain, in a scope that holds the
+// subject
+ControlFlow DataFlowGraphBuilder::visit(AstStatMatch* m)
+{
+    DfgScope* outer = currentScope();
+    DfgScope* matchScope = makeChildScope();
+
+    ControlFlow cf;
+    {
+        PushScope ps{scopeStack, matchScope};
+        visitMatchSubject(m->subject);
+        cf = visitMatchArmBlocks(m->arms, 0);
+    }
+
+    outer->inherit(matchScope);
+    return cf;
+}
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `arms[index]` and the arms after it, as an `if` whose
+// `else` is the rest
+ControlFlow DataFlowGraphBuilder::visitMatchArmBlocks(const AstArray<AstMatchArm>& arms, size_t index)
+{
+    if (index == arms.size)
+        return ControlFlow::None;
+
+    const AstMatchArm& arm = arms.data[index];
+    if (!arm.condition)
+        return visit(arm.body);
+
+    DfgScope* thenScope = makeChildScope();
+    DfgScope* restScope = makeChildScope();
+
+    if (arm.clauses.size == 0)
+        visitExpr(arm.condition);
+
+    ControlFlow thencf;
+    {
+        PushScope ps{scopeStack, thenScope};
+        visitIfClauses(arm.clauses);
+        thencf = visit(arm.body);
+    }
+
+    ControlFlow restcf;
+    {
+        PushScope ps{scopeStack, restScope};
+        restcf = visitMatchArmBlocks(arms, index + 1);
+    }
+
+    return joinBranches(thenScope, restScope, thencf, restcf);
 }
 
 ControlFlow DataFlowGraphBuilder::visit(AstStatWhile* w)
@@ -568,7 +639,7 @@ ControlFlow DataFlowGraphBuilder::visit(AstStatWhile* w)
     ControlFlow cf;
     {
         PushScope ps{scopeStack, whileScope};
-        // Luwu If Local (rfcs/if-local.md): a `when` chain's bindings are declared in the loop's scope
+        // Luwu If Local (rfcs/control-flow/if-local.md): a `when` chain's bindings are declared in the loop's scope
         if (w->clauses.size == 0)
             visitExpr(w->condition);
         else
@@ -1139,6 +1210,8 @@ DataFlowResult DataFlowGraphBuilder::visitExpr(AstExpr* e)
             return visitExpr(s->classOf);
         else if (auto d = e->as<AstExprDo>())
             return visitExpr(d);
+        else if (auto m = e->as<AstExprMatch>())
+            return visitExpr(m);
         else if (auto c = e->as<AstExprTableComprehension>())
             return visitExpr(c);
         else if (auto t = e->as<AstExprTry>())
@@ -1296,8 +1369,47 @@ DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprIndexExpr* i)
         return {def, keyArena->node(parentKey, def, index)};
     }
 
+    // Luwu Destructuring (rfcs/destructuring.md): a position read (`b.1`) is refined like a property, so `if b.1 then`
+    // narrows `b` and `b.1` in the branch. Its key is the position's name, `"1"`.
+    const AstExprConstantNumber* number = i->positional ? i->index->as<AstExprConstantNumber>() : nullptr;
+    if (number && number->value >= 1 && number->value == std::floor(number->value))
+    {
+        std::string index = std::to_string(size_t(number->value));
+        DefId def = lookup(parentDef, index, i->location);
+        return {def, keyArena->node(parentKey, def, index)};
+    }
+
     return {defArena->freshCell(Symbol{}, i->location, /* subscripted= */ true), nullptr};
 }
+
+// Luwu Destructuring (rfcs/destructuring.md): whether `name` is the key of a position read (`"1"` for `x.1`)
+static bool isPositionKey(const std::string& name)
+{
+    return !name.empty() && name[0] != '0' && std::all_of(name.begin(), name.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+// Luwu Destructuring (rfcs/destructuring.md): an object's positions read its class's fields (`cat.1` is `cat.name`), so
+// assigning any of its properties forgets what tests of its positions found
+void DataFlowGraphBuilder::forgetPositions(DefId parentDef, const Location& location)
+{
+    DfgScope* scope = currentScope();
+    std::vector<std::string> positions;
+    for (const DfgScope* enclosing = scope; enclosing; enclosing = enclosing->parent)
+    {
+        const std::unordered_map<std::string, const Def*>* props = enclosing->props.find(parentDef);
+        if (!props)
+            continue;
+        for (const auto& [name, def] : *props)
+        {
+            if (isPositionKey(name))
+                positions.push_back(name);
+        }
+    }
+
+    for (const std::string& name : positions)
+        scope->props[parentDef][name] = defArena->freshCell(Symbol{}, location);
+}
+
 DataFlowResult DataFlowGraphBuilder::visitFunction(AstExprFunction* f, NotNull<DfgScope> signatureScope)
 {
     if (AstLocal* self = f->self)
@@ -1418,7 +1530,7 @@ DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprTypeAssertion* t)
     return {def, key};
 }
 
-// Luwu Do Expressions (rfcs/do-expressions.md): a branch can assign (`if c then do x = 1 give x else x`), so each branch
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): a branch can assign (`if c then do x = 1 give x else x`), so each branch
 // gets its own scope and the code after the expression sees the join of both, as after an `if` statement. Upstream
 // visits all three parts in one scope, which is only right while expressions can't assign.
 DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprIfElse* i)
@@ -1431,7 +1543,7 @@ DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprIfElse* i)
 
     {
         PushScope ps{scopeStack, thenScope};
-        // Luwu If Local (rfcs/if-local.md): the chain's bindings are in scope only in the `then` branch
+        // Luwu If Local (rfcs/control-flow/if-local.md): the chain's bindings are in scope only in the `then` branch
         visitIfClauses(i->clauses);
         visitExpr(i->trueExpr);
     }
@@ -1446,15 +1558,79 @@ DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprIfElse* i)
     return {defArena->freshCell(Symbol{}, i->location), nullptr};
 }
 
-// Luwu Do Expressions (rfcs/do-expressions.md): the block always ends in a `give`, `return`, `break` or `continue`, so
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the arms run like an if-else chain, in a scope that holds
+// the subject
+DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprMatch* m)
+{
+    DfgScope* outer = currentScope();
+    DfgScope* matchScope = makeChildScope();
+
+    {
+        PushScope ps{scopeStack, matchScope};
+        visitMatchSubject(m->subject);
+        visitMatchArmValues(m->arms, 0);
+    }
+
+    outer->inherit(matchScope);
+    return {defArena->freshCell(Symbol{}, m->location), nullptr};
+}
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `arms[index]` and the arms after it, as an if-else
+// expression whose `else` is the rest. A last arm that matches every value is the only way out of the rest.
+void DataFlowGraphBuilder::visitMatchArmValues(const AstArray<AstMatchArm>& arms, size_t index)
+{
+    if (index == arms.size)
+        return;
+
+    const AstMatchArm& arm = arms.data[index];
+    if (!arm.condition)
+    {
+        visitExpr(arm.value);
+        return;
+    }
+
+    DfgScope* thenScope = makeChildScope();
+    if (arm.clauses.size == 0)
+        visitExpr(arm.condition);
+
+    {
+        PushScope ps{scopeStack, thenScope};
+        visitIfClauses(arm.clauses);
+        visitExpr(arm.value);
+    }
+
+    if (index + 1 == arms.size && arm.catchAll)
+    {
+        currentScope()->inherit(thenScope);
+        return;
+    }
+
+    DfgScope* restScope = makeChildScope();
+    {
+        PushScope ps{scopeStack, restScope};
+        visitMatchArmValues(arms, index + 1);
+    }
+
+    join(currentScope(), thenScope, restScope);
+}
+
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the block always ends in a `give`, `return`, `break` or `continue`, so
 // nothing falls out of its end. Code after the expression runs only after a `give`, and sees the join of what each
 // `give` saw.
 DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprDo* d)
 {
     DfgScope* outer = currentScope();
-    giveExits.push_back({outer, nullptr});
-
     DfgScope* body = makeChildScope();
+
+    // `x or give v` gives from the enclosing `do` expression
+    if (d->shorthand)
+    {
+        PushScope ps{scopeStack, body};
+        visitBlockWithoutChildScope(d->body);
+        return {defArena->freshCell(Symbol{}, d->location), nullptr};
+    }
+
+    giveExits.push_back({outer, nullptr});
     {
         PushScope ps{scopeStack, body};
         visitBlockWithoutChildScope(d->body);
@@ -1469,7 +1645,7 @@ DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprDo* d)
     return {defArena->freshCell(Symbol{}, d->location), nullptr};
 }
 
-// Luwu Table Comprehensions (rfcs/table-comprehensions.md): the loop is an ordinary loop statement, scoped to the
+// Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): the loop is an ordinary loop statement, scoped to the
 // expression
 DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprTableComprehension* c)
 {
@@ -1493,11 +1669,14 @@ ControlFlow DataFlowGraphBuilder::visit(AstStatComprehensionItem* i)
     return ControlFlow::None;
 }
 
-// Luwu Do Expressions (rfcs/do-expressions.md): records what this path assigned since the `do` expression started, and
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): records what this path assigned since the `do` expression started, and
 // joins it with the other `give`s. Inside the block, a `give` leaves like `return`.
 ControlFlow DataFlowGraphBuilder::visit(AstStatGive* g)
 {
-    visitExpr(g->value);
+    if (g->item)
+        visit(g->item);
+    else
+        visitExpr(g->value);
 
     // The parser only accepts `give` inside a `do` expression
     if (giveExits.empty())
@@ -1645,6 +1824,7 @@ DefId DataFlowGraphBuilder::visitLValue(AstExprIndexName* i, DefId incomingDef)
 
     DfgScope* scope = currentScope();
     DefId updated = defArena->freshCell(i->index, i->location, containsSubscriptedDefinition(incomingDef));
+    forgetPositions(parentDef, i->location);
     scope->props[parentDef][i->index.value] = updated;
     return updated;
 }
@@ -1658,6 +1838,7 @@ DefId DataFlowGraphBuilder::visitLValue(AstExprIndexExpr* i, DefId incomingDef)
     if (auto string = i->index->as<AstExprConstantString>())
     {
         DefId updated = defArena->freshCell(Symbol{}, i->location, containsSubscriptedDefinition(incomingDef));
+        forgetPositions(parentDef, i->location);
         scope->props[parentDef][string->value.data] = updated;
         return updated;
     }

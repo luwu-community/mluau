@@ -550,7 +550,7 @@ struct AstJsonEncoder : public AstVisitor
         writeRaw("}");
     }
 
-    // Luwu If Local (rfcs/if-local.md)
+    // Luwu If Local (rfcs/control-flow/if-local.md)
     void write(const AstIfClause& clause)
     {
         writeRaw("{");
@@ -562,6 +562,80 @@ struct AstJsonEncoder : public AstVisitor
             write("expr", clause.expr);
         popComma(c);
         writeRaw("}");
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
+    void write(const AstMatchSubject& subject)
+    {
+        writeRaw("{");
+        bool c = pushComma();
+        writeType("AstMatchSubject");
+        write("value", subject.value);
+        if (subject.declaration)
+            write("declaration", subject.declaration);
+        popComma(c);
+        writeRaw("}");
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
+    void write(const AstMatchArm& arm)
+    {
+        writeRaw("{");
+        bool c = pushComma();
+        writeType("AstMatchArm");
+        switch (arm.kind)
+        {
+        case AstMatchArm::Case:
+            write("kind", std::string_view("case"));
+            break;
+        case AstMatchArm::When:
+            write("kind", std::string_view("when"));
+            break;
+        case AstMatchArm::Else:
+            write("kind", std::string_view("else"));
+            break;
+        }
+        if (arm.condition)
+            write("condition", arm.condition);
+        if (arm.clauses.size != 0)
+            write("clauses", arm.clauses);
+        if (arm.catchAll)
+            write("catchAll", arm.catchAll);
+        if (arm.value)
+            write("value", arm.value);
+        if (arm.body)
+            write("body", arm.body);
+        popComma(c);
+        writeRaw("}");
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
+    void write(class AstExprMatch* node)
+    {
+        writeNode(
+            node,
+            "AstExprMatch",
+            [&]()
+            {
+                PROP(subject);
+                PROP(arms);
+            }
+        );
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
+    void write(class AstStatMatch* node)
+    {
+        writeNode(
+            node,
+            "AstStatMatch",
+            [&]()
+            {
+                PROP(subject);
+                PROP(arms);
+                PROP(hasEnd);
+            }
+        );
     }
 
     void write(class AstExprIfElse* node)
@@ -821,7 +895,7 @@ struct AstJsonEncoder : public AstVisitor
         writeNode(node, "AstStatContinue", []() {});
     }
 
-    // Luwu Do Expressions (rfcs/do-expressions.md)
+    // Luwu Do Expressions (rfcs/control-flow/do-expressions.md)
     void write(class AstStatGive* node)
     {
         writeNode(
@@ -829,12 +903,15 @@ struct AstJsonEncoder : public AstVisitor
             "AstStatGive",
             [&]()
             {
-                PROP(value);
+                if (node->item)
+                    PROP(item);
+                else
+                    PROP(value);
             }
         );
     }
 
-    // Luwu Table Comprehensions (rfcs/table-comprehensions.md)
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md)
     void write(class AstExprTableComprehension* node)
     {
         writeNode(
@@ -1407,6 +1484,12 @@ struct AstJsonEncoder : public AstVisitor
         return false;
     }
 
+    bool visit(class AstExprMatch* node) override
+    {
+        write(node);
+        return false;
+    }
+
     bool visit(class AstExprTableComprehension* node) override
     {
         write(node);
@@ -1516,6 +1599,12 @@ struct AstJsonEncoder : public AstVisitor
     }
 
     bool visit(class AstStatIf* node) override
+    {
+        write(node);
+        return false;
+    }
+
+    bool visit(class AstStatMatch* node) override
     {
         write(node);
         return false;

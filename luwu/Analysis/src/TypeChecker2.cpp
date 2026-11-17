@@ -15,6 +15,7 @@
 #include "Luau/Instantiation.h"
 #include "Luau/Instantiation2.h"
 #include "Luau/MismatchExplanation.h"
+#include "Luau/MismatchWording.h"
 #include "Luau/RepeatedTypeNames.h"
 #include "Luau/Metamethods.h"
 #include "Luau/Normalize.h"
@@ -734,6 +735,10 @@ bool TypeChecker2::hasBreak(AstStat* node)
         return false;
     }
 
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
+    if (node->is<AstStatMatch>())
+        return Luau::hasBreak(node);
+
     return false;
 }
 
@@ -753,13 +758,13 @@ const AstStat* TypeChecker2::getFallthrough(const AstStat* node)
         return getFallthrough(stat->body.data[stat->body.size - 1]);
     }
 
-    // Luwu Do Expressions (rfcs/do-expressions.md): `if (do return x) then` returns before the branch
+    // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `if (do return x) then` returns before the branch
     if (findDoEndingStatement(node))
         return nullptr;
 
     if (const AstStatIf* stat = node->as<AstStatIf>())
     {
-        // Luwu Do Expressions (rfcs/do-expressions.md): a then-branch that never runs doesn't fall through
+        // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): a then-branch that never runs doesn't fall through
         if (const AstStat* thenf = findDoBlockingThenBranch(stat) ? nullptr : getFallthrough(stat->thenbody))
             return thenf;
 
@@ -773,6 +778,10 @@ const AstStat* TypeChecker2::getFallthrough(const AstStat* node)
         else
             return stat;
     }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
+    if (node->is<AstStatMatch>())
+        return Luau::getFallthrough(node);
 
     if (node->is<AstStatReturn>())
         return nullptr;
@@ -962,6 +971,8 @@ void TypeChecker2::visit(AstStat* stat)
         return visit(s);
     else if (auto s = stat->as<AstStatIf>())
         return visit(s);
+    else if (auto s = stat->as<AstStatMatch>())
+        return visit(s);
     else if (auto s = stat->as<AstStatWhile>())
         return visit(s);
     else if (auto s = stat->as<AstStatRepeat>())
@@ -1022,7 +1033,7 @@ void TypeChecker2::visit(AstStatBlock* block)
         visit(statement);
 }
 
-// Luwu If Local (rfcs/if-local.md): a `when` chain's declarations are checked like any `local`, and its plain
+// Luwu If Local (rfcs/control-flow/if-local.md): a `when` chain's declarations are checked like any `local`, and its plain
 // conditions like the condition of an ordinary `if`.
 void TypeChecker2::visitIfCondition(AstExpr* condition, const AstArray<AstIfClause>& clauses)
 {
@@ -1056,6 +1067,28 @@ void TypeChecker2::visit(AstStatIf* ifStatement)
         visit(ifStatement->elsebody);
 }
 
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
+void TypeChecker2::visit(const AstMatchSubject& subject)
+{
+    if (subject.declaration)
+        visit(subject.declaration);
+    else
+        visit(subject.value, ValueContext::RValue);
+}
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
+void TypeChecker2::visit(AstStatMatch* match)
+{
+    visit(match->subject);
+
+    for (const AstMatchArm& arm : match->arms)
+    {
+        if (arm.condition)
+            visitIfCondition(arm.condition, arm.clauses);
+        visit(arm.body);
+    }
+}
+
 void TypeChecker2::visit(AstStatWhile* whileStatement)
 {
     if (whileStatement->clauses.size != 0)
@@ -1081,6 +1114,8 @@ void TypeChecker2::visit(AstStatContinue*) {}
 enum class FallthroughKind
 {
     IfWithoutElse,
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a `match` statement with no `else` or catch-all arm
+    MatchWithoutElse,
     Loop,
     CodePath,
 };
@@ -1099,6 +1134,8 @@ static FallthroughSite classifyFallthrough(const AstStat* fallthrough)
     constexpr unsigned whileKeywordLength = 5;
     constexpr unsigned repeatKeywordLength = 6;
 
+    constexpr unsigned matchKeywordLength = 5;
+
     if (const AstStatIf* ifStat = fallthrough->as<AstStatIf>(); ifStat && !ifStat->elsebody)
         return {FallthroughKind::IfWithoutElse, ifStat->ifLocation};
 
@@ -1106,6 +1143,9 @@ static FallthroughSite classifyFallthrough(const AstStat* fallthrough)
     {
         return Location{statement.begin, Position{statement.begin.line, statement.begin.column + length}};
     };
+
+    if (fallthrough->is<AstStatMatch>())
+        return {FallthroughKind::MatchWithoutElse, keyword(fallthrough->location, matchKeywordLength)};
 
     if (fallthrough->is<AstStatWhile>())
         return {FallthroughKind::Loop, keyword(fallthrough->location, whileKeywordLength)};
@@ -1124,6 +1164,8 @@ static std::string describeFallthrough(FallthroughKind kind, TypePackId expected
     {
     case FallthroughKind::IfWithoutElse:
         return "This 'if' has no 'else', so the code path that skips it doesn't " + returns;
+    case FallthroughKind::MatchWithoutElse:
+        return "This 'match' has no 'else', so the code path where no arm matches doesn't " + returns;
     case FallthroughKind::Loop:
         return "This loop may not run, so the code path that skips it doesn't " + returns;
     case FallthroughKind::CodePath:
@@ -3322,6 +3364,8 @@ void TypeChecker2::visit(AstExpr* expr, ValueContext context)
         return visit(e);
     else if (auto e = expr->as<AstExprDo>())
         return visit(e);
+    else if (auto e = expr->as<AstExprMatch>())
+        return visit(e);
     else if (auto e = expr->as<AstExprTableComprehension>())
         return visit(e);
     else if (auto e = expr->as<AstExprPop>())
@@ -4001,8 +4045,12 @@ void TypeChecker2::visitCall(AstExprCall* call)
         {
             AstExpr* argExpr = call->args.data[idx];
 
+            // Luwu bundles: a bundle literal `.(a, b)` is a `bundle.pack` call, but always one value
+            const AstExprCall* argCall = argExpr->as<AstExprCall>();
+            bool spreads = !argCall || !isBundlePackCall(argCall);
+
             // The last argument might be an ordinary value, but it can also be an entire pack.
-            if (idx == call->args.size - 1)
+            if (idx == call->args.size - 1 && spreads)
             {
                 if (TypePackId* lastArgPack = module->astTypePacks.find(argExpr))
                 {
@@ -4294,6 +4342,167 @@ void TypeChecker2::visitCall(AstExprCall* call)
     }
 }
 
+namespace
+{
+
+// Luwu collections: the element type a Vec or VecDeque fixes from a value at runtime (setelementtype in
+// lcollectionslib.cpp): a type tag, or a class for an object. The names say it the way the runtime's errors do.
+struct ContainerElement
+{
+    std::string tag;
+    // The class's template for an object, null for any other value
+    const ExternType* cls = nullptr;
+    // "numbers", "'Player' objects", "bundles of 3 values"
+    std::string plural;
+    // "a number", "a 'Player' object", "a bundle of 2 values"
+    std::string single;
+};
+
+std::string withArticle(const std::string& text)
+{
+    bool vowel = !text.empty() && std::string("aeiouAEIOU").find(text[0]) != std::string::npos;
+    return (vowel ? "an " : "a ") + text;
+}
+
+// The element of a value whose runtime type is `tag`
+ContainerElement taggedElement(const std::string& tag)
+{
+    std::string plural = tag;
+    if (tag == "userdata")
+        plural += " values";
+    else if (tag.back() == 's')
+        plural += "es";
+    else
+        plural += "s";
+    return ContainerElement{tag, nullptr, plural, withArticle(tag)};
+}
+
+// The element a value of the object type `object` fixes: its class, named by size for a bundle
+std::optional<ContainerElement> objectElement(const ExternType* object)
+{
+    const ExternType* declared = object->genericTemplate ? get<ExternType>(follow(*object->genericTemplate)) : object;
+    if (!declared)
+        return std::nullopt;
+
+    std::string quoted = "'" + declared->name + "'";
+    if (!declared->printsAsBundle)
+        return ContainerElement{"object", declared, quoted + " objects", withArticle(quoted + " object")};
+
+    // Bundles past the fixed sizes share the class BigBundle at runtime, so any two of them fit together
+    if (object->instantiatedTypePackParams.empty())
+    {
+        std::string size = MismatchWording::countValues(object->instantiatedTypeParams.size());
+        return ContainerElement{"object", declared, "bundles of " + size, "a bundle of " + size};
+    }
+    auto [positions, rest] = flatten(object->instantiatedTypePackParams[0]);
+    std::string bigSize = "more than " + MismatchWording::countValues(kBundleFixedMax);
+    std::string single = rest ? "a bundle of " + bigSize : "a bundle of " + MismatchWording::countValues(positions.size());
+    return ContainerElement{"object", declared, "bundles of " + bigSize, single};
+}
+
+// The element a value of type `ty` fixes, or nullopt when the type doesn't pin one down (a union, `unknown`, a generic)
+std::optional<ContainerElement> containerElementOf(NotNull<BuiltinTypes> builtinTypes, const Scope* scope, TypeId ty)
+{
+    ty = follow(ty);
+    if (const SingletonType* singleton = get<SingletonType>(ty))
+        return taggedElement(get<BooleanSingleton>(singleton) ? "boolean" : "string");
+    if (get<FunctionType>(ty))
+        return taggedElement("function");
+    if (get<TableType>(ty) || get<MetatableType>(ty))
+        return taggedElement("table");
+    if (const PrimitiveType* primitive = get<PrimitiveType>(ty))
+    {
+        switch (primitive->type)
+        {
+        case PrimitiveType::Boolean:
+            return taggedElement("boolean");
+        case PrimitiveType::Number:
+            return taggedElement("number");
+        case PrimitiveType::Integer:
+            return taggedElement("integer");
+        case PrimitiveType::String:
+            return taggedElement("string");
+        case PrimitiveType::Thread:
+            return taggedElement("thread");
+        case PrimitiveType::Function:
+            return taggedElement("function");
+        case PrimitiveType::Table:
+            return taggedElement("table");
+        case PrimitiveType::Buffer:
+            return taggedElement("buffer");
+        default:
+            return std::nullopt;
+        }
+    }
+    if (const ExternType* externType = get<ExternType>(ty))
+    {
+        if (ty == builtinTypes->vectorType)
+            return taggedElement("vector");
+        // An instantiation of a generic class (`OrderedMap<string, number>`) is related to the class through its template
+        const ExternType* declared = externType->genericTemplate ? get<ExternType>(follow(*externType->genericTemplate)) : externType;
+        if (!declared || declared->traitInfo)
+            return std::nullopt;
+        // Luwu try expressions: `Ok` and `Err` are both results at runtime, and `Some` an option
+        if (std::optional<std::string> plural = builtinEnumPlural(scope, ty))
+            return ContainerElement{*plural, nullptr, *plural, withArticle(plural->substr(0, plural->size() - 1))};
+        if (declared->relation && declared->relation->get_if<Klass>())
+            return objectElement(externType);
+        if (!declared->relation)
+            return taggedElement("userdata");
+    }
+    return std::nullopt;
+}
+
+bool sameElement(const ContainerElement& a, const ContainerElement& b)
+{
+    return a.tag == b.tag && a.cls == b.cls;
+}
+
+
+} // namespace
+
+// Luwu collections: `Vec(...)` and `VecDeque(...)` fix their element type to their first value's and raise on a value of
+// another type. The solver infers the union of the arguments instead, so the mismatch is reported here.
+void TypeChecker2::checkContainerConstructor(AstExprCall* call)
+{
+    if (call->args.size < 2)
+        return;
+
+    std::optional<std::string> containerName =
+        fixedElementContainerName(module->internalTypes.get(), findInnermostScope(call->location), lookupType(call->func));
+    if (!containerName)
+        return;
+
+    const Scope* scope = findInnermostScope(call->location);
+    std::optional<ContainerElement> fixed = containerElementOf(builtinTypes, scope, lookupType(call->args.data[0]));
+    if (!fixed)
+        return;
+
+    // A call or `...` as the last argument can stand for any number of values, unless the call returns exactly one (as
+    // `bundle.pack` and a bundle literal `.(a, b)` do)
+    AstExpr* last = call->args.data[call->args.size - 1];
+    auto [lastValues, lastRest] = flatten(lookupPack(last));
+    bool lastIsOneValue = lastValues.size() == 1 && !lastRest;
+    bool lastSpreads = (last->is<AstExprCall>() && !lastIsOneValue) || last->is<AstExprVarargs>();
+    size_t checked = lastSpreads ? call->args.size - 1 : call->args.size;
+    for (size_t i = 1; i < checked; i++)
+    {
+        AstExpr* arg = call->args.data[i];
+        std::optional<ContainerElement> element = containerElementOf(builtinTypes, scope, lookupType(arg));
+        if (!element || sameElement(*element, *fixed))
+            continue;
+
+        std::string message = format(
+            "This %s can only accept %s (the type of its first value), but you passed %s",
+            containerName->c_str(),
+            fixed->plural.c_str(),
+            element->single.c_str()
+        );
+        reportError(GenericError{std::move(message)}, arg->location);
+        return;
+    }
+}
+
 void TypeChecker2::visit(AstExprCall* call)
 {
     std::optional<InConditionalContext> flipper;
@@ -4324,10 +4533,11 @@ void TypeChecker2::visit(AstExprCall* call)
         checkImpossibleTypeTest(call);
 
     visitCall(call);
+    checkContainerConstructor(call);
 }
 
-// Luwu match expressions: a type test's operand for a message. A value `is` read into a hidden local (`(matched)`,
-// `(destructured)`) has no name a user wrote.
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a type test's operand for a message. A value `is` read
+// into a hidden local (`(matched)`, `(destructured)`) has no name a user wrote.
 static std::string typeTestOperandName(std::optional<std::string> name, const char* fallback)
 {
     if (!name || name->empty() || (*name)[0] == '(')
@@ -4335,9 +4545,9 @@ static std::string typeTestOperandName(std::optional<std::string> name, const ch
     return "'" + *name + "'";
 }
 
-// Luwu match expressions: `x is C`, where no value of x's type can be a C. The test is always false, so the code it
-// guards never runs. That's reported here once, and the tested local counts as reported (improperlyUsedLocals), so
-// the reads it guards don't add a "'x' is 'never' here" each.
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `x is C`, where no value of x's type can be a C. The
+// test is always false, so the code it guards never runs. That's reported here once, and the tested local counts as
+// reported (improperlyUsedLocals), so the reads it guards don't add a "'x' is 'never' here" each.
 void TypeChecker2::checkImpossibleTypeTest(AstExprCall* call)
 {
     AstExprIndexName* callee = call->func->as<AstExprIndexName>();
@@ -4443,9 +4653,9 @@ TypeId TypeChecker2::stripFromNilAndReport(TypeId ty, const Location& location)
     return ty;
 }
 
-// Luwu Destructuring (rfcs/destructuring.md): an element of a positional pattern on an object, or a union of objects,
-// reads the field each class's primary constructor takes at that position. Returns false for any other value, whose
-// element is checked like `t[i]`.
+// Luwu Destructuring (rfcs/destructuring.md): a position read (`x.1`, or an element of `.(a, b)`) from an object, or a
+// union of objects, reads the field each class's primary constructor takes at that position. Anything else has no
+// positions. Returns false only when the position isn't a number literal.
 bool TypeChecker2::checkPositionalElement(AstExprIndexExpr* indexExpr)
 {
     const AstExprConstantNumber* number = indexExpr->index->as<AstExprConstantNumber>();
@@ -4466,19 +4676,36 @@ bool TypeChecker2::checkPositionalElement(AstExprIndexExpr* indexExpr)
         options.push_back(exprType);
     }
 
-    for (TypeId option : options)
-    {
-        if (!getClassFieldUserData(option))
-            return false;
-    }
-
     visit(indexExpr->expr, ValueContext::RValue);
 
+    // the parser writes the position of a pattern's element nowhere in the source
+    bool inPattern = indexExpr->index->location.begin == indexExpr->index->location.end;
+
     for (TypeId option : options)
     {
+        // Luwu bundles: a bundle has a position for each of its values, and any past them when it has a rest
+        if (std::optional<BundleShape> shape = bundleShapeOf(option))
+        {
+            if (!shape->at(builtinTypes, position))
+            {
+                PositionalDestructuring error{toString(option), position, std::nullopt, /* notObject */ false, inPattern};
+                error.bundleSize = shape->head.size();
+                reportError(std::move(error), indexExpr->location);
+            }
+            continue;
+        }
+
         const ExternType* cls = get<ExternType>(option);
         const ClassFieldUserData* data = getClassFieldUserData(option);
-        LUAU_ASSERT(cls && data);
+        if (!data)
+        {
+            // only objects have positions; `any` and an earlier error read as anything
+            bool readsAnything = get<AnyType>(option) || get<ErrorType>(option);
+            if (!readsAnything)
+                reportError(PositionalDestructuring{toString(option), position, std::nullopt, /* notObject */ true, inPattern}, indexExpr->location);
+            continue;
+        }
+        LUAU_ASSERT(cls);
 
         bool hasPosition = data->positionalFields && position < data->positionalFields->size();
         if (hasPosition)
@@ -4844,7 +5071,11 @@ void TypeChecker2::visit(AstExprIndexExpr* indexExpr, ValueContext context)
     else if (auto cls = get<ExternType>(exprType))
     {
         if (cls->indexer)
+        {
             testIsSubtype(indexType, cls->indexer->indexType, indexExpr->index->location);
+            if (context == ValueContext::LValue && cls->indexer->isReadOnly)
+                reportError(PropertyAccessViolation{exprType, "indexer", PropertyAccessViolation::CannotWrite}, indexExpr->location);
+        }
         else
             reportError(DynamicPropertyLookupOnExternTypesUnsafe{exprType}, indexExpr->location);
     }
@@ -5802,6 +6033,12 @@ void TypeChecker2::checkLuwuNominalTypeComparison(AstExprBinary* expr)
     if (!kind || comparedName == kind)
         return;
 
+    // Luwu builtin classes: `typeof` names an object of a builtin class after its class ("bundle", "vec"), not "object"
+    bool builtinClassTypeof =
+        query->function == "typeof" && std::string_view(kind) == "object" && isBuiltinClassTypeofName(std::string(comparedName));
+    if (builtinClassTypeof)
+        return;
+
     bool comparesEqual = expr->op == AstExprBinary::Op::CompareEq;
     reportError(GenericError{luwuNominalTypeComparisonMessage(query->function, comparedName, queriedTy, kind, comparesEqual)}, expr->location);
 }
@@ -6224,20 +6461,37 @@ void TypeChecker2::visit(AstExprIfElse* expr)
     visit(expr->falseExpr, ValueContext::RValue);
 }
 
-// Luwu Do Expressions (rfcs/do-expressions.md)
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
+void TypeChecker2::visit(AstExprMatch* expr)
+{
+    InConditionalContext inContext(&typeContext, TypeContext::Default);
+    visit(expr->subject);
+
+    for (const AstMatchArm& arm : expr->arms)
+    {
+        if (arm.condition)
+            visitIfCondition(arm.condition, arm.clauses);
+        visit(arm.value, ValueContext::RValue);
+    }
+}
+
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md)
 void TypeChecker2::visit(AstExprDo* expr)
 {
     InConditionalContext inContext(&typeContext, TypeContext::Default);
     visit(expr->body);
 }
 
-// Luwu Do Expressions (rfcs/do-expressions.md)
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md)
 void TypeChecker2::visit(AstStatGive* give)
 {
-    visit(give->value, ValueContext::RValue);
+    if (give->item)
+        visit(give->item);
+    else
+        visit(give->value, ValueContext::RValue);
 }
 
-// Luwu Table Comprehensions (rfcs/table-comprehensions.md): the loop is checked like any loop, then the item against the
+// Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): the loop is checked like any loop, then the item against the
 // table's indexer, which an annotation may have decided. A nil value adds nothing, so the value may be nil even when
 // the element type isn't.
 void TypeChecker2::visit(AstExprTableComprehension* expr)
@@ -6249,22 +6503,31 @@ void TypeChecker2::visit(AstExprTableComprehension* expr)
     if (!ttv || !ttv->indexer)
         return;
 
-    AstStatComprehensionItem* item = expr->item;
+    // A `do` item whose `give`s write keys adds the items of those `give`s
+    if (expr->item->givenItems.size == 0)
+        checkComprehensionItem(expr->item, *ttv->indexer);
 
+    for (AstStatComprehensionItem* given : expr->item->givenItems)
+        checkComprehensionItem(given, *ttv->indexer);
+}
+
+// Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): one item against the table's indexer
+void TypeChecker2::checkComprehensionItem(AstStatComprehensionItem* item, const TableIndexer& indexer)
+{
     if (item->key)
-        testIsSubtype(lookupType(item->key), ttv->indexer->indexType, item->key->location);
+        testIsSubtype(lookupType(item->key), indexer.indexType, item->key->location);
 
     // Accepted against `element | nil`, but reported against the element type, which is what the reader wrote. Checked as
     // a literal like a list literal's items, so `tags = {}` fits a `{ string }` property.
     TypeId valueType = lookupType(item->value);
-    TypeId elementOrNil = module->internalTypes->addType(UnionType{{ttv->indexer->indexResultType, builtinTypes->nilType}});
+    TypeId elementOrNil = module->internalTypes->addType(UnionType{{indexer.indexResultType, builtinTypes->nilType}});
     NotNull<Scope> scope{findInnermostScope(item->value->location)};
 
     if (!subtyping->isSubtype(valueType, elementOrNil, scope).isSubtype)
-        testPotentialLiteralIsSubtype(item->value, ttv->indexer->indexResultType);
+        testPotentialLiteralIsSubtype(item->value, indexer.indexResultType);
 }
 
-// Luwu Table Comprehensions (rfcs/table-comprehensions.md): see visit(AstExprTableComprehension*)
+// Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): see visit(AstExprTableComprehension*)
 void TypeChecker2::visit(AstStatComprehensionItem* item)
 {
     if (item->key)
@@ -8225,6 +8488,14 @@ bool TypeChecker2::testPotentialLiteralIsSubtype(AstExpr* expr, TypeId expectedT
     {
         bool passes = testPotentialLiteralIsSubtype(ifElse->trueExpr, expectedType);
         passes &= testPotentialLiteralIsSubtype(ifElse->falseExpr, expectedType);
+        return passes;
+    }
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): each arm's value, like an if-else expression's branches
+    else if (auto match = expr->as<AstExprMatch>())
+    {
+        bool passes = true;
+        for (const AstMatchArm& arm : match->arms)
+            passes &= testPotentialLiteralIsSubtype(arm.value, expectedType);
         return passes;
     }
     else if (auto binExpr = expr->as<AstExprBinary>(); binExpr && binExpr->op == AstExprBinary::Or)

@@ -29,7 +29,10 @@ pub static ENABLED_FFLAGS: &[&str] = &[
     "LuwuDestructuring",
     // the `collections` library; it also needs LuwuClasses and LuwuNonePrimitive, and stays closed without them
     #[cfg(feature = "luwu-classes")]
-    "DebugLuwuCollections",
+    "DebugLuwuBuiltinClasses",
+    // the `bundle` library and `.(a, b)` values; it also needs LuwuClasses
+    #[cfg(feature = "luwu-classes")]
+    "DebugLuwuBundles",
     // `try` expressions, which give a `collections.result`
     #[cfg(feature = "luwu-classes")]
     "DebugLuwuTryExpressions"
@@ -138,7 +141,7 @@ impl Lua {
             })?;
         }
 
-        // The `collections` library of builtin classes (DebugLuwuCollections, enabled above). It needs classes and
+        // The `collections` library of builtin classes (DebugLuwuBuiltinClasses, enabled above). It needs classes and
         // the `none` primitive, which is the empty option.
         #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
         {
@@ -149,7 +152,7 @@ impl Lua {
             })?;
         }
 
-        // The `bundle` library, which `.(a, b)` values build their bundles with (DebugLuwuCollections, enabled above)
+        // The `bundle` library, which `.(a, b)` values build their bundles with (DebugLuwuBundles, enabled above)
         #[cfg(all(feature = "luwu-classes", feature = "none-primitive"))]
         {
             let lua = self.lock();

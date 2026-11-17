@@ -1248,7 +1248,7 @@ const Instruction* executeGETPOSITIONAL(lua_State* L, const Instruction* pc, Stk
     return pc;
 }
 
-// Luwu Table Comprehensions (rfcs/table-comprehensions.md): LOP_PRESIZETABLE for native code (see FALLBACK_PRESIZETABLE)
+// Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): LOP_PRESIZETABLE for native code (see FALLBACK_PRESIZETABLE)
 const Instruction* executePRESIZETABLE(lua_State* L, const Instruction* pc, StkId base, TValue* k)
 {
     Instruction insn = *pc++;

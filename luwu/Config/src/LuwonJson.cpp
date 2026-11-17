@@ -807,8 +807,8 @@ private:
         if (const LuwonValue* bundle = only("$bundle"); isList(bundle))
         {
             const std::vector<LuwonEntry>& values = bundle->table->array;
-            if (values.size() > 12)
-                return fail("'$bundle' holds at most 12 values");
+            if (values.size() > 1024)
+                return fail("'$bundle' holds at most 1024 values");
 
             LuwonValue value{LuwonValue::Kind::Bundle};
             for (const LuwonEntry& entry : values)

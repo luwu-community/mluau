@@ -5,8 +5,8 @@
 #include "Luau/StringUtils.h"
 
 #include <algorithm>
+#include <stdlib.h>
 #include <string.h>
-#include <climits>
 
 LUAU_FASTFLAG(LuauIntegerType2)
 LUAU_FASTFLAG(LuwuClasses)
@@ -1580,7 +1580,7 @@ uint8_t BytecodeBuilder::getVersion()
     if (FFlag::LuwuDestructuring)
         return LWBC_VERSION_WIP;
 
-    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): LOP_PRESIZETABLE is WIP bytecode too
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): LOP_PRESIZETABLE is WIP bytecode too
     if (FFlag::LuwuTableComprehensions)
         return LWBC_VERSION_WIP;
 

@@ -62,6 +62,7 @@ LUAU_FASTFLAG(DebugLuwuUserDefinedRefinements)
 // Luwu literal types: `literal<B>` in parameter and local annotations, and `V<literal<B>>` validators (in progress)
 LUAU_FASTFLAGVARIABLE(LuwuLiteralTypes)
 LUAU_FASTFLAG(DebugLuwuTryExpressions)
+LUAU_FASTFLAG(DebugLuwuBuiltinClasses)
 
 namespace Luau
 {
@@ -912,15 +913,23 @@ TypePackId ConstraintGenerator::addTypePack(std::vector<TypeId> head, std::optio
 
 ScopePtr ConstraintGenerator::childScope(AstNode* node, const ScopePtr& parent)
 {
+    ScopePtr scope = childScope(node->location, parent);
+    module->astScopes[node] = scope.get();
+
+    return scope;
+}
+
+// Luwu: a scope for part of a node, such as the rest of a `match`'s arms, which no AstNode spans
+ScopePtr ConstraintGenerator::childScope(const Location& location, const ScopePtr& parent)
+{
     auto scope = std::make_shared<Scope>(parent);
-    scopes.emplace_back(node->location, scope);
-    scope->location = node->location;
+    scopes.emplace_back(location, scope);
+    scope->location = location;
 
     scope->returnType = parent->returnType;
     scope->varargPack = parent->varargPack;
 
     parent->children.emplace_back(scope.get());
-    module->astScopes[node] = scope.get();
 
     return scope;
 }
@@ -1249,7 +1258,15 @@ void ConstraintGenerator::applyRefinements(const ScopePtr& scope, Location locat
 
     for (auto& [def, partition] : refinements)
     {
-        if (std::optional<TypeId> defTy = lookup(scope, location, def))
+        // Luwu Destructuring (rfcs/destructuring.md): a position read (`b.1`) records its type in the scope it's checked
+        // in. A condition checks some of its parts in separate scopes (the right side of `and`, an if-else expression's
+        // condition), which the branch being refined isn't inside, so its type is looked up by its definition too. Upstream
+        // has only property reads, which are refined through the table they're read from instead.
+        std::optional<TypeId> defTy = lookup(scope, location, def);
+        if (const TypeId* positionRead = defTy ? nullptr : positionReadTypes.find(def))
+            defTy = *positionRead;
+
+        if (defTy)
         {
             TypeId ty = *defTy;
             // Intersect ty with every discriminant type. If either type is not
@@ -3484,6 +3501,99 @@ void ConstraintGenerator::prototypeTypeDefinitions(const ScopePtr& scope, AstSta
     }
 }
 
+namespace
+{
+
+// Whether `local` is read or written anywhere in `node`
+bool mentionsLocal(AstNode* node, const AstLocal* local)
+{
+    struct Finder : AstVisitor
+    {
+        const AstLocal* local = nullptr;
+        bool found = false;
+
+        bool visit(AstNode*) override
+        {
+            return !found;
+        }
+
+        bool visit(AstExprLocal* expr) override
+        {
+            found = found || expr->local == local;
+            return false;
+        }
+    };
+
+    Finder finder;
+    finder.local = local;
+    node->visit(&finder);
+    return finder.found;
+}
+
+// The argument holding the value when `call` pushes onto `receiver`: `x:push(v)`, `x:pushback(v)`, `x:pushfront(v)`, or
+// `x:insert(i, v)`. nullopt for any other call, or one whose arguments read `receiver` themselves.
+std::optional<size_t> pushedValueIndex(const AstExprCall* call, const AstLocal* receiver)
+{
+    const AstExprIndexName* method = call->self ? call->func->as<AstExprIndexName>() : nullptr;
+    const AstExprLocal* object = method ? method->expr->as<AstExprLocal>() : nullptr;
+    if (!object || object->local != receiver)
+        return std::nullopt;
+
+    std::optional<size_t> index;
+    if (method->index == "push" || method->index == "pushback" || method->index == "pushfront")
+        index = 0;
+    else if (method->index == "insert")
+        index = 1;
+    if (!index || *index >= call->args.size)
+        return std::nullopt;
+
+    for (AstExpr* arg : call->args)
+    {
+        if (mentionsLocal(arg, receiver))
+            return std::nullopt;
+    }
+    return index;
+}
+
+} // namespace
+
+// Luwu collections: finds each `local x = C()` in `block`, without arguments or an annotation, whose next use is a push.
+// Its constructor gets an element type that push binds (firstPushElementTypes, firstPushes). The solver only applies it
+// when `C` turns out to be Vec or VecDeque.
+void ConstraintGenerator::findFirstPushes(AstStatBlock* block)
+{
+    for (size_t i = 0; i < block->body.size; i++)
+    {
+        const AstStatLocal* declaration = block->body.data[i]->as<AstStatLocal>();
+        bool oneValue = declaration && declaration->vars.size == 1 && declaration->values.size == 1;
+        if (!oneValue || declaration->vars.data[0]->annotation)
+            continue;
+
+        AstExprCall* constructor = declaration->values.data[0]->as<AstExprCall>();
+        bool empty = constructor && constructor->args.size == 0 && !constructor->self && constructor->typeArguments.size == 0;
+        if (!empty || constructor->func->is<AstExprInstantiate>())
+            continue;
+
+        AstLocal* container = declaration->vars.data[0];
+        for (size_t j = i + 1; j < block->body.size; j++)
+        {
+            AstStat* stat = block->body.data[j];
+            if (!mentionsLocal(stat, container))
+                continue;
+
+            const AstStatExpr* statement = stat->as<AstStatExpr>();
+            AstExprCall* push = statement ? statement->expr->as<AstExprCall>() : nullptr;
+            if (std::optional<size_t> valueIndex = push ? pushedValueIndex(push, container) : std::nullopt)
+            {
+                TypeId elementType = arena->addType(BlockedType{});
+                firstPushElementTypes[constructor] = elementType;
+                firstPushes[push] = FirstPush{elementType, *valueIndex};
+            }
+            break;
+        }
+    }
+}
+
 ControlFlow ConstraintGenerator::visitBlockWithoutChildScope(const ScopePtr& scope, AstStatBlock* block)
 {
     RecursionCounter counter{&recursionCount};
@@ -3495,6 +3605,8 @@ ControlFlow ConstraintGenerator::visitBlockWithoutChildScope(const ScopePtr& sco
     }
 
     prototypeTypeDefinitions(scope, block);
+    if (FFlag::DebugLuwuBuiltinClasses)
+        findFirstPushes(block);
 
     std::optional<ControlFlow> firstControlFlow;
     for (AstStat* stat : block->body)
@@ -3522,6 +3634,8 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStat* stat)
         return visit(scope, s);
     else if (auto i = stat->as<AstStatIf>())
         return visit(scope, i);
+    else if (auto match = stat->as<AstStatMatch>())
+        return visit(scope, match);
     else if (auto s = stat->as<AstStatWhile>())
         return visit(scope, s);
     else if (auto s = stat->as<AstStatRepeat>())
@@ -3599,84 +3713,129 @@ ConstraintGenerator::ResolvedAnnotation ConstraintGenerator::resolveLocalAnnotat
     return ResolvedAnnotation{resolveType(scope, local->annotation, /* inTypeArguments */ false), std::nullopt};
 }
 
-// Luwu bundles: how many values the `.(...)` that `expr` evaluates to holds (Parser::parseDotPositional), looking
-// through parentheses and if-else branches. 0 when it isn't one.
-static size_t dotPositionalSize(AstExpr* expr)
+// Luwu bundles: each `.(...)` (Parser::parseDotPositional) that `expr` can evaluate to, looking through parentheses,
+// if-else branches, the values a `do` expression gives and a `match`'s arms
+static void collectDotPositionals(AstExpr* expr, std::vector<AstExprCall*>& out)
 {
     if (AstExprGroup* group = expr->as<AstExprGroup>())
-        return dotPositionalSize(group->expr);
-
-    if (AstExprIfElse* ifElse = expr->as<AstExprIfElse>())
     {
-        size_t size = dotPositionalSize(ifElse->trueExpr);
-        return size != 0 ? size : dotPositionalSize(ifElse->falseExpr);
+        collectDotPositionals(group->expr, out);
     }
+    else if (AstExprIfElse* ifElse = expr->as<AstExprIfElse>())
+    {
+        collectDotPositionals(ifElse->trueExpr, out);
+        collectDotPositionals(ifElse->falseExpr, out);
+    }
+    else if (AstExprDo* doExpr = expr->as<AstExprDo>(); doExpr && !doExpr->shorthand)
+    {
+        for (AstStatGive* give : doExpr->gives())
+        {
+            if (!give->item)
+                collectDotPositionals(give->value, out);
+        }
+    }
+    else if (AstExprMatch* match = expr->as<AstExprMatch>())
+    {
+        for (const AstMatchArm& arm : match->arms)
+            collectDotPositionals(arm.value, out);
+    }
+    else if (AstExprCall* call = expr->as<AstExprCall>(); call && call->fromDotPositional)
+    {
+        out.push_back(call);
+    }
+}
 
-    AstExprCall* call = expr->as<AstExprCall>();
-    if (!call || !call->fromDotPositional || call->args.size == 0)
-        return 0;
+// Luwu bundles: how many values the `.(...)` that `expr` evaluates to holds, the first of collectDotPositionals whose size
+// is known. 0 when there's none.
+static size_t dotPositionalSize(AstExpr* expr)
+{
+    std::vector<AstExprCall*> calls;
+    collectDotPositionals(expr, calls);
 
-    // a last value that's a call or `...` decides the size at runtime
-    AstExpr* last = call->args.data[call->args.size - 1];
-    if (last->is<AstExprCall>() || last->is<AstExprVarargs>())
-        return 0;
-    return call->args.size;
+    for (AstExprCall* call : calls)
+    {
+        if (call->args.size == 0)
+            continue;
+
+        // a last value that's a call or `...` decides the size at runtime
+        AstExpr* last = call->args.data[call->args.size - 1];
+        if (!last->is<AstExprCall>() && !last->is<AstExprVarargs>())
+            return call->args.size;
+    }
+    return 0;
 }
 
 // Luwu Destructuring (rfcs/destructuring.md): a positional pattern on a `.(...)` value gives the bundle its elements'
 // annotations as its expected type, so `const .(format: Format, extension: string) = .("Zip", "zip")` checks "Zip"
-// against `Format` instead of widening it to `string`. Every element needs an annotation: a placeholder for a missing one
-// would be inferred from how the element is used later instead of from its value.
+// against `Format` instead of widening it to `string`. An element without an annotation expects nothing, and is `unknown`
+// in the bundle's expected type, which pushes nothing into its value.
 std::optional<TypeId> ConstraintGenerator::expectedBundleType(const ScopePtr& scope, AstStatLocal* statLocal)
 {
     AstDestructurePattern* pattern = statLocal->destructure;
     if (!pattern || !pattern->positional || statLocal->vars.size != 1 || statLocal->values.size != 1 || statLocal->vars.data[0]->annotation)
         return std::nullopt;
 
-    // the bundle class of each size, as the `bundle` library exports them
+    // the bundle class of each fixed size, as the `bundle` library exports them, then `BigBundle` for any larger one
     static const char* const kBundles[] = {
         "Bundle0", "Bundle1", "Bundle2", "Bundle3", "Bundle4", "Bundle5", "Bundle6",
-        "Bundle7", "Bundle8", "Bundle9", "Bundle10", "Bundle11", "Bundle12",
     };
     static constexpr size_t kBundleCount = sizeof(kBundles) / sizeof(kBundles[0]);
 
     size_t size = dotPositionalSize(statLocal->values.data[0]);
-    if (size == 0 || size >= kBundleCount || pattern->fields.size != size || !globalScope->lookupImportedType("bundle", kBundles[size]))
+    const char* className = size < kBundleCount ? kBundles[size] : "BigBundle";
+    if (size == 0 || pattern->fields.size != size || !globalScope->lookupImportedType("bundle", className))
         return std::nullopt;
 
+    std::vector<std::optional<TypeId>> elements;
+    std::vector<TypeId> positions;
+    bool annotated = false;
     for (const AstDestructureField& field : pattern->fields)
     {
-        if (field.target.location || !field.target.local->annotation)
-            return std::nullopt;
+        AstLocal* local = field.target.location ? nullptr : field.target.local;
+        if (!local || !local->annotation)
+        {
+            elements.push_back(std::nullopt);
+            positions.push_back(builtinTypes->unknownType);
+            continue;
+        }
+
+        ResolvedAnnotation annotation = resolveLocalAnnotation(scope, local);
+        bundleElementAnnotations[local] = annotation;
+        elements.push_back(annotation.type);
+        positions.push_back(annotation.type);
+        annotated = true;
     }
 
-    std::vector<TypeId> elements;
-    for (const AstDestructureField& field : pattern->fields)
-    {
-        ResolvedAnnotation annotation = resolveLocalAnnotation(scope, field.target.local);
-        bundleElementAnnotations[field.target.local] = annotation;
-        elements.push_back(annotation.type);
-    }
+    if (!annotated)
+        return std::nullopt;
 
     expectDotPositionalElements(statLocal->values.data[0], elements);
 
-    TypeId bundle = arena->addType(PendingExpansionType{AstName{"bundle"}, AstName{kBundles[size]}, std::move(elements), {}});
+    // a `BigBundle`'s positions are its one type pack
+    std::vector<TypeId> typeArguments;
+    std::vector<TypePackId> packArguments;
+    if (size < kBundleCount)
+        typeArguments = std::move(positions);
+    else
+        packArguments.push_back(arena->addTypePack(std::move(positions)));
+
+    TypeId bundle =
+        arena->addType(PendingExpansionType{AstName{"bundle"}, AstName{className}, std::move(typeArguments), std::move(packArguments)});
     addConstraint(globalScope, statLocal->location, TypeAliasExpansionConstraint{/* target */ bundle});
     return bundle;
 }
 
-// Each `.(...)` that `expr` evaluates to, through parentheses and if-else branches like dotPositionalSize
-void ConstraintGenerator::expectDotPositionalElements(AstExpr* expr, const std::vector<TypeId>& elements)
+// Each `.(...)` that `expr` evaluates to (collectDotPositionals) with as many values as there are elements
+void ConstraintGenerator::expectDotPositionalElements(AstExpr* expr, const std::vector<std::optional<TypeId>>& elements)
 {
-    if (AstExprGroup* group = expr->as<AstExprGroup>())
-        expectDotPositionalElements(group->expr, elements);
-    else if (AstExprIfElse* ifElse = expr->as<AstExprIfElse>())
+    std::vector<AstExprCall*> calls;
+    collectDotPositionals(expr, calls);
+
+    for (AstExprCall* call : calls)
     {
-        expectDotPositionalElements(ifElse->trueExpr, elements);
-        expectDotPositionalElements(ifElse->falseExpr, elements);
+        if (call->args.size == elements.size())
+            dotPositionalElementTypes[call] = elements;
     }
-    else if (AstExprCall* call = expr->as<AstExprCall>(); call && call->fromDotPositional && call->args.size == elements.size())
-        dotPositionalElementTypes[call] = elements;
 }
 
 ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatLocal* statLocal)
@@ -4274,7 +4433,7 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatForIn* forI
 
 ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatWhile* while_)
 {
-    // Luwu If Local (rfcs/if-local.md): `while local x = f() when c do`, checked like an `if`'s chain
+    // Luwu If Local (rfcs/control-flow/if-local.md): `while local x = f() when c do`, checked like an `if`'s chain
     if (while_->clauses.size != 0)
     {
         ScopePtr chainScope = ifClausesScope(while_->clauses, while_->body, scope);
@@ -4562,7 +4721,7 @@ static void bindFreeType(TypeId a, TypeId b)
         emplaceType<BoundType>(asMutable(b), a);
 }
 
-// Luwu Do Expressions (rfcs/do-expressions.md): every value of a statement runs, so after a value that is `x or return`
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): every value of a statement runs, so after a value that is `x or return`
 // (asLeaveGuard), `x` is truthy, and after `x and return`, falsy.
 void ConstraintGenerator::applyOrLeaveRefinements(const ScopePtr& scope, const AstArray<AstExpr*>& values)
 {
@@ -4579,7 +4738,10 @@ void ConstraintGenerator::applyOrLeaveRefinements(const ScopePtr& scope, const A
 
 ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatAssign* assign)
 {
-    TypePackId resultPack = checkPack(scope, assign->values).tp;
+    std::vector<std::optional<TypeId>> expectedTypes;
+    for (size_t i = 0; i < assign->vars.size && i < assign->values.size; ++i)
+        expectedTypes.push_back(expectedTypeOfAssignedBundle(scope, assign->vars.data[i], assign->values.data[i]));
+    TypePackId resultPack = checkPack(scope, assign->values, expectedTypes).tp;
     applyOrLeaveRefinements(scope, assign->values);
 
     std::vector<TypeId> valueTypes;
@@ -4630,12 +4792,70 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatPush* push)
     if (containerTable && containerTable->indexer && follow(containerTable->indexer->indexType) == builtinTypes->numberType)
         elementType = containerTable->indexer->indexResultType;
 
+    // The values settle first: an expected type they take on the way (a literal's singletons) is part of what's pushed
     std::vector<std::optional<TypeId>> expectedTypes(push->values.size, elementType);
+    Checkpoint valuesStart = checkpoint(this);
     TypePackId valuesPack = checkPack(scope, push->values, expectedTypes).tp;
+    Checkpoint valuesEnd = checkpoint(this);
 
-    addConstraint(scope, push->location, PushConstraint{containerType, valuesPack});
+    // A container whose type isn't known yet passes its element type to the values through the solver, before their own
+    // constraints run, as a parameter's type reaches an argument. A call's values are fixed by its own constraints (a
+    // bundle literal's), so only a call needs it: anything else still takes the element type when it's pushed.
+    bool pushesCall = std::any_of(push->values.begin(), push->values.end(), [](AstExpr* value) { return value->is<AstExprCall>(); });
+    if (!elementType && pushesCall)
+    {
+        TypeId element = arena->addType(BlockedType{});
+        NotNull<Constraint> indexer =
+            addConstraint(scope, push->target->location, HasIndexerConstraint{element, containerType, builtinTypes->numberType});
+        getMutable<BlockedType>(element)->setOwner(indexer);
+
+        for (AstExpr* value : push->values)
+        {
+            TypeId* valueType = module->astTypes.find(value);
+            if (!valueType)
+                continue;
+            NotNull<Constraint> expected = addConstraint(
+                scope,
+                value->location,
+                PushTypeConstraint{element, *valueType, NotNull{&module->astTypes}, NotNull{&module->astExpectedTypes}, NotNull{value}}
+            );
+            addAllAsReverseDependencies(valuesStart, valuesEnd, this, expected);
+        }
+    }
+
+    NotNull<Constraint> pushConstraint = addConstraint(scope, push->location, PushConstraint{containerType, valuesPack});
+    addAllAsDependencies(valuesStart, valuesEnd, this, pushConstraint);
 
     return ControlFlow::None;
+}
+
+// Luwu bundles: the type a bundle literal assigned to `target` is expected to have, so its positions take their expected
+// types as in a declaration (`later = .("coal", 3)` keeps "coal" a singleton where an `.(ItemId, number)` goes): an
+// annotated local's type, or the type of a local's property. nullopt for any other value or target, which are checked
+// without an expected type as before.
+std::optional<TypeId> ConstraintGenerator::expectedTypeOfAssignedBundle(const ScopePtr& scope, AstExpr* target, AstExpr* value)
+{
+    const AstExprCall* call = value->as<AstExprCall>();
+    if (!call || !isBundlePackCall(call))
+        return std::nullopt;
+
+    if (const AstExprLocal* local = target->as<AstExprLocal>())
+        return local->local->annotation ? scope->lookup(local->local) : std::nullopt;
+
+    const AstExprIndexName* property = target->as<AstExprIndexName>();
+    const AstExprLocal* object = property ? property->expr->as<AstExprLocal>() : nullptr;
+    std::optional<TypeId> objectType = object ? scope->lookup(object->local) : std::nullopt;
+    if (!objectType)
+        return std::nullopt;
+
+    TypeId propertyType = arena->addType(BlockedType{});
+    NotNull<Constraint> hasProp = addConstraint(
+        scope,
+        property->location,
+        HasPropConstraint{propertyType, *objectType, property->index.value, ValueContext::LValue, inConditional(typeContext)}
+    );
+    getMutable<BlockedType>(propertyType)->setOwner(hasProp);
+    return propertyType;
 }
 
 ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatCompoundAssign* assign)
@@ -4647,7 +4867,7 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatCompoundAss
     return ControlFlow::None;
 }
 
-// Luwu If Local (rfcs/if-local.md): the scope a `when` chain's bindings and refinements live in. It spans the chain
+// Luwu If Local (rfcs/control-flow/if-local.md): the scope a `when` chain's bindings and refinements live in. It spans the chain
 // and the branch it guards, so code in a later clause sees the bindings before it. The branch's own scope is a child.
 ScopePtr ConstraintGenerator::ifClausesScope(const AstArray<AstIfClause>& clauses, AstNode* branch, const ScopePtr& parent)
 {
@@ -4663,7 +4883,7 @@ ScopePtr ConstraintGenerator::ifClausesScope(const AstArray<AstIfClause>& clause
     return scope;
 }
 
-// Luwu If Local (rfcs/if-local.md): checks a `when` chain in `chainScope` (see ifClausesScope). A
+// Luwu If Local (rfcs/control-flow/if-local.md): checks a `when` chain in `chainScope` (see ifClausesScope). A
 // binding is declared like a `local` and narrowed to truthy (an untested one only declared); a plain condition's
 // refinement applies to the clauses after it and to the branch. Returns what the else branch may assume the negation
 // of: for a chain of plain conditions and untested bindings, the conditions' conjunction (the same as `a and b`); for a
@@ -4752,29 +4972,129 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatIf* ifState
         if (ifStatement->elsebody)
             elsecf = visit(elseScope, ifStatement->elsebody);
 
-        if (thencf != ControlFlow::None && elsecf == ControlFlow::None)
-            scope->inheritRefinements(elseScope);
-        else if (thencf == ControlFlow::None && elsecf != ControlFlow::None)
-        {
-            // Luwu If Local (rfcs/if-local.md): every clause passed, so what the chain refined holds after the `if`
-            if (chainScope)
-                scope->inheritRefinements(chainScope);
-
-            scope->inheritRefinements(thenScope);
-        }
-
-        if (thencf == ControlFlow::None)
-            scope->inheritAssignments(thenScope);
-        if (elsecf == ControlFlow::None)
-            scope->inheritAssignments(elseScope);
-
-        if (thencf == elsecf)
-            return thencf;
-        else if (matches(thencf, ControlFlow::Returns | ControlFlow::Throws) && matches(elsecf, ControlFlow::Returns | ControlFlow::Throws))
-            return ControlFlow::Returns;
-        else
-            return ControlFlow::None;
+        return joinBranches(scope, BranchScopes{chainScope, thenScope, refinement}, elseScope, thencf, elsecf);
     }
+}
+
+// What the code after a two-way branch sees: the refinements of the branch that falls through when the other one
+// leaves, the assignments of each branch that falls through, and how the whole statement leaves
+ControlFlow ConstraintGenerator::joinBranches(
+    const ScopePtr& scope,
+    const BranchScopes& then,
+    const ScopePtr& elseScope,
+    ControlFlow thencf,
+    ControlFlow elsecf
+)
+{
+    if (thencf != ControlFlow::None && elsecf == ControlFlow::None)
+        scope->inheritRefinements(elseScope);
+    else if (thencf == ControlFlow::None && elsecf != ControlFlow::None)
+    {
+        // Luwu If Local (rfcs/control-flow/if-local.md): every clause passed, so what the chain refined holds after the `if`
+        if (then.chain)
+            scope->inheritRefinements(then.chain);
+
+        scope->inheritRefinements(then.body);
+    }
+
+    if (thencf == ControlFlow::None)
+        scope->inheritAssignments(then.body);
+    if (elsecf == ControlFlow::None)
+        scope->inheritAssignments(elseScope);
+
+    if (thencf == elsecf)
+        return thencf;
+    else if (matches(thencf, ControlFlow::Returns | ControlFlow::Throws) && matches(elsecf, ControlFlow::Returns | ControlFlow::Throws))
+        return ControlFlow::Returns;
+    else
+        return ControlFlow::None;
+}
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): checks `arm`'s condition (a plain one, or its `when`
+// chain) in `scope`. `branch` is the arm's value or block, which gets the scope with the condition's refinement.
+ConstraintGenerator::BranchScopes ConstraintGenerator::checkMatchArmCondition(const ScopePtr& scope, const AstMatchArm& arm, AstNode* branch)
+{
+    BranchScopes result;
+
+    if (arm.clauses.size != 0)
+    {
+        result.chain = ifClausesScope(arm.clauses, branch, scope);
+        result.refinement = checkIfClauses(result.chain, arm.clauses);
+        result.body = childScope(branch, result.chain);
+        return result;
+    }
+
+    {
+        InConditionalContext flipper{&typeContext};
+        result.refinement = check(scope, arm.condition).refinement;
+    }
+
+    result.body = childScope(branch, scope);
+    applyRefinements(result.body, arm.condition->location, result.refinement);
+    return result;
+}
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the scope the arms after `arms[index]` are checked in,
+// which assumes that arm didn't match. It spans from the next arm's keyword to the end of the `match`.
+ScopePtr ConstraintGenerator::matchRestScope(
+    const ScopePtr& scope,
+    const AstArray<AstMatchArm>& arms,
+    size_t index,
+    const Location& matchLocation,
+    RefinementId refinement
+)
+{
+    Location location{matchLocation.end, matchLocation.end};
+    if (index + 1 < arms.size)
+        location = Location{arms.data[index + 1].keywordLocation, matchLocation};
+
+    ScopePtr rest = childScope(location, scope);
+    applyRefinements(rest, location, refinementArena.negation(refinement));
+    return rest;
+}
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the header's declaration of the subject, or the local the
+// arms test
+void ConstraintGenerator::checkMatchSubject(const ScopePtr& scope, const AstMatchSubject& subject)
+{
+    if (subject.declaration)
+        visit(scope, subject.declaration);
+    else
+        check(scope, subject.value);
+}
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the arms are checked like an `if` chain: each arm's block in
+// a scope where its condition holds, and the arms after it where that condition failed
+ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatMatch* match)
+{
+    ScopePtr matchScope = childScope(match, scope);
+    checkMatchSubject(matchScope, match->subject);
+
+    ControlFlow flow = visitMatchArms(matchScope, match, 0);
+
+    scope->inheritRefinements(matchScope);
+    scope->inheritAssignments(matchScope);
+    return flow;
+}
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `match->arms[index]` and the arms after it. A value no arm
+// matches runs nothing.
+ControlFlow ConstraintGenerator::visitMatchArms(const ScopePtr& scope, AstStatMatch* match, size_t index)
+{
+    if (index == match->arms.size)
+        return ControlFlow::None;
+
+    const AstMatchArm& arm = match->arms.data[index];
+    if (!arm.condition)
+        return visit(scope, arm.body);
+
+    BranchScopes then = checkMatchArmCondition(scope, arm, arm.body);
+    ScopePtr rest = matchRestScope(scope, match->arms, index, match->location, then.refinement);
+
+    ControlFlow thencf = visit(then.body, arm.body);
+    ControlFlow restcf = visitMatchArms(rest, match, index + 1);
+
+    return joinBranches(scope, then, rest, thencf, restcf);
 }
 
 void ConstraintGenerator::resolveGenericDefaultParameters(const ScopePtr& defnScope, AstStatTypeAlias* alias, const TypeFun& fun)
@@ -4890,6 +5210,13 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatTypeAlias* 
         if (TypeId* literalTy = module->astResolvedTypes.find(literal))
             attachDeclarationComments(*literalTy, Location{alias->location.begin, literal->location.end});
     }
+
+    // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): a non-generic alias of a generic class instantiation prints
+    // as its name (see PendingExpansionType::aliasName)
+    // An alias of another alias (`type B = A`) is bound to that alias's type, which keeps its own name.
+    bool generic = alias->generics.size > 0 || alias->genericPacks.size > 0;
+    if (PendingExpansionType* body = generic ? nullptr : get_if<PendingExpansionType>(&asMutable(ty)->ty))
+        body->aliasName = alias->name.value;
 
     TypeId aliasTy = bindingIt->second.type;
     LUAU_ASSERT(get<BlockedType>(aliasTy));
@@ -6074,9 +6401,34 @@ InferencePack ConstraintGenerator::checkPack(const ScopePtr& scope, AstExprCall*
         fnType = check(scope, call->func).ty;
     }
 
+    // Luwu collections: an empty `Vec()` or `VecDeque()` constructs with the element type its first push binds
+    if (TypeId* elementType = firstPushElementTypes.find(call))
+    {
+        TypeId placeholder = arena->addType(BlockedType{});
+        TypeInstantiationConstraint instantiation{fnType, placeholder, {*elementType}, {}};
+        instantiation.fromFirstPush = true;
+        NotNull<Constraint> constraint = addConstraint(scope, call->func->location, std::move(instantiation));
+        getMutable<BlockedType>(placeholder)->setOwner(constraint);
+        fnType = placeholder;
+    }
+
     Checkpoint funcEndCheckpoint = checkpoint(this);
 
     InferencePack result = checkExprCall(scope, call, fnType, funcBeginCheckpoint, funcEndCheckpoint, expectedType);
+
+    // Luwu collections: the first push onto an empty `Vec()` or `VecDeque()` binds its element type
+    if (const FirstPush* push = firstPushes.find(call))
+    {
+        // A call's values are recorded as a pack, any other expression's as a type
+        AstExpr* value = call->args.data[push->valueIndex];
+        TypePackId source = builtinTypes->unknownTypePack;
+        if (TypePackId* values = module->astTypePacks.find(value))
+            source = *values;
+        else if (TypeId* valueType = module->astTypes.find(value))
+            source = arena->addTypePack({*valueType});
+        NotNull<Constraint> constraint = addConstraint(scope, value->location, UnpackConstraint{{push->elementType}, source});
+        getMutable<BlockedType>(push->elementType)->setOwner(constraint);
+    }
 
     // Luwu Traits (rfcs/classes/traits.md): `class.of(self)(...)` in a trait method generic over `Self` constructs another
     // object of self's class, whatever the trait's constructor says it makes
@@ -6085,6 +6437,32 @@ InferencePack ConstraintGenerator::checkPack(const ScopePtr& scope, AstExprCall*
         std::optional<TypeId> selfType = scope->lookup(of);
         if (selfType && traitSelfTypes.contains(*selfType))
             result = InferencePack{arena->addTypePack({*selfType})};
+    }
+
+    // Luwu bundles: a bundle literal `.(a, b)` takes its positions' expected types (BidirectionalTypePusher). The pusher
+    // reads the expression's type, but a call as an argument or a local's value is recorded as a pack only. A bundle
+    // literal is always one value, so record that too.
+    if (isBundlePackCall(call) && !module->astTypes.contains(call))
+        module->astTypes[call] = flattenPack(scope, call->location, result).ty;
+
+    // Where the expected type is known here (an annotated local), the push comes before the call builds the bundle's
+    // type from its arguments. An argument's comes from the function check.
+    if (expectedType && isBundlePackCall(call))
+    {
+        TypeId bundleType = module->astTypes[call];
+        Checkpoint callEndCheckpoint = checkpoint(this);
+        NotNull<Constraint> push = addConstraint(
+            scope,
+            call->location,
+            PushTypeConstraint{
+                /* expectedType */ *expectedType,
+                /* targetType */ bundleType,
+                /* astTypes */ NotNull{&module->astTypes},
+                /* astExpectedTypes */ NotNull{&module->astExpectedTypes},
+                /* expr */ NotNull{call},
+            }
+        );
+        addAllAsReverseDependencies(funcBeginCheckpoint, callEndCheckpoint, this, push);
     }
 
     // Luwu: every call's values, not only those of a call in a place that takes them all, so the DiscardedValues lint
@@ -6144,7 +6522,7 @@ InferencePack ConstraintGenerator::checkExprCall(
     std::vector<std::optional<TypeId>> expectedTypesForCall = getExpectedCallTypesForFunctionOverloads(fnType);
 
     // Luwu Destructuring (rfcs/destructuring.md): a `.(...)` value destructured by an annotated positional pattern
-    if (const std::vector<TypeId>* elements = call->fromDotPositional ? dotPositionalElementTypes.find(call) : nullptr)
+    if (const std::vector<std::optional<TypeId>>* elements = call->fromDotPositional ? dotPositionalElementTypes.find(call) : nullptr)
         expectedTypesForCall.assign(elements->begin(), elements->end());
 
     module->astOriginalCallTypes[call->func] = fnType;
@@ -6158,6 +6536,10 @@ InferencePack ConstraintGenerator::checkExprCall(
     for (size_t i = 0; i < exprArgs.size(); ++i)
     {
         AstExpr* arg = exprArgs[i];
+        // Luwu bundles: a bundle literal `.(a, b)` is a call that's always one value, so as the last argument it's an
+        // ordinary one, which the function check pushes the parameter's type into
+        const AstExprCall* argCall = arg->as<AstExprCall>();
+        bool spreads = (argCall && !isBundlePackCall(argCall)) || arg->is<AstExprVarargs>();
 
         if (i == 0 && call->self)
         {
@@ -6171,7 +6553,7 @@ InferencePack ConstraintGenerator::checkExprCall(
             else
                 args.push_back(freshType(scope, Polarity::Negative));
         }
-        else if (i < exprArgs.size() - 1 || !(arg->is<AstExprCall>() || arg->is<AstExprVarargs>()))
+        else if (i < exprArgs.size() - 1 || !spreads)
         {
             std::optional<TypeId> expectedType = std::nullopt;
             if (i < expectedTypesForCall.size())
@@ -6499,6 +6881,8 @@ Inference ConstraintGenerator::check(const ScopePtr& scope, AstExpr* expr, std::
         result = check(scope, ifElse, expectedType);
     else if (auto doExpr = expr->as<AstExprDo>())
         result = check(scope, doExpr, expectedType);
+    else if (auto match = expr->as<AstExprMatch>())
+        result = check(scope, match, expectedType);
     else if (auto comprehension = expr->as<AstExprTableComprehension>())
         result = check(scope, comprehension, expectedType);
     else if (auto typeAssert = expr->as<AstExprTypeAssertion>())
@@ -6779,6 +7163,9 @@ Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprIndexExpr* in
         updateRValueRefinements(scope, key->def, result);
     }
 
+    if (key && indexExpr->positional && !positionReadTypes.contains(key->def))
+        positionReadTypes[key->def] = result;
+
     std::optional<size_t> position;
     if (indexExpr->positional)
     {
@@ -6883,7 +7270,44 @@ Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprUnary* unary)
 
 Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprBinary* binary, std::optional<TypeId> expectedType)
 {
-    return checkAstExprBinary(scope, binary->location, binary->op, binary->left, binary->right, expectedType);
+    Inference result = checkAstExprBinary(scope, binary->location, binary->op, binary->left, binary->right, expectedType);
+    if (RefinementId size = bundleSizeRefinement(scope, binary))
+        result.refinement = result.refinement ? refinementArena.conjunction(result.refinement, size) : size;
+    return result;
+}
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a bundle pattern's size test (`#value == 2`) narrows
+// `value` to the bundles of that size, so `.(x, y) | .(x, y, z)` reads `z` only from the bundles that have it. Its
+// discriminant is the bundle class of that size with every position `unknown`, which every bundle of the size is. Bundles
+// past the fixed sizes, and `..` patterns, keep what `typeof(value) == "bundle"` narrowed them to.
+RefinementId ConstraintGenerator::bundleSizeRefinement(const ScopePtr& scope, AstExprBinary* binary)
+{
+    static const char* const kBundles[] = {"Bundle0", "Bundle1", "Bundle2", "Bundle3", "Bundle4", "Bundle5", "Bundle6"};
+    static constexpr size_t kBundleCount = sizeof(kBundles) / sizeof(kBundles[0]);
+
+    if (!binary->fromBundlePattern || binary->op != AstExprBinary::CompareEq)
+        return nullptr;
+
+    AstExprUnary* size = binary->left->as<AstExprUnary>();
+    AstExprConstantNumber* count = binary->right->as<AstExprConstantNumber>();
+    if (!size || size->op != AstExprUnary::Op::Len || !count || count->value < 0 || count->value >= double(kBundleCount))
+        return nullptr;
+
+    const RefinementKey* key = dfg->getRefinementKey(size->expr);
+    std::optional<TypeFun> sized = key ? globalScope->lookupImportedType("bundle", kBundles[size_t(count->value)]) : std::nullopt;
+    if (!sized)
+        return nullptr;
+
+    TypeId sizedTemplate = follow(sized->type);
+    std::vector<TypeId> positions(size_t(count->value), builtinTypes->unknownType);
+    if (positions.empty())
+        return refinementArena.proposition(key, sizedTemplate);
+
+    std::vector<TypeId> copiedReferences;
+    TypeId anyOfSize = instantiateGenericNominal(arena, sizedTemplate, std::move(positions), {}, copiedReferences);
+    for (TypeId reference : copiedReferences)
+        addConstraint(scope, binary->location, TypeAliasExpansionConstraint{reference});
+    return refinementArena.proposition(key, anyOfSize);
 }
 
 Inference ConstraintGenerator::checkAstExprBinary(
@@ -7011,7 +7435,7 @@ Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprIfElse* ifEls
     applyRefinements(elseScope, ifElse->falseExpr->location, refinementArena.negation(refinement));
     TypeId elseType = check(elseScope, ifElse->falseExpr, expectedType).ty;
 
-    // Luwu Do Expressions (rfcs/do-expressions.md): a `do` in a branch can assign, and the code after the expression reads
+    // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): a `do` in a branch can assign, and the code after the expression reads
     // the join of both branches (see DataFlowGraphBuilder::visitExpr(AstExprIfElse*))
     scope->inheritAssignments(thenScope);
     scope->inheritAssignments(elseScope);
@@ -7019,13 +7443,60 @@ Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprIfElse* ifEls
     return Inference{makeUnion(scope, ifElse->location, thenType, elseType)};
 }
 
-// Luwu Do Expressions (rfcs/do-expressions.md): a `do` expression's type is the union of what its `give`s give. One
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the union of the arms' values, each checked where its
+// condition holds and every condition before it failed
+Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprMatch* match, std::optional<TypeId> expectedType)
+{
+    InConditionalContext inContext(&typeContext, TypeContext::Default);
+
+    ScopePtr matchScope = childScope(match, scope);
+    checkMatchSubject(matchScope, match->subject);
+
+    Inference result = checkMatchArms(matchScope, match, 0, expectedType);
+
+    scope->inheritAssignments(matchScope);
+    return result;
+}
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the union of `match->arms[index]`'s value and the values of
+// the arms after it
+Inference ConstraintGenerator::checkMatchArms(const ScopePtr& scope, AstExprMatch* match, size_t index, std::optional<TypeId> expectedType)
+{
+    if (index == match->arms.size)
+        return Inference{builtinTypes->neverType};
+
+    const AstMatchArm& arm = match->arms.data[index];
+    if (!arm.condition)
+        return check(scope, arm.value, expectedType);
+
+    BranchScopes then = checkMatchArmCondition(scope, arm, arm.value);
+    TypeId thenType = check(then.body, arm.value, expectedType).ty;
+    scope->inheritAssignments(then.body);
+
+    if (index + 1 == match->arms.size)
+        return Inference{thenType};
+
+    ScopePtr rest = matchRestScope(scope, match->arms, index, match->location, then.refinement);
+    TypeId restType = checkMatchArms(rest, match, index + 1, expectedType).ty;
+    scope->inheritAssignments(rest);
+
+    return Inference{makeUnion(scope, match->location, thenType, restType)};
+}
+
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): a `do` expression's type is the union of what its `give`s give. One
 // that never gives (every path returns, breaks or continues) is `never`, so `x or do return nil` is `x` made truthy.
 Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprDo* doExpr, std::optional<TypeId> expectedType)
 {
     InConditionalContext inContext(&typeContext, TypeContext::Default);
 
     ScopePtr bodyScope = childScope(doExpr->body, scope);
+
+    // `x or give v` gives from the enclosing `do` expression, and has no value of its own
+    if (doExpr->shorthand)
+    {
+        visitBlockWithoutChildScope(bodyScope, doExpr->body);
+        return Inference{builtinTypes->neverType};
+    }
 
     giveContexts.push_back({scope.get(), expectedType, {}});
     visitBlockWithoutChildScope(bodyScope, doExpr->body);
@@ -7040,7 +7511,7 @@ Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprDo* doExpr, s
     return Inference{result};
 }
 
-// Luwu Do Expressions (rfcs/do-expressions.md): `give` leaves its block like `return` does, so the statements after it
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `give` leaves its block like `return` does, so the statements after it
 // in the block don't see what it skipped. Code after the whole `do` expression does run after a `give`, though: the
 // assignments made on its way there are copied to the scope the expression is checked in, where the data flow graph
 // joins them (DataFlowGraphBuilder::visit(AstStatGive*)).
@@ -7053,10 +7524,18 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatGive* give)
         return ControlFlow::None;
     }
 
-    // Checking the value can push and pop nested contexts, so nothing holds a reference into giveContexts across it
-    std::optional<TypeId> expectedType = giveContexts.back().expectedType;
-    TypeId ty = check(scope, give->value, expectedType).ty;
-    giveContexts.back().gives.push_back(ty);
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): `give [k] = v` gives no value; its item adds to the table
+    if (give->item)
+    {
+        visit(scope, give->item);
+    }
+    else
+    {
+        // Checking the value can push and pop nested contexts, so nothing holds a reference into giveContexts across it
+        std::optional<TypeId> expectedType = giveContexts.back().expectedType;
+        TypeId ty = check(scope, give->value, expectedType).ty;
+        giveContexts.back().gives.push_back(ty);
+    }
 
     Scope* outer = giveContexts.back().outer;
     for (Scope* path = scope.get(); path && path != outer; path = path->parent.get())
@@ -7068,7 +7547,7 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatGive* give)
     return ControlFlow::Returns;
 }
 
-// Luwu Table Comprehensions (rfcs/table-comprehensions.md): the table's indexer. An annotation decides it when there is
+// Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): the table's indexer. An annotation decides it when there is
 // one (`local xs: {string} = { for ... }`), so the item is checked against it the way a table literal's items are;
 // otherwise it is inferred from the item. Either way a nil value adds nothing, so the value type excludes nil:
 // `{ for ... do maybe(x) }` is `{X}`.
@@ -7076,7 +7555,8 @@ Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprTableComprehe
 {
     InConditionalContext inContext(&typeContext, TypeContext::Default);
 
-    bool isMap = comprehension->item->key != nullptr;
+    AstStatComprehensionItem* item = comprehension->item;
+    bool isMap = item->isMap();
 
     // The expected indexer, from an expected table type or a table member of an expected union (`{T}?`)
     std::optional<TableIndexer> expectedIndexer;
@@ -7135,14 +7615,18 @@ Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprTableComprehe
         };
 
         if (isMap && checked.keyType)
-            keyType = withoutNil(*checked.keyType, comprehension->item->key->location);
+            keyType = withoutNil(*checked.keyType, item->key ? item->key->location : item->location);
 
         if (checked.valueType)
-            valueType = withoutNil(*checked.valueType, comprehension->item->value->location);
+            valueType = withoutNil(*checked.valueType, item->value->location);
 
         // `[k] ..= v` stores the first value as is and strings after that
-        if (comprehension->item->accumulate == AstExprBinary::Concat)
-            valueType = makeUnion(scope, comprehension->item->value->location, valueType, builtinTypes->stringType);
+        bool concatenates = item->accumulate == AstExprBinary::Concat;
+        for (AstStatComprehensionItem* given : item->givenItems)
+            concatenates = concatenates || given->accumulate == AstExprBinary::Concat;
+
+        if (concatenates)
+            valueType = makeUnion(scope, item->value->location, valueType, builtinTypes->stringType);
     }
 
     TypeId ty = arena->addType(TableType{TableState::Sealed, TypeLevel{}, scope.get()});
@@ -7156,7 +7640,7 @@ Inference ConstraintGenerator::check(const ScopePtr& scope, AstExprTableComprehe
     return Inference{ty};
 }
 
-// Luwu Table Comprehensions (rfcs/table-comprehensions.md): checks the item against the expected element types, and
+// Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): checks the item against the expected element types, and
 // records its types for the table's indexer
 ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatComprehensionItem* item)
 {
@@ -7165,6 +7649,13 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatComprehensi
         // The parser only makes items inside a comprehension
         if (item->key)
             check(scope, item->key);
+        check(scope, item->value);
+        return ControlFlow::None;
+    }
+
+    // A `do` item whose `give`s write keys: each `give [k] = v` adds its item's types (visit(AstStatGive*))
+    if (item->givenItems.size != 0)
+    {
         check(scope, item->value);
         return ControlFlow::None;
     }
@@ -7179,8 +7670,15 @@ ControlFlow ConstraintGenerator::visit(const ScopePtr& scope, AstStatComprehensi
 
     TypeId valueType = check(scope, item->value, expectedValue).ty;
 
-    comprehensionContexts.back().keyType = keyType;
-    comprehensionContexts.back().valueType = valueType;
+    // Several `give [k] = v`s in one `do` item each add an item
+    ComprehensionContext& context = comprehensionContexts.back();
+    if (keyType && context.keyType)
+        keyType = makeUnion(scope, item->location, *context.keyType, *keyType);
+    if (context.valueType)
+        valueType = makeUnion(scope, item->location, *context.valueType, valueType);
+
+    context.keyType = keyType;
+    context.valueType = valueType;
 
     return ControlFlow::None;
 }
@@ -7323,7 +7821,7 @@ std::tuple<TypeId, TypeId, RefinementId> ConstraintGenerator::checkBinary(
         applyRefinements(rightScope, right->location, leftRefinement);
         auto [rightType, rightRefinement] = check(rightScope, right, expectedType);
 
-        // Luwu Do Expressions (rfcs/do-expressions.md): `x and break` only completes when `x` is falsy
+        // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `x and break` only completes when `x` is falsy
         if (asLeave(right))
             orLeaveRefinements[right] = refinementArena.negation(leftRefinement);
 
@@ -7342,7 +7840,7 @@ std::tuple<TypeId, TypeId, RefinementId> ConstraintGenerator::checkBinary(
         applyRefinements(rightScope, right->location, refinementArena.negation(leftRefinement));
         auto [rightType, rightRefinement] = check(rightScope, right, expectedType);
 
-        // Luwu Do Expressions (rfcs/do-expressions.md): `x or return` only has a value when `x` is truthy
+        // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `x or return` only has a value when `x` is truthy
         if (asLeave(right))
         {
             orLeaveRefinements[right] = leftRefinement;
@@ -7366,6 +7864,16 @@ std::tuple<TypeId, TypeId, RefinementId> ConstraintGenerator::checkBinary(
         const RefinementKey* key = dfg->getRefinementKey(typeguard->target);
         if (!key)
             return {leftType, rightType, nullptr};
+
+        // Luwu builtin classes: `typeof` names an object of one after what it is ("bundle", "vec")
+        std::optional<TypeId> builtinClass;
+        if (typeguard->isTypeof)
+        {
+            std::vector<TypeId> copiedReferences;
+            builtinClass = builtinClassTypeofType(arena, builtinTypes, globalScope.get(), typeguard->type, copiedReferences);
+            for (TypeId reference : copiedReferences)
+                addConstraint(scope, typeguard->target->location, TypeAliasExpansionConstraint{reference});
+        }
 
         TypeId discriminantTy = builtinTypes->neverType;
         if (typeguard->type == "nil")
@@ -7400,6 +7908,8 @@ std::tuple<TypeId, TypeId, RefinementId> ConstraintGenerator::checkBinary(
             discriminantTy = builtinTypes->objectType;
         else if (FFlag::LuwuClasses && FFlag::LuwuTraits && typeguard->type == "trait")
             discriminantTy = builtinTypes->traitType;
+        else if (builtinClass)
+            discriminantTy = *builtinClass;
         else if (typeguard->type == "vector" && !typeguard->isTypeof)
         {
             // `vector` is defined in EmbeddedBuiltinDefinitions, not as an actual built-in type

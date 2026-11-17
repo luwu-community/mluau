@@ -101,7 +101,7 @@ struct ConstraintGenerator
     // define the scope hierarchy.
     std::vector<std::pair<Location, ScopePtr>> scopes;
 
-    // Luwu Do Expressions (rfcs/do-expressions.md): the `do` expressions being checked, innermost last. `outer` is the
+    // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the `do` expressions being checked, innermost last. `outer` is the
     // scope the expression is checked in; `gives` collects the type of each `give` in its block.
     struct GiveContext
     {
@@ -111,14 +111,14 @@ struct ConstraintGenerator
     };
     std::vector<GiveContext> giveContexts;
 
-    // Luwu Do Expressions (rfcs/do-expressions.md): for `x or return` and `x and return`, keyed by the right operand, what
+    // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): for `x or return` and `x and return`, keyed by the right operand, what
     // holds when the expression completes: `x`'s truthiness refinement, or its negation after `and`. A statement whose
     // whole value (or a declaration's or assignment's value) is such an expression applies it to the code after it
     // (applyOrLeaveRefinements).
     DenseHashMap<const AstExpr*, RefinementId> orLeaveRefinements{nullptr};
     void applyOrLeaveRefinements(const ScopePtr& scope, const AstArray<AstExpr*>& values);
 
-    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): the comprehensions being checked, innermost last. The
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): the comprehensions being checked, innermost last. The
     // expected key and value types come from an annotation; the item's types are collected when there is none.
     struct ComprehensionContext
     {
@@ -162,6 +162,9 @@ struct ConstraintGenerator
 
     // Map a function's signature scope back to its signature type.
     DenseHashMap<Scope*, TypeId> scopeToFunction{nullptr};
+    // Luwu Destructuring (rfcs/destructuring.md): the type of each position read (`b.1`) the first time it's checked,
+    // by its definition (applyRefinements)
+    DenseHashMap<const Def*, TypeId> positionReadTypes{nullptr};
 
     // Luwu try expressions: what the functions being checked raise with `error` and `assert`, innermost last.
     // checkFunctionBody joins a function's onto its error hint.
@@ -216,6 +219,18 @@ struct ConstraintGenerator
     // Needed to register all available type functions for execution at later stages.
     NotNull<TypeFunctionRuntime> typeFunctionRuntime;
     DenseHashMap<const AstStatTypeFunction*, ScopePtr> astTypeFunctionEnvironmentScopes{nullptr};
+
+    // Luwu collections: an empty `Vec()` or `VecDeque()` whose local's next use is a push takes its element type from
+    // that push (findFirstPushes), the way the runtime fixes it from the first value. The constructor call's element
+    // type, bound by the push.
+    DenseHashMap<const AstExprCall*, TypeId> firstPushElementTypes{nullptr};
+    struct FirstPush
+    {
+        TypeId elementType;
+        // Which argument of the push holds the value
+        size_t valueIndex;
+    };
+    DenseHashMap<const AstExprCall*, FirstPush> firstPushes{nullptr};
 
     // Needed to resolve modules to make 'require' import types properly.
     NotNull<ModuleResolver> moduleResolver;
@@ -326,6 +341,7 @@ private:
      * @param parent the parent scope of the new scope. Must not be null.
      */
     ScopePtr childScope(AstNode* node, const ScopePtr& parent);
+    ScopePtr childScope(const Location& location, const ScopePtr& parent);
 
     std::optional<TypeId> lookup(const ScopePtr& scope, Location location, DefId def, bool prototype = true);
 
@@ -471,6 +487,7 @@ private:
     );
 
     ControlFlow visitBlockWithoutChildScope(const ScopePtr& scope, AstStatBlock* block);
+    void findFirstPushes(AstStatBlock* block);
 
     ControlFlow visit(const ScopePtr& scope, AstStat* stat);
     ControlFlow visit(const ScopePtr& scope, AstStatBlock* block);
@@ -498,6 +515,24 @@ private:
     ControlFlow visit(const ScopePtr& scope, AstStatCompoundAssign* assign);
     ControlFlow visit(const ScopePtr& scope, AstStatPush* push);
     ControlFlow visit(const ScopePtr& scope, AstStatIf* ifStatement);
+
+    // The scopes of a branch with a condition: `chain` for a `when` chain's bindings (null without one), `body` for
+    // the branch, and the refinement the code after a failed condition may assume the negation of
+    struct BranchScopes
+    {
+        ScopePtr chain;
+        ScopePtr body;
+        RefinementId refinement = nullptr;
+    };
+    ControlFlow joinBranches(const ScopePtr& scope, const BranchScopes& then, const ScopePtr& elseScope, ControlFlow thencf, ControlFlow elsecf);
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
+    ControlFlow visit(const ScopePtr& scope, AstStatMatch* match);
+    ControlFlow visitMatchArms(const ScopePtr& scope, AstStatMatch* match, size_t index);
+    BranchScopes checkMatchArmCondition(const ScopePtr& scope, const AstMatchArm& arm, AstNode* branch);
+    ScopePtr matchRestScope(const ScopePtr& scope, const AstArray<AstMatchArm>& arms, size_t index, const Location& matchLocation, RefinementId refinement);
+    void checkMatchSubject(const ScopePtr& scope, const AstMatchSubject& subject);
+    Inference checkMatchArms(const ScopePtr& scope, AstExprMatch* match, size_t index, std::optional<TypeId> expectedType);
     ScopePtr ifClausesScope(const AstArray<AstIfClause>& clauses, AstNode* branch, const ScopePtr& parent);
     RefinementId checkIfClauses(const ScopePtr& chainScope, const AstArray<AstIfClause>& clauses);
     ControlFlow visit(const ScopePtr& scope, AstStatTypeAlias* alias);
@@ -560,6 +595,7 @@ private:
     Inference check(const ScopePtr& scope, AstExprUnary* unary);
     Inference check(const ScopePtr& scope, AstExprPop* pop);
     Inference check(const ScopePtr& scope, AstExprBinary* binary, std::optional<TypeId> expectedType);
+    RefinementId bundleSizeRefinement(const ScopePtr& scope, AstExprBinary* binary);
     Inference checkAstExprBinary(
         const ScopePtr& scope,
         const Location& location,
@@ -570,6 +606,7 @@ private:
     );
     Inference check(const ScopePtr& scope, AstExprIfElse* ifElse, std::optional<TypeId> expectedType);
     Inference check(const ScopePtr& scope, AstExprDo* doExpr, std::optional<TypeId> expectedType);
+    Inference check(const ScopePtr& scope, AstExprMatch* match, std::optional<TypeId> expectedType);
     Inference check(const ScopePtr& scope, AstExprTableComprehension* comprehension, std::optional<TypeId> expectedType);
     Inference check(const ScopePtr& scope, AstExprTypeAssertion* typeAssert);
     Inference check(const ScopePtr& scope, AstExprInterpString* interpString);
@@ -585,6 +622,7 @@ private:
     );
 
     void visitLValue(const ScopePtr& scope, AstExpr* expr, TypeId rhsType);
+    std::optional<TypeId> expectedTypeOfAssignedBundle(const ScopePtr& scope, AstExpr* target, AstExpr* value);
     void visitLValue(const ScopePtr& scope, AstExprLocal* local, TypeId rhsType);
     void visitLValue(const ScopePtr& scope, AstExprGlobal* global, TypeId rhsType);
     void visitLValue(const ScopePtr& scope, AstExprIndexName* expr, TypeId rhsType);
@@ -640,8 +678,8 @@ private:
     DenseHashMap<AstLocal*, ResolvedAnnotation> bundleElementAnnotations{nullptr};
     std::optional<TypeId> expectedBundleType(const ScopePtr& scope, AstStatLocal* statLocal);
     // The element annotations of the positional pattern a `.(...)` value is destructured by: each value's expected type
-    DenseHashMap<const AstExprCall*, std::vector<TypeId>> dotPositionalElementTypes{nullptr};
-    void expectDotPositionalElements(AstExpr* expr, const std::vector<TypeId>& elements);
+    DenseHashMap<const AstExprCall*, std::vector<std::optional<TypeId>>> dotPositionalElementTypes{nullptr};
+    void expectDotPositionalElements(AstExpr* expr, const std::vector<std::optional<TypeId>>& elements);
     // Luwu literal types: an alias of a union with a literal member (`type Length = CssLength | Token | number`), as
     // resolveLiteralCheckAnnotation resolves the union written out
     std::optional<ResolvedAnnotation> literalUnionOfType(TypeId ty);

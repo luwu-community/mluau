@@ -129,6 +129,14 @@ void luaV_gettablefor(lua_State* L, const TValue* t, TValue* key, StkId val, con
         else if (LUAU_UNLIKELY(FFlag::LuwuClasses && ttisobject(t)))
         {
             LuauObject* inst = objectvalue(t);
+
+            // Luwu bundles: `b[n]` reads a position; a string still finds a method
+            if (luaR_isbundle(inst) && !ttisstring(key))
+            {
+                luaR_getbundleposition(L, inst, key, val);
+                return;
+            }
+
             const TValue* offsettval = luaH_get(inst->lclass->memberstooffset, key);
 
             // Objects throw if you try to access a member that is not
@@ -191,6 +199,15 @@ void luaV_getpositional(lua_State* L, const TValue* t, int position, StkId val)
         LuauObject* inst = objectvalue(t);
         LuauClass* lco = inst->lclass;
 
+        // Luwu bundles: a bundle's positions are its values
+        if (luaR_isbundle(inst))
+        {
+            TValue key;
+            setnvalue(&key, double(position + 1));
+            luaR_getbundleposition(L, inst, &key, val);
+            return;
+        }
+
         // a class without a primary constructor has -1 positions
         if (position >= lco->numberofpositional)
             luaG_positionalerror(L, lco, position);
@@ -203,13 +220,14 @@ void luaV_getpositional(lua_State* L, const TValue* t, int position, StkId val)
         return;
     }
 
-    // a value nothing can index names the pattern instead of an index with a number
-    if (!ttistable(t) && ttisnil(luaT_gettmbyobj(L, t, TM_INDEX)))
-        luaG_runerror(L, "%s may not be destructured", luaT_objtypename(L, t));
-
-    TValue key;
-    setnvalue(&key, double(position + 1));
-    luaV_gettable(L, t, &key, val);
+    // only objects have positions: a table's numbers are keys
+    luaG_runerror(
+        L,
+        "value of type %s does not have a constant positional member at offset %d; did you mean to use runtime indexing syntax [%d] instead?",
+        luaT_objtypename(L, t),
+        position + 1,
+        position + 1
+    );
 }
 
 void luaV_settable(lua_State* L, const TValue* t, TValue* key, StkId val)
@@ -246,6 +264,10 @@ void luaV_settable(lua_State* L, const TValue* t, TValue* key, StkId val)
         else if (LUAU_UNLIKELY(FFlag::LuwuClasses && ttisobject(t)))
         {
             LuauObject* inst = objectvalue(t);
+            // Luwu bundles: `b[n] = v` names `with`; a string is a missing field like on any object
+            if (luaR_isbundle(inst) && !ttisstring(key))
+                luaR_bundleassignerror(L, key);
+
             const TValue* offset = luaH_get(inst->lclass->memberstooffset, key);
             if (ttisnil(offset))
                 luaG_missingmembererror(L, t, key);
@@ -791,7 +813,7 @@ LUAU_NOINLINE void luaV_tryfuncTM(lua_State* L, StkId func)
     setobj2s(L, func, tm); // tag method is the new function to be called
 }
 
-// Luwu Table Comprehensions (rfcs/table-comprehensions.md): how many elements a table iterated by a generic for can
+// Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): how many elements a table iterated by a generic for can
 // produce at most, read in O(1): its array part plus its hash part. A table with __iter can produce anything, which only
 // makes the size a worse guess.
 static int iterationcapacity(const TValue* generator)

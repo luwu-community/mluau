@@ -1,9 +1,12 @@
 // This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/ConstraintSolver.h"
 
+#include "Luau/BuiltinDefinitions.h"
+
 #include "Luau/Anyification.h"
 #include "Luau/ApplyTypeFunction.h"
 #include "Luau/AstUtils.h"
+#include "Luau/BuiltinDefinitions.h"
 #include "Luau/BuiltinTypeFunctions.h"
 #include "Luau/Clone.h"
 #include "Luau/Common.h"
@@ -142,12 +145,22 @@ std::pair<std::vector<TypeId>, std::vector<TypePackId>> saturateArguments(
     // mutually exclusive with the type pack -> type conversion we do below:
     // extraTypes will only have elements in it if we have more types than we
     // have parameter slots for them to go into.
+    size_t firstRawPack = 0;
     if (!extraTypes.empty() && !fn.typePackParams.empty())
     {
-        saturatedPackArguments.push_back(arena->addTypePack(extraTypes));
+        // Luwu: a pack after the extra types is the rest of theirs when the function has one pack parameter, so
+        // `F<number, ...string>` for `type F<T...>` passes `(number, ...string)`, and `.(number, T...)` is a bundle of
+        // a number and then `T...`. Upstream drops the pack: `F<number, ...string>` is `F<number>`.
+        std::optional<TypePackId> rest;
+        if (fn.typePackParams.size() == 1 && !rawPackArguments.empty())
+        {
+            rest = rawPackArguments[0];
+            firstRawPack = 1;
+        }
+        saturatedPackArguments.push_back(arena->addTypePack(TypePack{extraTypes, rest}));
     }
 
-    for (size_t i = 0; i < rawPackArguments.size(); ++i)
+    for (size_t i = firstRawPack; i < rawPackArguments.size(); ++i)
     {
         TypePackId tp = rawPackArguments[i];
 
@@ -1643,7 +1656,9 @@ bool ConstraintSolver::tryDispatch(const TypeAliasExpansionConstraint& c, NotNul
     // If we use the same signature, we don't need to bother trying to
     // instantiate the alias again, since the instantiation should be
     // deterministic.
-    if (TypeId* cached = instantiatedAliases.find(signature))
+    // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): an alias's body gets an instantiation of its own (below)
+    bool namesInstantiation = petv->aliasName && FFlag::LuwuGenericNominals && get<ExternType>(follow(tf->type));
+    if (TypeId* cached = namesInstantiation ? nullptr : instantiatedAliases.find(signature))
     {
         bindResult(*cached);
         return true;
@@ -1689,7 +1704,12 @@ bool ConstraintSolver::tryDispatch(const TypeAliasExpansionConstraint& c, NotNul
         for (TypePackId argument : packArguments)
             queuer.run(argument);
 
-        instantiatedAliases[signature] = instantiation;
+        // The body of `type Nums = Vec<number>` prints as `Nums`. Every other `Vec<number>` shares the cached instantiation,
+        // so this one isn't cached.
+        if (namesInstantiation)
+            getMutable<ExternType>(instantiation)->aliasName = petv->aliasName;
+        else
+            instantiatedAliases[signature] = instantiation;
         bindResult(instantiation);
         return true;
     }
@@ -3115,10 +3135,7 @@ bool ConstraintSolver::tryDispatch(const HasIndexerConstraint& c, NotNull<const 
         return block(*btf.blocked, constraint);
 
     if (c.position)
-    {
-        if (std::optional<bool> dispatched = tryDispatchPositional(constraint, subjectType, *c.position, c.resultType))
-            return *dispatched;
-    }
+        return tryDispatchPositional(constraint, subjectType, *c.position, c.resultType);
 
     int recursionDepth = 0;
 
@@ -3134,11 +3151,11 @@ bool ConstraintSolver::tryDispatch(const HasIndexerConstraint& c, NotNull<const 
     return result;
 }
 
-// Luwu Destructuring (rfcs/destructuring.md): an element of a positional pattern on an object, or on a union of objects,
-// is the field each class's primary constructor takes at that position. A class without one, or without that position,
-// gives an error type here and an error from TypeChecker2. Returns nullopt when `subjectType` isn't made only of objects:
-// the element is then read like `t[i]`.
-std::optional<bool> ConstraintSolver::tryDispatchPositional(
+// Luwu Destructuring (rfcs/destructuring.md): a position read from an object, or from a union of objects, is the field each
+// class's primary constructor takes at that position. Anything else has no positions. A class without a primary
+// constructor or without that position, and anything that isn't an object, gives an error type here and an error from
+// TypeChecker2. `any` reads as `any`.
+bool ConstraintSolver::tryDispatchPositional(
     NotNull<const Constraint> constraint,
     TypeId subjectType,
     size_t position,
@@ -3159,9 +3176,25 @@ std::optional<bool> ConstraintSolver::tryDispatchPositional(
     std::vector<TypeId> results;
     for (TypeId option : options)
     {
+        if (get<AnyType>(option))
+        {
+            results.push_back(builtinTypes->anyType);
+            continue;
+        }
+
+        // Luwu bundles: a bundle's positions are its class's type arguments, and an intersection reads its bundles'
+        if (std::optional<TypeId> read = readBundlePosition(builtinTypes, NotNull{arena}, option, position))
+        {
+            results.push_back(*read);
+            continue;
+        }
+
         const ClassFieldUserData* data = getClassFieldUserData(option);
         if (!data)
-            return std::nullopt;
+        {
+            results.push_back(builtinTypes->errorType);
+            continue;
+        }
 
         if (!data->positionalFields || position >= data->positionalFields->size())
         {
@@ -3943,6 +3976,24 @@ bool ConstraintSolver::tryDispatch(const TypeInstantiationConstraint& c, NotNull
     // Luwu Classes (rfcs/classes): `Box<<string>>` is the constructor (a trait's `__create`) with its type arguments
     // given, so `Box<<string>>(x)` is a `Box<string>`. Its `__call` takes the class value first, which the call won't pass.
     std::optional<TypeId> classCall = FFlag::LuwuClasses ? classValueCallType(builtinTypes, c.functionType) : std::nullopt;
+    if (c.fromFirstPush && !(classCall && fixedElementContainerName(arena, constraint->scope.get(), c.functionType)))
+    {
+        bind(constraint, c.placeholderType, c.functionType);
+        return true;
+    }
+
+    // Luwu try expressions: a container whose first value is an `Ok` takes `Err`s too, and one of a `Some` takes `none`,
+    // which a type taken from the first push can't say. Those keep the element type an empty container gets otherwise.
+    if (c.fromFirstPush && !c.typeArguments.empty())
+    {
+        if (isBlocked(c.typeArguments[0]))
+            return block(c.typeArguments[0], constraint);
+        if (builtinEnumPlural(constraint->scope.get(), c.typeArguments[0]))
+        {
+            bind(constraint, c.placeholderType, c.functionType);
+            return true;
+        }
+    }
     if (classCall)
     {
         if (isBlocked(*classCall))
@@ -5054,6 +5105,10 @@ bool ConstraintSolver::bindCachedExpansion(TypeId pendingExpansion, NotNull<Scop
     TypeId target = follow(pendingExpansion);
     const PendingExpansionType* petv = get<PendingExpansionType>(target);
     if (!petv)
+        return false;
+    // Luwu Generic Nominals (rfcs/generics-on-extern-types.md): an alias's body gets an instantiation of its own
+    // (tryDispatch(TypeAliasExpansionConstraint))
+    if (petv->aliasName)
         return false;
 
     std::optional<TypeFun> tf;

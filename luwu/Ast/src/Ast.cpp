@@ -592,7 +592,7 @@ AstExprIfElse::AstExprIfElse(
 {
 }
 
-// Luwu If Local (rfcs/if-local.md)
+// Luwu If Local (rfcs/control-flow/if-local.md)
 static void visitIfCondition(AstExpr* condition, const AstArray<AstIfClause>& clauses, AstVisitor* visitor)
 {
     if (clauses.size == 0)
@@ -640,25 +640,89 @@ void AstExprIfElse::visit(AstVisitor* visitor)
     }
 }
 
+void AstMatchArm::visitCondition(AstVisitor* visitor) const
+{
+    if (condition)
+        visitIfCondition(condition, clauses, visitor);
+}
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the header's declaration (or the tested local), then
+// each arm's condition and value or block
+static void visitMatch(const AstMatchSubject& subject, const AstArray<AstMatchArm>& arms, AstVisitor* visitor)
+{
+    if (subject.declaration)
+        subject.declaration->visit(visitor);
+    else
+        subject.value->visit(visitor);
+
+    for (const AstMatchArm& arm : arms)
+    {
+        arm.visitCondition(visitor);
+        if (arm.value)
+            arm.value->visit(visitor);
+        if (arm.body)
+            arm.body->visit(visitor);
+    }
+}
+
+bool matchesEveryValue(const AstArray<AstMatchArm>& arms)
+{
+    if (arms.size == 0)
+        return false;
+
+    const AstMatchArm& last = arms.data[arms.size - 1];
+    return last.kind == AstMatchArm::Else || last.catchAll;
+}
+
+AstExprMatch::AstExprMatch(const Location& location, const AstMatchSubject& subject, const AstArray<AstMatchArm>& arms)
+    : AstExpr(ClassIndex(), location)
+    , subject(subject)
+    , arms(arms)
+{
+}
+
+void AstExprMatch::visit(AstVisitor* visitor)
+{
+    if (visitor->visit(this))
+        visitMatch(subject, arms, visitor);
+}
+
+AstStatMatch::AstStatMatch(const Location& location, const AstMatchSubject& subject, const AstArray<AstMatchArm>& arms, bool hasEnd)
+    : AstStat(ClassIndex(), location)
+    , subject(subject)
+    , arms(arms)
+    , hasEnd(hasEnd)
+{
+}
+
+void AstStatMatch::visit(AstVisitor* visitor)
+{
+    if (visitor->visit(this))
+        visitMatch(subject, arms, visitor);
+}
+
 bool AstExprDo::alwaysLeaves() const
 {
-    if (shorthand)
-        return true;
+    return shorthand || gives().empty();
+}
 
+std::vector<AstStatGive*> AstExprDo::gives() const
+{
     struct GiveFinder : AstVisitor
     {
-        bool found = false;
+        std::vector<AstStatGive*> found;
 
-        bool visit(AstStatGive*) override
+        bool visit(AstStatGive* give) override
         {
-            found = true;
+            found.push_back(give);
             return false;
         }
 
-        // a nested `do` expression's gives are its own, and a function's body is another function
-        bool visit(AstExprDo*) override
+        // a nested `do` expression's gives are its own, except the shorthand's (`x or give v`), and a function's body is
+        // another function
+        bool visit(AstExprDo* expr) override
         {
-            return false;
+            return expr->shorthand;
         }
 
         bool visit(AstExprFunction*) override
@@ -671,7 +735,7 @@ bool AstExprDo::alwaysLeaves() const
     for (AstStat* stat : body->body)
         stat->visit(&finder);
 
-    return !finder.found;
+    return std::move(finder.found);
 }
 
 AstExpr* withoutGroups(AstExpr* expr)
@@ -977,7 +1041,12 @@ AstStatGive::AstStatGive(const Location& location, AstExpr* value)
 
 void AstStatGive::visit(AstVisitor* visitor)
 {
-    if (visitor->visit(this))
+    if (!visitor->visit(this))
+        return;
+
+    if (item)
+        item->visit(visitor);
+    else
         value->visit(visitor);
 }
 

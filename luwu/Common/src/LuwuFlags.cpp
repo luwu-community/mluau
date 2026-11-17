@@ -17,7 +17,7 @@ LUAU_FASTFLAGVARIABLE(LuwuTraits)
 // is on the compiler emits WIP bytecode (version 200), which positional patterns need for LOP_GETPOSITIONAL.
 LUAU_FASTFLAGVARIABLE(LuwuDestructuring)
 
-// Luwu Table Comprehensions (rfcs/table-comprehensions.md): `{ for ... in ... when ... give item }` (in progress). While it
+// Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): `{ for ... in ... when ... give item }` (in progress). While it
 // is on, the compiler emits WIP bytecode (version 200), which has LOP_PRESIZETABLE.
 LUAU_FASTFLAGVARIABLE(LuwuTableComprehensions)
 
@@ -49,13 +49,17 @@ bool luauClassCompat()
 
 } // namespace Luau
 
-// Luwu collections: the `collections` library of builtin classes (`Pair`, `Triple`, `Quad`, `OrderedMap`, `Vec`,
-// `VecDeque`), in the VM and in Analysis's builtin definitions. A prototype whose API can still change. Needs
+// Luwu builtin classes: standard library classes written in C++, in the VM and in Analysis's builtin definitions. So far
+// that's the `collections` library (`OrderedMap`, `Vec`, `VecDeque`). A prototype whose API can still change. Needs
 // LuwuClasses.
-LUAU_FASTFLAGVARIABLE(DebugLuwuCollections)
+LUAU_FASTFLAGVARIABLE(DebugLuwuBuiltinClasses)
 
 // Luwu try expressions: `try expr` gives an `Ok` or an `Err`, and the `Ok`, `Err`, `Some` and `None` globals exist. A
 // Debug flag while it's in progress: a function containing `try` doesn't compile to native code yet. Needs LuwuClasses
 // and LuwuNonePrimitive. The parser gates the syntax, and while it is on the compiler emits WIP bytecode (version 200),
 // which holds the protected ranges.
 LUAU_FASTFLAGVARIABLE(DebugLuwuTryExpressions)
+
+// Luwu bundles: the `bundle` library, its classes, and the compiler's fastcalls and unfolding for it. A prototype whose
+// API can still change. Needs LuwuClasses.
+LUAU_FASTFLAGVARIABLE(DebugLuwuBundles)

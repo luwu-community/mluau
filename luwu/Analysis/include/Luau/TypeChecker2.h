@@ -247,6 +247,8 @@ private:
     Scope* findInnermostScope(Location location) const;
     void visit(AstStat* stat);
     void visit(AstStatIf* ifStatement);
+    void visit(const AstMatchSubject& subject);
+    void visit(AstStatMatch* match);
     void visitIfCondition(AstExpr* condition, const AstArray<AstIfClause>& clauses);
     void visit(AstStatWhile* whileStatement);
     void visit(AstStatRepeat* repeatStatement);
@@ -255,6 +257,7 @@ private:
     void visit(AstStatReturn* ret);
     void visit(AstStatGive* give);
     void visit(AstStatComprehensionItem* item);
+    void checkComprehensionItem(AstStatComprehensionItem* item, const TableIndexer& indexer);
     void visit(AstStatExpr* expr);
     void visit(AstStatLocal* local);
     void visit(AstStatFor* forStatement);
@@ -332,6 +335,7 @@ private:
     // The types of `call`'s arguments as written, without `self`.
     void appendArgumentTypes(TypePack& args, AstExprCall* call);
     void visitCall(AstExprCall* call);
+    void checkContainerConstructor(AstExprCall* call);
     void checkUnionMethodSelves(AstExprIndexName* indexExpr);
     // Luwu literal types: a value already checked where it was given (a literal parameter or local, a literal field read),
     // named for messages
@@ -381,6 +385,7 @@ private:
     void visit(AstExprTypeAssertion* expr);
     void visit(AstExprIfElse* expr);
     void visit(AstExprDo* expr);
+    void visit(AstExprMatch* expr);
     void visit(AstExprTableComprehension* expr);
     void visit(AstExprInterpString* interpString);
     void visit(AstExprInstantiate* explicitTypeInstantiation);

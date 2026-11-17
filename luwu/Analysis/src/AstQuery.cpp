@@ -540,7 +540,7 @@ struct FindExprOrLocal : public AstVisitor
 
         // Luwu Destructuring (rfcs/destructuring.md): a binding of a pattern is declared by a statement whose value reads
         // its key, at the same location as a shorthand binding (`.{name}`). The binding is what's pointed at there.
-        // A type test's pattern on a local (`x is Point.(px)`) reads `x` itself, so its first binding holds the pattern
+        // A type test's pattern on a local (`x is Point(px)`) reads `x` itself, so its first binding holds the pattern
         // (`destructure`) instead of following a hidden local.
         bool declaresBinding = al->isDesugaredField() || al->destructure;
         if (declaresBinding && matchedVar)

@@ -28,6 +28,7 @@
 #include <string_view>
 
 #include <math.h>
+#include <stdlib.h>
 
 LUAU_FASTINTVARIABLE(LuauCompileLoopUnrollThreshold, 25)
 LUAU_FASTINTVARIABLE(LuauCompileLoopUnrollThresholdMaxBoost, 300)
@@ -60,7 +61,8 @@ LUAU_FASTFLAGVARIABLE(LuauCompileStringInterpTargetTop)
 LUAU_FASTFLAG(LuwuNoinlineAttribute)
 LUAU_FASTFLAGVARIABLE(LuauEmitCallFeedback)
 LUAU_FASTFLAG(LuwuDefaultArguments)
-LUAU_FASTFLAG(DebugLuwuCollections)
+LUAU_FASTFLAG(DebugLuwuBuiltinClasses)
+LUAU_FASTFLAG(DebugLuwuBundles)
 LUAU_FASTFLAGVARIABLE(LuwuExportedClassIsNilWorkaround)
 LUAU_FASTFLAG(LuwuStringExtensions)
 
@@ -4005,7 +4007,7 @@ struct Compiler
     // arguments or as the items of a list literal. Empty when the call passes anything else.
     std::vector<AstExprCall*> orderedMapEntryBundles(AstExprCall* expr)
     {
-        if (!FFlag::DebugLuwuCollections || expr->self)
+        if (!FFlag::DebugLuwuBuiltinClasses || expr->self)
             return {};
 
         Builtin builtin = getBuiltin(expr->func, globals, variables);
@@ -5948,7 +5950,7 @@ struct Compiler
         return le->local;
     }
 
-    // Luwu Do Expressions (rfcs/do-expressions.md): the check in `type(x) == "string" or return` (or `break`, `continue`)
+    // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the check in `type(x) == "string" or return` (or `break`, `continue`)
     // written as a statement, a declaration's value or an assignment's value, which only completes when the check passes
     static AstExpr* orLeaveCheck(AstStat* stat)
     {
@@ -6089,11 +6091,27 @@ struct Compiler
         if (!FFlag::LuwuClasses)
             return nullptr;
 
+        // Luwu Guards (rfcs/control-flow/guards.md): `return if not class.isinstance(c, C)` leaves when the check fails,
+        // so it proves `c` for the rest of the block just as the assert does. So does the `if` statement it means.
+        if (AstStatIf* guard = stat->as<AstStatIf>())
+        {
+            bool leavesOnFailure = !guard->elsebody && guard->clauses.size == 0 && guard->thenbody->body.size == 1 &&
+                                   alwaysTerminates(guard->thenbody->body.data[0]);
+            AstExprUnary* negated = withoutGroups(guard->condition)->as<AstExprUnary>();
+            bool checksFailure = negated && negated->op == AstExprUnary::Op::Not;
+
+            AstStatClass* decl = leavesOnFailure && checksFailure ? matchIsinstanceCall(negated->expr, local) : nullptr;
+            if (!decl || bodyWritesLocal(body, index + 1, local))
+                return nullptr;
+
+            return decl;
+        }
+
         AstStatExpr* statExpr = stat->as<AstStatExpr>();
         if (!statExpr)
             return nullptr;
 
-        // Luwu Do Expressions (rfcs/do-expressions.md): `class.isinstance(c, C) or return` leaves when the check fails,
+        // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `class.isinstance(c, C) or return` leaves when the check fails,
         // so it proves `c` for the rest of the block just as the assert does
         if (AstExprBinary* orLeave = asOrLeave(statExpr->expr))
         {
@@ -6553,10 +6571,10 @@ struct Compiler
             return;
         }
 
-        // Luwu Table Comprehensions (rfcs/table-comprehensions.md): nothing can observe the table in `#{ for ... }`, so only
+        // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): nothing can observe the table in `#{ for ... }`, so only
         // its length is computed and the table is never built
         AstExprTableComprehension* counted = expr->op == AstExprUnary::Op::Len ? expr->expr->as<AstExprTableComprehension>() : nullptr;
-        if (counted && !counted->item->key)
+        if (counted && !counted->item->isMap())
             return compileComprehensionCount(counted, target);
 
         uint8_t re = compileExprAuto(expr->expr, rs);
@@ -6718,7 +6736,7 @@ struct Compiler
         }
     }
 
-    // Luwu If Local (rfcs/if-local.md): emits a `when` chain's clauses in order, adding a jump to `elseJumps` after
+    // Luwu If Local (rfcs/control-flow/if-local.md): emits a `when` chain's clauses in order, adding a jump to `elseJumps` after
     // each one, taken when it fails. A binding gets a register of its own and stays pushed as a local; the caller
     // closes and pops the chain's locals (from `oldLocals`) after the branch.
     //
@@ -6779,7 +6797,7 @@ struct Compiler
         isinstanceProvenLocals[local] = decl;
     }
 
-    // Luwu If Local (rfcs/if-local.md): the lowest register among the captured locals from `start` up, or -1. A
+    // Luwu If Local (rfcs/control-flow/if-local.md): the lowest register among the captured locals from `start` up, or -1. A
     // clause can capture an earlier binding (`when run(function() x = nil end)`), and when a later clause fails the
     // else path has to close that upvalue too, because the binding's register is reused after the chain.
     int capturedLocalsReg(size_t start)
@@ -6798,7 +6816,7 @@ struct Compiler
         return reg;
     }
 
-    // Luwu If Local (rfcs/if-local.md): compiles `clauses`, then the code they guard with `compileBranch`, which sees the
+    // Luwu If Local (rfcs/control-flow/if-local.md): compiles `clauses`, then the code they guard with `compileBranch`, which sees the
     // clauses' bindings and `class.isinstance` proofs. A `while` chain is its loop's header (Loop::compilingHeader). Closes
     // the bindings' upvalues when `closeAfter`, and pops them. Returns the register a failing clause's path closes
     // upvalues from, or -1 (capturedLocalsReg; see emitClauseFailureClose).
@@ -6833,14 +6851,137 @@ struct Compiler
         return closeReg;
     }
 
-    // Luwu If Local (rfcs/if-local.md): the start of the path a failing clause jumps to
+    // Luwu If Local (rfcs/control-flow/if-local.md): the start of the path a failing clause jumps to
     void emitClauseFailureClose(int closeReg)
     {
         if (closeReg >= 0)
             bytecode.emitABC(LOP_CLOSEUPVALS, uint8_t(closeReg), 0, 0);
     }
 
-    // Luwu If Local (rfcs/if-local.md)
+    // Luwu Classes (rfcs/classes): compiles `thenBody` with `compileBranch`. The branch of `if class.isinstance(x, C)` knows
+    // `x` is exactly a `C`, so `x.field` can use GETOBJECTMEMBER (see provenIsinstanceClass).
+    template<typename CompileBranch>
+    void compileProvenBranch(AstExpr* condition, AstStat* thenBody, CompileBranch&& compileBranch)
+    {
+        AstLocal* provenLocal = nullptr;
+        AstStatClass* previousProvenClass = nullptr;
+
+        if (AstStatClass* decl = matchIsinstanceProvenLocal(condition, thenBody, provenLocal))
+        {
+            AstStatClass** existing = isinstanceProvenLocals.find(provenLocal);
+            previousProvenClass = existing ? *existing : nullptr;
+            isinstanceProvenLocals[provenLocal] = decl;
+        }
+
+        compileBranch();
+
+        // DenseHashMap has no erase; a null entry means "not proven"
+        if (provenLocal)
+            isinstanceProvenLocals[provenLocal] = previousProvenClass;
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the header's declaration of the subject, if it has one.
+    // The caller pops the subject's local.
+    void compileMatchSubject(const AstMatchSubject& subject)
+    {
+        if (subject.declaration)
+            compileStat(subject.declaration);
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): one arm with a condition. A failing test jumps past the
+    // arm; a passing one runs `compileBranch` and jumps to the end of the `match` (into `endJumps`) unless the arm's block
+    // always leaves. A statement arm with a plain `class.isinstance` test proves the class in its block, as an `if` does.
+    template<typename CompileBranch>
+    void compileMatchArm(AstNode* match, const AstMatchArm& arm, std::vector<size_t>& endJumps, CompileBranch&& compileBranch)
+    {
+        LUAU_ASSERT(arm.condition);
+        AstNode* branch = arm.value ? static_cast<AstNode*>(arm.value) : arm.body;
+        bool terminates = arm.body && alwaysTerminates(arm.body);
+
+        std::vector<size_t> elseJump;
+        int closeReg = -1;
+        if (arm.clauses.size != 0)
+        {
+            closeReg = compileGuardedBranch(arm.clauses, elseJump, branch, /* loopHeader */ false, /* closeAfter */ !terminates, compileBranch);
+        }
+        else
+        {
+            compileConditionValue(arm.condition, nullptr, elseJump, false);
+            if (arm.body)
+                compileProvenBranch(arm.condition, arm.body, compileBranch);
+            else
+                compileBranch();
+        }
+
+        if (!terminates)
+        {
+            endJumps.push_back(bytecode.emitLabel());
+            bytecode.emitAD(LOP_JUMP, 0, 0);
+        }
+
+        size_t elseLabel = bytecode.emitLabel();
+        emitClauseFailureClose(closeReg);
+        patchJumps(match, elseJump, elseLabel);
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the subject, then the arms as an if-else chain whose
+    // branches compile into `target`. Only a `match` already reported for its missing `else` can match no arm; it gives
+    // nil.
+    void compileExprMatch(AstExprMatch* expr, uint8_t target, bool targetTemp)
+    {
+        RegScope rs(this);
+        size_t oldLocals = localStack.size();
+        compileMatchSubject(expr->subject);
+
+        std::vector<size_t> endJumps;
+        for (const AstMatchArm& arm : expr->arms)
+        {
+            auto compileValue = [&]()
+            {
+                compileExpr(arm.value, target, targetTemp);
+            };
+
+            if (arm.condition)
+                compileMatchArm(expr, arm, endJumps, compileValue);
+            else
+                compileValue();
+        }
+
+        if (!matchesEveryValue(expr->arms))
+            bytecode.emitABC(LOP_LOADNIL, target, 0, 0);
+
+        patchJumps(expr, endJumps, bytecode.emitLabel());
+        closeLocals(oldLocals);
+        popLocals(oldLocals);
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the subject, then the arms as an `if` chain
+    void compileStatMatch(AstStatMatch* stat)
+    {
+        RegScope rs(this);
+        size_t oldLocals = localStack.size();
+        compileMatchSubject(stat->subject);
+
+        std::vector<size_t> endJumps;
+        for (const AstMatchArm& arm : stat->arms)
+        {
+            auto compileBody = [&]()
+            {
+                compileStat(arm.body);
+            };
+
+            if (arm.condition)
+                compileMatchArm(stat, arm, endJumps, compileBody);
+            else
+                compileBody();
+        }
+
+        patchJumps(stat, endJumps, bytecode.emitLabel());
+        closeLocals(oldLocals);
+        popLocals(oldLocals);
+    }
+
+    // Luwu If Local (rfcs/control-flow/if-local.md)
     void compileExprIfElseClauses(AstExprIfElse* expr, uint8_t target, bool targetTemp)
     {
         std::vector<size_t> elseJump;
@@ -6869,13 +7010,20 @@ struct Compiler
         patchJump(expr, thenLabel, endLabel);
     }
 
-    // Luwu Do Expressions (rfcs/do-expressions.md): the block runs in place, and each `give` compiles its value into
+    // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the block runs in place, and each `give` compiles its value into
     // `target`, closes the block's captured locals and jumps to the end, the way an inlined function's `return` does
     // (compileInlineReturn). `return`, `break` and `continue` leave through their usual paths: they close upvalues
     // from the local stack, which already holds the block's locals.
     void compileExprDo(AstExprDo* expr, uint8_t target, bool targetTemp, unsigned bundleSize = 0)
     {
         RegScope rs(this);
+
+        // `x or give v` gives from the enclosing `do` expression's frame
+        if (expr->shorthand)
+        {
+            compileStat(expr->body);
+            return;
+        }
 
         giveFrames.push_back({target, targetTemp, localStack.size(), {}, bundleSize});
 
@@ -6897,7 +7045,7 @@ struct Compiler
         giveFrames.pop_back();
     }
 
-    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): the comprehension's loop compiles like any loop, with its
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): the comprehension's loop compiles like any loop, with its
     // item appending to the table (compileStatComprehensionItem). What makes it faster than the loop one would write by
     // hand is the sizing: the table is allocated for every element the source can produce, by NEWTABLE for a constant
     // range or by PRESIZETABLE at the loop's start (compileComprehensionPresize), so filling it never rehashes. An array
@@ -6910,7 +7058,7 @@ struct Compiler
 
         RegScope rs(this);
 
-        bool isMap = expr->item->key != nullptr;
+        bool isMap = expr->item->isMap();
 
         // The target can be a local the loop reads (`t = { for _, v in t do v }`), so the table is only written to it at the end
         uint8_t table = targetTemp ? target : allocReg(expr, 1u);
@@ -6960,7 +7108,7 @@ struct Compiler
             bytecode.emitABC(LOP_MOVE, target, table, 0);
     }
 
-    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): the trip count of a numeric for whose bounds and step are
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): the trip count of a numeric for whose bounds and step are
     // constants, with the first value and the step; -1 when they aren't constant (see getTripCount for the other -1 cases)
     int getConstantTripCount(AstStatFor* range, double& from, double& step)
     {
@@ -6980,13 +7128,13 @@ struct Compiler
         return getTripCount(fromc.valueNumber, toc.valueNumber, stepc.valueNumber);
     }
 
-    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): an array comprehension over a constant range whose item and
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): an array comprehension over a constant range whose item and
     // `when` conditions fold to constants on every iteration has nothing left to run at runtime. It compiles to what the
     // literal it builds compiles to: `{ for i = 1, 4 do i * 2 }` is `{ 2, 4, 6, 8 }`, a NEWTABLE and SETLISTs.
     bool tryCompileConstantComprehension(AstExprTableComprehension* expr, uint8_t target)
     {
         AstStatFor* range = expr->clauseCount == 1 ? expr->loop->as<AstStatFor>() : nullptr;
-        if (!range || expr->item->key)
+        if (!range || expr->item->isMap())
             return false;
 
         AstStatIf* guard = range->whenGuard;
@@ -7106,7 +7254,7 @@ struct Compiler
         return true;
     }
 
-    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): `#{ for ... }`, which counts the items that aren't nil
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): `#{ for ... }`, which counts the items that aren't nil
     // without building the table (see ComprehensionFrame)
     void compileComprehensionCount(AstExprTableComprehension* expr, uint8_t target)
     {
@@ -7123,7 +7271,7 @@ struct Compiler
         bytecode.emitABC(LOP_MOVE, target, counter, 0);
     }
 
-    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): sizes the comprehension's table from the loop whose
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): sizes the comprehension's table from the loop whose
     // registers start at `regs`, when that loop is the one its frame sizes from
     void compileComprehensionPresize(AstStat* loop, uint8_t regs, bool range)
     {
@@ -7142,7 +7290,7 @@ struct Compiler
         bytecode.emitABC(LOP_PRESIZETABLE, frame.table, regs, form);
     }
 
-    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): one element. A nil value adds nothing, which is also how an
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): one element. A nil value adds nothing, which is also how an
     // `if c then v else nil` item filters.
     void compileStatComprehensionItem(AstStatComprehensionItem* stat)
     {
@@ -7154,8 +7302,15 @@ struct Compiler
 
         if (frame.table == kInvalidReg)
         {
-            LUAU_ASSERT(!stat->key);
+            LUAU_ASSERT(!stat->isMap());
             compileComprehensionCountItem(stat, frame.counter, rs);
+            return;
+        }
+
+        // A `do` item whose `give`s write keys gives nothing itself: each `give` stores its key (compileStatGive)
+        if (stat->givenItems.size != 0)
+        {
+            compileExprAuto(stat->value, rs);
             return;
         }
 
@@ -7182,7 +7337,7 @@ struct Compiler
         patchJump(stat, skipLabel, endLabel);
     }
 
-    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): an item of `#{ for ... }`: counted unless it is nil
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): an item of `#{ for ... }`: counted unless it is nil
     void compileComprehensionCountItem(AstStatComprehensionItem* stat, uint8_t counter, RegScope& rs)
     {
         // a constant has no side effects to keep, so a non-nil one just counts and a nil one does nothing
@@ -7222,7 +7377,7 @@ struct Compiler
             patchJump(stat, skipLabel, bytecode.emitLabel());
     }
 
-    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): `[key] op= value`. The key's current value is combined
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): `[key] op= value`. The key's current value is combined
     // with the new one; an absent key stores the value itself (negated for -=)
     void compileComprehensionAccumulate(AstStatComprehensionItem* stat, uint8_t table, uint8_t key, uint8_t value)
     {
@@ -7269,14 +7424,21 @@ struct Compiler
         patchJump(stat, doneLabel, bytecode.emitLabel());
     }
 
-    // Luwu Do Expressions (rfcs/do-expressions.md)
+    // Luwu Do Expressions (rfcs/control-flow/do-expressions.md)
     void compileStatGive(AstStatGive* stat)
     {
         LUAU_ASSERT(!giveFrames.empty());
 
-        // Each `give` writes the target only once, right before it jumps out: the target can be a live local that the
-        // block still reads (`x = do ... give x + 1`), so it's never used as scratch before that
+        // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): `give [k] = v` stores into the comprehension's table
+        // instead of writing the target
+        if (stat->item)
         {
+            compileStatComprehensionItem(stat->item);
+        }
+        else
+        {
+            // Each `give` writes the target only once, right before it jumps out: the target can be a live local that the
+            // block still reads (`x = do ... give x + 1`), so it's never used as scratch before that
             RegScope rs(this);
             GiveFrame& frame = giveFrames.back();
             if (frame.bundleSize > 0)
@@ -7454,7 +7616,7 @@ struct Compiler
     }
 
     // Luwu try expressions: `class.isinstance(r, Ok)` or `class.isinstance(r, Err)`, which a result kept in registers
-    // answers from its flag. `is Ok.(value)` desugars to it. Gives whether it tests for Ok and sets `local` to r.
+    // answers from its flag. `is Ok(value)` desugars to it. Gives whether it tests for Ok and sets `local` to r.
     std::optional<bool> tryResultVariantTest(AstExprCall* call, AstExprLocal*& local)
     {
         const int* bfid = builtins.find(call);
@@ -7549,7 +7711,7 @@ struct Compiler
     }
 
     // Luwu try expressions: element `position` of a try result kept in registers, read by a positional pattern
-    // (`r is ok.(value)`). The first is an ok's value or an err's error, which share a register, so it needs no check. The
+    // (`r is Ok(value)`). The first is an ok's value or an err's error, which share a register, so it needs no check. The
     // rest are an err's module, line and traceback.
     void compileTryResultPositional(AstExpr* expr, size_t position, uint8_t reg, uint8_t target)
     {
@@ -7967,10 +8129,6 @@ struct Compiler
     void compileExprIndexName(AstExprIndexName* expr, uint8_t target, bool targetTemp = false)
     {
         setDebugLine(expr); // normally compileExpr sets up line info, but compileExprIndexName can be called directly
-
-        // Luwu collections: a destructured bundle's element is already in a register
-        if (tryCompileUnfoldedBundleRead(expr, target))
-            return;
 
         // Luwu try expressions: a field of a result kept in registers
         if (AstExprLocal* local = expr->expr->as<AstExprLocal>(); local && tryResultLocals.contains(local->local))
@@ -8452,6 +8610,10 @@ struct Compiler
         {
             compileExprDo(expr, target, targetTemp);
         }
+        else if (AstExprMatch* expr = node->as<AstExprMatch>())
+        {
+            compileExprMatch(expr, target, targetTemp);
+        }
         else if (AstExprTableComprehension* expr = node->as<AstExprTableComprehension>())
         {
             compileExprTableComprehension(expr, target, targetTemp);
@@ -8883,7 +9045,7 @@ struct Compiler
             return nullptr;
     }
 
-    // Luwu If Local (rfcs/if-local.md)
+    // Luwu If Local (rfcs/control-flow/if-local.md)
     void compileStatIfClauses(AstStatIf* stat)
     {
         std::vector<size_t> elseJump;
@@ -8980,18 +9142,6 @@ struct Compiler
         std::vector<size_t> elseJump;
         compileConditionValue(stat->condition, nullptr, elseJump, false);
 
-        // Luwu Classes (rfcs/classes): the then-branch of `if class.isinstance(x, C)` knows `x` is exactly a
-        // `C`, so `x.field` can use GETOBJECTMEMBER (see provenIsinstanceClass).
-        AstLocal* provenLocal = nullptr;
-        AstStatClass* previousProvenClass = nullptr;
-
-        if (AstStatClass* decl = matchIsinstanceProvenLocal(stat->condition, stat->thenbody, provenLocal))
-        {
-            AstStatClass** existing = isinstanceProvenLocals.find(provenLocal);
-            previousProvenClass = existing ? *existing : nullptr;
-            isinstanceProvenLocals[provenLocal] = decl;
-        }
-
         // Luwu String Extensions (rfcs/string-extensions.md): the then-branch of `if type(x) == "string"` knows `x` is a
         // string, so its method calls compile as function calls (see stringMethodAsFunctionCall)
         AstLocal* stringLocal = matchTypeStringCheck(stat->condition);
@@ -9005,11 +9155,14 @@ struct Compiler
             stringProvenLocals[stringLocal] = true;
         }
 
-        compileStat(stat->thenbody);
-
-        // DenseHashMap has no erase; a null entry means "not proven"
-        if (provenLocal)
-            isinstanceProvenLocals[provenLocal] = previousProvenClass;
+        compileProvenBranch(
+            stat->condition,
+            stat->thenbody,
+            [&]()
+            {
+                compileStat(stat->thenbody);
+            }
+        );
 
         if (stringLocal)
             stringProvenLocals[stringLocal] = previousString;
@@ -9050,7 +9203,7 @@ struct Compiler
         }
     }
 
-    // Luwu If Local (rfcs/if-local.md): `while local x = f() when c do`. The chain runs before every iteration, and its
+    // Luwu If Local (rfcs/control-flow/if-local.md): `while local x = f() when c do`. The chain runs before every iteration, and its
     // bindings are locals of the iteration: closed (if captured) and popped before jumping back, so a closure in the
     // body captures that iteration's value, as with a `for` variable. A failing clause leaves the loop through a
     // CLOSEUPVALS when a later clause captured an earlier binding (see capturedLocalsReg).
@@ -9097,7 +9250,7 @@ struct Compiler
         loops.pop_back();
     }
 
-    // Luwu Do Expressions (rfcs/do-expressions.md): `x or return v` as a statement compiles as the
+    // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `x or return v` as a statement compiles as the
     // `if not x then return v end` it replaces, and `x and break` as `if x then break end`, with every shortcut an `if`
     // gets (a `break` or `continue` body is a single jump to the loop's exit or continue label). In `x or y and continue`
     // the `if` body is the statement `y and continue`.
@@ -9359,23 +9512,18 @@ struct Compiler
         return true;
     }
 
-    // Luwu bundles: the position of the bundle element `name` (`first` to `twelfth`) in a bundle of `size`, or -1
-    static int bundleElementIndex(AstName name, unsigned size)
+    // Luwu bundles: the most values an unfolded bundle keeps in registers
+    static constexpr unsigned kMaxUnfoldedBundleValues = 12;
+
+    // Luwu bundles: whether the field `field` of a pattern reads a position of a bundle of `size`, as `.{ 2 as b }` does
+    static bool readsBundlePosition(const AstDestructureField& field, unsigned size)
     {
-        static const char* const kElements[] = {
-            "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth", "eleventh", "twelfth",
-        };
-        static constexpr unsigned kElementCount = sizeof(kElements) / sizeof(kElements[0]);
-        for (unsigned i = 0; i < size && i < kElementCount; i++)
-        {
-            if (name == kElements[i])
-                return int(i);
-        }
-        return -1;
+        AstExprConstantNumber* position = field.keyExpr ? field.keyExpr->as<AstExprConstantNumber>() : nullptr;
+        return field.keyIsPosition && position && position->value >= 1 && position->value <= double(size);
     }
 
     // Luwu collections: the size of the bundle every `give` of `expr` constructs, or 0 when one gives anything else or
-    // the sizes differ. Gives of nested `do` expressions belong to those.
+    // the sizes differ. Gives of nested `do` expressions belong to those, except the shorthand's (`x or give v`).
     unsigned bundleSizeOfGives(AstExprDo* expr)
     {
         struct GiveVisitor : AstVisitor
@@ -9385,7 +9533,7 @@ struct Compiler
 
             bool visit(AstExprDo* node) override
             {
-                return node == root;
+                return node == root || node->shorthand;
             }
 
             bool visit(AstExprFunction* node) override
@@ -9426,11 +9574,11 @@ struct Compiler
         }
     }
 
-    // Luwu bundles: `const .{ first, second } = bundle.Pair(a, b)` creates no object. The hidden local a
-    // destructuring desugars to gets one register per element, and its field reads become those registers (see
-    // compileExprIndexName). A `do` expression unfolds the same way when every `give` builds the same kind of bundle.
-    // Like a fastcall, this assumes `collections` is the builtin library when the module never assigns it; anything the
-    // pattern reads that isn't an element of the bundle keeps the object.
+    // Luwu bundles: `const .(a, b) = .(x, y)` creates no object. The hidden local a destructuring desugars to gets one
+    // register per value, and its position reads become those registers (see compileExprIndexExpr). A `do` expression
+    // unfolds the same way when every `give` builds a bundle of the same size. Like a fastcall, this assumes `bundle` is
+    // the builtin library when the module never assigns it; anything the pattern reads that isn't a position of the
+    // bundle keeps the object.
     bool tryCompileUnfoldedBundle(AstStatLocal* stat)
     {
         AstDestructurePattern* pattern = stat->destructure;
@@ -9447,7 +9595,7 @@ struct Compiler
 
         AstExprDo* doExpr = value->as<AstExprDo>();
         unsigned size = doExpr ? bundleSizeOfGives(doExpr) : bundleConstructionSize(value);
-        if (size == 0)
+        if (size == 0 || size > kMaxUnfoldedBundleValues)
             return false;
 
         // a position past the bundle's end raises, so the object stays
@@ -9456,7 +9604,7 @@ struct Compiler
 
         for (const AstDestructureField& field : pattern->fields)
         {
-            if (!pattern->positional && bundleElementIndex(field.key, size) < 0)
+            if (!pattern->positional && !readsBundlePosition(field, size))
                 return false;
         }
 
@@ -9473,7 +9621,7 @@ struct Compiler
         return true;
     }
 
-    // Luwu collections: a local bound to an unfolded bundle's element (`local first = (destructured).first`) uses the
+    // Luwu collections: a local bound to an unfolded bundle's element (`local first = (destructured).1`) uses the
     // element's register, the way `local a = b` reuses `b`'s. Only when nothing writes it, since two bindings can
     // share an element.
     bool tryBindBundleElement(AstStatLocal* stat)
@@ -9493,30 +9641,23 @@ struct Compiler
         return true;
     }
 
-    // Luwu collections: the register holding the element `read` takes from an unfolded bundle, by name
-    // (`(destructured).first`) or by position (`.(a, b)`)
+    // Luwu collections: the register holding the value `read` takes from an unfolded bundle by position (`.(a, b)`,
+    // `.{ 2 as b }`)
     std::optional<uint8_t> unfoldedBundleElement(AstExpr* read)
     {
-        AstExprIndexName* field = read->as<AstExprIndexName>();
         AstExprIndexExpr* element = read->as<AstExprIndexExpr>();
-        if (element && !element->positional)
+        if (!element || !element->positional)
             return std::nullopt;
 
-        AstExpr* object = field ? field->expr : element ? element->expr : nullptr;
-        AstExprLocal* local = object ? object->as<AstExprLocal>() : nullptr;
+        AstExprLocal* local = element->expr->as<AstExprLocal>();
         const UnfoldedBundle* bundle = local ? unfoldedBundles.find(local->local) : nullptr;
         if (!bundle)
             return std::nullopt;
 
-        int index = -1;
-        if (field)
-            index = bundleElementIndex(field->index, bundle->size);
-        else if (AstExprConstantNumber* position = element->index->as<AstExprConstantNumber>())
-            index = int(position->value) - 1;
-
-        // tryCompileUnfoldedBundle only unfolds a bundle whose every read is one of its elements
-        LUAU_ASSERT(index >= 0 && unsigned(index) < bundle->size);
-        return uint8_t(bundle->reg + index);
+        // tryCompileUnfoldedBundle only unfolds a bundle whose every read is one of its positions
+        AstExprConstantNumber* position = element->index->as<AstExprConstantNumber>();
+        LUAU_ASSERT(position && position->value >= 1 && unsigned(position->value) <= bundle->size);
+        return uint8_t(bundle->reg + unsigned(position->value) - 1);
     }
 
     // Luwu collections: an element of an unfolded bundle into `target`, a move from the register holding it
@@ -9812,15 +9953,15 @@ struct Compiler
         loops.pop_back();
     }
 
-    // Luwu bundles: the most values a bundle holds (LUWU_BUNDLE_MAX in the VM)
-    static constexpr unsigned kMaxBundleValues = 12;
+    // Luwu bundles: the most values a bundle holds (LUWU_BUNDLE_LIMIT in the VM). A larger construction raises.
+    static constexpr unsigned kMaxBundleValues = 1024;
 
     // Luwu bundles: the size of the bundle `expr` constructs, a `bundle.pack` call (which `.(a, b)` is) whose last argument
     // isn't a multiret. 0 for anything else.
     unsigned bundleConstructionSize(AstExpr* expr)
     {
         AstExprCall* call = expr->as<AstExprCall>();
-        if (!FFlag::DebugLuwuCollections || !call || call->self || call->args.size > kMaxBundleValues)
+        if (!FFlag::DebugLuwuBundles || !call || call->self || call->args.size > kMaxBundleValues)
             return 0;
 
         Builtin builtin = getBuiltin(call->func, globals, variables);
@@ -10457,6 +10598,10 @@ struct Compiler
         {
             compileStatIf(stat);
         }
+        else if (AstStatMatch* stat = node->as<AstStatMatch>())
+        {
+            compileStatMatch(stat);
+        }
         else if (AstStatWhile* stat = node->as<AstStatWhile>())
         {
             compileStatWhile(stat);
@@ -10830,7 +10975,7 @@ struct Compiler
         {
             const LoopJump& lj = loopJumps[i];
 
-            // Luwu Do Expressions (rfcs/do-expressions.md): a `do` expression in this loop's header jumps for an
+            // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): a `do` expression in this loop's header jumps for an
             // enclosing loop, which patches it later
             if (lj.loop != loop)
             {
@@ -10857,7 +11002,7 @@ struct Compiler
         loopJumps.resize(kept);
     }
 
-    // Luwu Do Expressions (rfcs/do-expressions.md): the loop a `break` or `continue` belongs to: the innermost loop that
+    // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the loop a `break` or `continue` belongs to: the innermost loop that
     // isn't compiling its own header (a `while` or `until` condition, `for` bounds, `for ... in` values). A header runs
     // outside its loop's body, so the parser resolves a `break`/`continue` in a `do` expression there to the enclosing
     // loop.
@@ -11874,7 +12019,7 @@ struct Compiler
 
         bool visit(AstExpr* expr) override
         {
-            // Luwu Do Expressions (rfcs/do-expressions.md): a `do` expression can `return` from anywhere inside an
+            // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): a `do` expression can `return` from anywhere inside an
             // expression, so every expression has to be searched. Upstream skips them: there, a `return` is only ever a
             // statement of the function's own blocks.
             return FFlag::LuwuDoExpr;
@@ -12001,7 +12146,7 @@ struct Compiler
         Type type;
         size_t label;
 
-        // Luwu Do Expressions (rfcs/do-expressions.md): the index in `loops` of the loop this jump leaves or continues.
+        // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the index in `loops` of the loop this jump leaves or continues.
         // It isn't always the innermost one: see targetLoop.
         size_t loop;
     };
@@ -12013,7 +12158,7 @@ struct Compiler
 
         AstStatContinue* continueUsed;
 
-        // Luwu Do Expressions (rfcs/do-expressions.md): set while the loop compiles its own header (see targetLoop)
+        // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): set while the loop compiles its own header (see targetLoop)
         bool compilingHeader = false;
     };
 
@@ -12222,7 +12367,7 @@ struct Compiler
     std::vector<Loop> loops;
     std::vector<InlineFrame> inlineFrames;
 
-    // Luwu Do Expressions (rfcs/do-expressions.md): the `do` expressions being compiled, innermost last
+    // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the `do` expressions being compiled, innermost last
     struct GiveFrame
     {
         uint8_t target;
@@ -12243,7 +12388,7 @@ struct Compiler
     };
     DenseHashMap<AstLocal*, UnfoldedBundle> unfoldedBundles{nullptr};
 
-    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): the comprehensions being compiled, innermost last
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): the comprehensions being compiled, innermost last
     struct ComprehensionFrame
     {
         // The table being built, or kInvalidReg for `#{ for ... }`, which only counts (compileComprehensionCount).
@@ -12255,7 +12400,7 @@ struct Compiler
     };
     std::vector<ComprehensionFrame> comprehensionFrames;
 
-    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): the longest constant range a comprehension is folded to
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): the longest constant range a comprehension is folded to
     // a literal for (tryCompileConstantComprehension). Past it, the loop is less bytecode than the constants.
     static const int kConstantComprehensionLimit = 64;
 

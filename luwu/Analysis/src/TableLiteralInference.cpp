@@ -3,6 +3,7 @@
 #include "Luau/TableLiteralInference.h"
 
 #include "Luau/Ast.h"
+#include "Luau/BuiltinDefinitions.h"
 #include "Luau/Common.h"
 #include "Luau/ConstraintSolver.h"
 #include "Luau/HashUtil.h"
@@ -13,6 +14,8 @@
 #include "Luau/ToString.h"
 #include "Luau/TypeUtils.h"
 #include "Luau/Unifier2.h"
+
+#include <stdlib.h>
 
 LUAU_FASTFLAGVARIABLE(LuauBidirectionalInferenceVariadics)
 LUAU_FASTFLAGVARIABLE(LuauBidirectionalInferenceBetterLambdaHandling)
@@ -79,8 +82,8 @@ struct FindFunctionTypeIn : IterativeTypeVisitor
                 return false;
             }
 
-            int candidateDistance = std::abs(int(size(candidate->argTypes)) - numberOfLambdaParameters);
-            int thisDistance = std::abs(int(size(ftv.argTypes)) - numberOfLambdaParameters);
+            int candidateDistance = abs(int(size(candidate->argTypes)) - numberOfLambdaParameters);
+            int thisDistance = abs(int(size(ftv.argTypes)) - numberOfLambdaParameters);
 
             if (thisDistance < candidateDistance)
             {
@@ -95,7 +98,7 @@ struct FindFunctionTypeIn : IterativeTypeVisitor
         else
         {
             if (candidate == nullptr ||
-                std::abs(int(size(candidate->argTypes)) - numberOfLambdaParameters) > std::abs(int(size(ftv.argTypes)) - numberOfLambdaParameters))
+                abs(int(size(candidate->argTypes)) - numberOfLambdaParameters) > abs(int(size(ftv.argTypes)) - numberOfLambdaParameters))
             {
                 candidate = get<FunctionType>(ty);
                 return false;
@@ -112,7 +115,13 @@ struct FindFunctionTypeIn : IterativeTypeVisitor
  */
 bool isCheckableExpr(const AstExpr* expr)
 {
-    return isLiteral(expr) || expr->is<AstExprGroup>() || expr->is<AstExprIfElse>();
+    // Luwu bundles: a bundle literal `.(a, b)` is a `bundle.pack` call, and its positions take expected types
+    const AstExprCall* call = expr->as<AstExprCall>();
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a `match`'s arms take the expected type, like an if-else
+    // expression's branches
+    // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): so do the values a `do` expression gives
+    bool checkableLuwuExpr = expr->is<AstExprMatch>() || expr->is<AstExprDo>();
+    return isLiteral(expr) || expr->is<AstExprGroup>() || expr->is<AstExprIfElse>() || (call && isBundlePackCall(call)) || checkableLuwuExpr;
 }
 
 struct BidirectionalTypePusher
@@ -214,6 +223,38 @@ struct BidirectionalTypePusher
         {
             pushType(expectedType, ternary->trueExpr);
             pushType(expectedType, ternary->falseExpr);
+            return exprType;
+        }
+
+        // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): each arm's value, like an if-else expression's branches
+        if (auto match = expr->as<AstExprMatch>())
+        {
+            for (const AstMatchArm& arm : match->arms)
+                pushType(expectedType, arm.value);
+            return exprType;
+        }
+
+        // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): each value the `do` expression gives. A `give [k] = v` in a
+        // comprehension's item writes the comprehension's table instead.
+        if (auto doExpr = expr->as<AstExprDo>(); doExpr && !doExpr->shorthand)
+        {
+            for (AstStatGive* give : doExpr->gives())
+            {
+                if (!give->item)
+                    pushType(expectedType, give->value);
+            }
+            return exprType;
+        }
+
+        // Luwu bundles: a bundle literal `.(a, b)` (a `bundle.pack` call) takes each position's expected type, so
+        // `.("torch", 1)` where an `.(ItemId, number)` goes keeps "torch" as a singleton
+        if (auto call = expr->as<AstExprCall>(); call && isBundlePackCall(call))
+        {
+            if (std::optional<std::vector<TypeId>> positions = expectedBundlePositions(solver->arena, constraint->scope.get(), expectedType, call))
+            {
+                for (size_t i = 0; i < call->args.size && i < positions->size(); i++)
+                    pushType((*positions)[i], call->args.data[i]);
+            }
             return exprType;
         }
 

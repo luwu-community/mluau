@@ -108,13 +108,24 @@ bool hasBreak(AstStat* node)
 
         return false;
     }
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
+    else if (AstStatMatch* stat = node->as<AstStatMatch>())
+    {
+        for (const AstMatchArm& arm : stat->arms)
+        {
+            if (hasBreak(arm.body))
+                return true;
+        }
+
+        return false;
+    }
     else
     {
         return false;
     }
 }
 
-// Luwu Do Expressions (rfcs/do-expressions.md): a `do` expression that evaluating `expr` always reaches, and whose block
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): a `do` expression that evaluating `expr` always reaches, and whose block
 // never ends normally (`print(do return "x")`), so the code after the statement holding it never runs. Only parts
 // that always run count: not the right side of `and`/`or` unless the left side can't decide it, an if-else
 // expression's branches or a function body.
@@ -165,6 +176,10 @@ static const AstExprDo* findAlwaysLeavingDo(const AstExpr* expr)
     if (const AstExprIfElse* ifElse = expr->as<AstExprIfElse>())
         return findAlwaysLeavingDo(ifElse->condition);
 
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): only the subject always runs
+    if (const AstExprMatch* match = expr->as<AstExprMatch>())
+        return findAlwaysLeavingDo(match->subject.value);
+
     if (const AstExprIndexName* index = expr->as<AstExprIndexName>())
         return findAlwaysLeavingDo(index->expr);
 
@@ -204,7 +219,7 @@ static const AstExprDo* findAlwaysLeavingDo(const AstExpr* expr)
     return nullptr;
 }
 
-// Luwu Do Expressions (rfcs/do-expressions.md): a `do` expression that `expr` can only be truthy after, because it never
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): a `do` expression that `expr` can only be truthy after, because it never
 // ends normally (`a and (do return x)`)
 static const AstExprDo* findTruthyOnlyAfterDo(const AstExpr* expr)
 {
@@ -235,7 +250,7 @@ static const AstExprDo* findTruthyOnlyAfterDo(const AstExpr* expr)
     return nullptr;
 }
 
-// Luwu Do Expressions (rfcs/do-expressions.md): the `do` expression that keeps the `if`'s then-branch from ever running:
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the `do` expression that keeps the `if`'s then-branch from ever running:
 // the condition, or any clause of its `when` chain, can only be truthy after it, and it never ends normally
 const AstExprDo* findDoBlockingThenBranch(const AstStatIf* stat)
 {
@@ -251,10 +266,14 @@ const AstExprDo* findDoBlockingThenBranch(const AstStatIf* stat)
     return nullptr;
 }
 
-// Luwu Do Expressions (rfcs/do-expressions.md): the `do` expression that keeps the statement from finishing: the
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the `do` expression that keeps the statement from finishing: the
 // statement always evaluates it, and it never ends normally
 const AstExprDo* findDoEndingStatement(const AstStat* node)
 {
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): only the subject always runs
+    if (const AstStatMatch* stat = node->as<AstStatMatch>())
+        return findAlwaysLeavingDo(stat->subject.value);
+
     if (const AstStatIf* stat = node->as<AstStatIf>())
         return findAlwaysLeavingDo(stat->clauses.size == 0 ? stat->condition : stat->clauses.data[0].expr);
 
@@ -304,12 +323,12 @@ const AstStat* getFallthrough(const AstStat* node)
     }
     else if (findDoEndingStatement(node))
     {
-        // Luwu Do Expressions (rfcs/do-expressions.md): `print(do return "x")` returns before the call
+        // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `print(do return "x")` returns before the call
         return nullptr;
     }
     else if (const AstStatIf* stat = node->as<AstStatIf>())
     {
-        // Luwu Do Expressions (rfcs/do-expressions.md): a then-branch that never runs doesn't fall through
+        // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): a then-branch that never runs doesn't fall through
         if (const AstStat* thenf = findDoBlockingThenBranch(stat) ? nullptr : getFallthrough(stat->thenbody))
             return thenf;
 
@@ -324,6 +343,18 @@ const AstStat* getFallthrough(const AstStat* node)
         {
             return stat;
         }
+    }
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): an arm that falls through, or the `match` itself when a
+    // value can match no arm
+    else if (const AstStatMatch* stat = node->as<AstStatMatch>())
+    {
+        for (const AstMatchArm& arm : stat->arms)
+        {
+            if (const AstStat* armf = getFallthrough(arm.body))
+                return armf;
+        }
+
+        return matchesEveryValue(stat->arms) ? nullptr : stat;
     }
     else if (node->is<AstStatReturn>())
     {
@@ -596,6 +627,11 @@ ControlFlow TypeChecker::check(const ScopePtr& scope, const AstStat& program)
     else if (program.is<AstStatDeclareClass>())
     {
         // Luwu Declare Statements (rfcs/declare-statements.md): classes are only checked by the new solver
+        return ControlFlow::None;
+    }
+    else if (auto match = program.as<AstStatMatch>())
+    {
+        checkMatch(scope, match->location, match->subject, match->arms);
         return ControlFlow::None;
     }
     else
@@ -895,7 +931,7 @@ static std::optional<Predicate> tryGetTypeGuardPredicate(const AstExprBinary& ex
     return predicate;
 }
 
-// Luwu If Local (rfcs/if-local.md): the old solver gets the minimum, so it doesn't fail on a `when` chain: each
+// Luwu If Local (rfcs/control-flow/if-local.md): the old solver gets the minimum, so it doesn't fail on a `when` chain: each
 // binding is declared like a `local` in the branch's scope, and the plain conditions refine that scope. Nothing
 // is refined in the else branch, and the bindings aren't narrowed to truthy.
 static void checkIfClausesOldSolver(TypeChecker& checker, const ScopePtr& thenScope, const AstArray<AstIfClause>& clauses)
@@ -969,7 +1005,7 @@ ErrorVec TypeChecker::canUnify(TypePackId subTy, TypePackId superTy, const Scope
 
 ControlFlow TypeChecker::check(const ScopePtr& scope, const AstStatWhile& statement)
 {
-    // Luwu If Local (rfcs/if-local.md)
+    // Luwu If Local (rfcs/control-flow/if-local.md)
     if (statement.clauses.size != 0)
     {
         ScopePtr whileScope = childScope(scope, Location{statement.condition->location, statement.body->location});
@@ -2162,6 +2198,11 @@ WithPredicate<TypeId> TypeChecker::checkExpr(const ScopePtr& scope, const AstExp
         result = checkExpr(scope, *a, expectedType);
     else if (auto a = expr.as<AstExprDo>())
         result = checkExpr(scope, *a);
+    else if (auto a = expr.as<AstExprMatch>())
+    {
+        checkMatch(scope, a->location, a->subject, a->arms);
+        result = WithPredicate{anyType};
+    }
     else if (auto a = expr.as<AstExprTableComprehension>())
         result = checkExpr(scope, *a);
     else if (auto a = expr.as<AstExprPop>())
@@ -3534,7 +3575,7 @@ WithPredicate<TypeId> TypeChecker::checkExpr(const ScopePtr& scope, const AstExp
     return WithPredicate{types.size() == 1 ? types[0] : addType(UnionType{std::move(types)})};
 }
 
-// Luwu Do Expressions (rfcs/do-expressions.md): the old solver gets the minimum, so it doesn't fail on one: the block is
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the old solver gets the minimum, so it doesn't fail on one: the block is
 // checked, and the expression is `any`.
 WithPredicate<TypeId> TypeChecker::checkExpr(const ScopePtr& scope, const AstExprDo& expr)
 {
@@ -3542,7 +3583,37 @@ WithPredicate<TypeId> TypeChecker::checkExpr(const ScopePtr& scope, const AstExp
     return WithPredicate{anyType};
 }
 
-// Luwu Table Comprehensions (rfcs/table-comprehensions.md): the old solver gets the minimum, so it doesn't fail on one:
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the old solver gets the minimum, so it doesn't fail on one:
+// every part is checked without narrowing, and a `match` expression is `any`.
+void TypeChecker::checkMatch(const ScopePtr& scope, const Location& location, const AstMatchSubject& subject, const AstArray<AstMatchArm>& arms)
+{
+    ScopePtr matchScope = childScope(scope, location);
+    if (subject.declaration)
+        check(matchScope, *subject.declaration);
+    else
+        checkExpr(matchScope, *subject.value);
+
+    for (const AstMatchArm& arm : arms)
+    {
+        ScopePtr armScope = childScope(matchScope, location);
+        for (const AstIfClause& clause : arm.clauses)
+        {
+            if (clause.declaration)
+                check(armScope, *clause.declaration);
+            else
+                checkExpr(armScope, *clause.expr);
+        }
+
+        if (arm.condition && arm.clauses.size == 0)
+            checkExpr(armScope, *arm.condition);
+        if (arm.value)
+            checkExpr(armScope, *arm.value);
+        if (arm.body)
+            check(armScope, *arm.body);
+    }
+}
+
+// Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): the old solver gets the minimum, so it doesn't fail on one:
 // the loop is checked, and the expression is `any`.
 WithPredicate<TypeId> TypeChecker::checkExpr(const ScopePtr& scope, const AstExprTableComprehension& expr)
 {
@@ -3576,7 +3647,10 @@ ControlFlow TypeChecker::check(const ScopePtr& scope, const AstStatComprehension
 
 ControlFlow TypeChecker::check(const ScopePtr& scope, const AstStatGive& give)
 {
-    checkExpr(scope, *give.value);
+    if (give.item)
+        check(scope, *give.item);
+    else
+        checkExpr(scope, *give.value);
     return ControlFlow::Returns;
 }
 

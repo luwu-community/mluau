@@ -114,6 +114,9 @@ struct AstLocal
     bool isConst;
     // exported is only a property set after construction
     bool isExported = false;
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): bound by `case name` in a `match` arm, which binds
+    // the subject's value. A name there that's already taken was usually meant as a test (`case is Cat`).
+    bool isCaseBinding = false;
 
     AstType* annotation;
 
@@ -597,10 +600,10 @@ public:
     Location argLocation;
     // Luwu bundles: `.(a, b)`, which the parser writes as `bundle.pack(a, b)` (Parser::parseDotPositional)
     bool fromDotPositional = false;
-    // Luwu match expressions: a call the parser wrote for a type test (`x is Point` is `class.isinstance(x, Point)`),
-    // not one in the code. Editor features that show a call's parameters skip it.
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a call the parser wrote for a type test (`x is Point`
+    // is `class.isinstance(x, Point)`), not one in the code. Editor features that show a call's parameters skip it.
     bool fromTypeTest = false;
-    // Luwu match expressions: the `.{...}` after the type test (`x is Point.{x, y}`), kept even with no fields yet so
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the `{...}` or `(...)` after the type test's class (`x is Point {x, y}`), kept even with no fields yet so
     // autocomplete can offer the class's fields there
     const AstDestructurePattern* typeTestPattern = nullptr;
 };
@@ -788,6 +791,9 @@ public:
     Op op;
     AstExpr* left;
     AstExpr* right;
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the size test of a bundle pattern (`#value == 2`),
+    // which narrows `value` to the bundles of that size
+    bool fromBundlePattern = false;
 };
 
 std::string toString(AstExprBinary::Op op);
@@ -805,7 +811,7 @@ public:
     AstType* annotation;
 };
 
-// Luwu If Local (rfcs/if-local.md): one clause of an `if`/`elseif` condition written as a `when` chain, in a
+// Luwu If Local (rfcs/control-flow/if-local.md): one clause of an `if`/`elseif` condition written as a `when` chain, in a
 // statement or an expression. The clauses run left to right, and the branch is taken only when every clause
 // passes. A binding passes when the value it binds is truthy; a plain condition passes when it is truthy.
 // A binding is visible to the clauses after it and to its branch, and nowhere else.
@@ -823,7 +829,7 @@ struct AstIfClause
     // The `when` before this clause. Unset on the first clause.
     std::optional<Location> whenLocation;
     // False for a binding that holds its value whatever it is, with no truthiness test: a field a pattern binds after
-    // a type test (`x is Point.{x, y}`), which has to bind even when the field is `false`.
+    // a type test (`x is Point {x, y}`), which has to bind even when the field is `false`.
     bool tested = true;
 };
 
@@ -863,7 +869,7 @@ public:
     // ifLocation of the nested AstExprIfElse it parses into, and leaves this unset.
     std::optional<Location> elseLocation;
 
-    // Luwu If Local (rfcs/if-local.md): the condition's `when` chain. Empty for an ordinary condition. When
+    // Luwu If Local (rfcs/control-flow/if-local.md): the condition's `when` chain. Empty for an ordinary condition. When
     // it is set, `condition` is the first clause's expression, and code that evaluates or checks the
     // condition has to go through the clauses instead.
     AstArray<AstIfClause> clauses{nullptr, 0};
@@ -990,14 +996,19 @@ public:
     // Location of the leading 'if' or 'elseif' keyword token only (not the whole clause).
     Location ifLocation;
 
-    // Luwu If Local (rfcs/if-local.md): the condition's `when` chain. Empty for an ordinary condition. When
+    // Luwu If Local (rfcs/control-flow/if-local.md): the condition's `when` chain. Empty for an ordinary condition. When
     // it is set, `condition` is the first clause's expression, and code that evaluates or checks the
     // condition has to go through the clauses instead.
     AstArray<AstIfClause> clauses{nullptr, 0};
 
-    // Luwu If Local (rfcs/if-local.md): this `if` is a loop's `when` chain (AstStatFor::whenGuard), not one written
+    // Luwu If Local (rfcs/control-flow/if-local.md): this `if` is a loop's `when` chain (AstStatFor::whenGuard), not one written
     // as an `if`. It has no `then`, no `else` and no `end` of its own.
     bool isWhenGuard = false;
+
+    // Luwu Guards (rfcs/control-flow/guards.md): this `if` is a guard written leave-first, `continue if x`. Its
+    // `thenbody` is the one leave statement (`continue`, `break`, `return` or `give`), and it has no `then`, `else` or
+    // `end`.
+    bool isLeaveGuard = false;
 
     // Visits the condition: `condition`, or every clause of the `when` chain (a binding's declaration, or a
     // plain condition).
@@ -1031,7 +1042,7 @@ public:
     // Location of the leading 'while' keyword token only.
     Location whileLocation;
 
-    // Luwu If Local (rfcs/if-local.md): the condition's `when` chain (`while local x = f() when x.ok do`), checked
+    // Luwu If Local (rfcs/control-flow/if-local.md): the condition's `when` chain (`while local x = f() when x.ok do`), checked
     // before every iteration; the loop ends when a clause fails. Empty for an ordinary condition. When it is set,
     // `condition` is the first clause's expression, as for AstStatIf::clauses.
     AstArray<AstIfClause> clauses{nullptr, 0};
@@ -1079,7 +1090,7 @@ public:
     void visit(AstVisitor* visitor) override;
 };
 
-// Luwu Do Expressions (rfcs/do-expressions.md): `give exp`, which exits the innermost `do` expression with exp as
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `give exp`, which exits the innermost `do` expression with exp as
 // its value.
 class AstStatGive : public AstStat
 {
@@ -1091,9 +1102,12 @@ public:
     void visit(AstVisitor* visitor) override;
 
     AstExpr* value;
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): `give [key] = value` in a comprehension's `do` item, which
+    // writes `key` like a `[key] = value` item instead of giving a value. Null for a plain `give`; `value` is the item's.
+    class AstStatComprehensionItem* item = nullptr;
 };
 
-// Luwu Table Comprehensions (rfcs/table-comprehensions.md): a comprehension's item, `value`, `[key] = value` or an
+// Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): a comprehension's item, `value`, `[key] = value` or an
 // accumulating `[key] op= value`, run once per iteration of the innermost clause. A nil value adds nothing.
 class AstStatComprehensionItem : public AstStat
 {
@@ -1112,6 +1126,14 @@ public:
     std::optional<AstExprBinary::Op> accumulate;
     // False when the item is a `do` block written in place of `give do`; `value` is then that AstExprDo.
     bool hasGive = true;
+    // A `do` item whose `give`s write keys (`give [k] = v`): those gives' items, which make this a map comprehension.
+    // `key` is then null and `value` is the AstExprDo, run only for what its gives write.
+    AstArray<AstStatComprehensionItem*> givenItems{nullptr, 0};
+
+    bool isMap() const
+    {
+        return key || givenItems.size != 0;
+    }
 };
 
 class AstStatContinue : public AstStat
@@ -1165,17 +1187,23 @@ struct AstDestructurePattern
     bool closed = true;
     // `.(a, b)`: the fields are elements read by position, in order, and have no keys.
     bool positional = false;
+    // `.[a, b]`: the fields are elements read by index, `value[1]` on, and have no keys.
+    bool array = false;
     AstArray<AstDestructureField> fields{nullptr, 0};
 };
 
 struct AstDestructureField
 {
-    // Empty for an element of a positional pattern, whose `keyLocation` is where the element starts.
+    // Empty for an element of a positional or array pattern, whose `keyLocation` is where the element starts, and for a
+    // key that isn't a name.
     AstName key;
     Location keyLocation;
     // The `as` keyword, when the field is bound under another name or only destructured.
     std::optional<Location> asLocation;
     AstDestructurePattern target;
+    // `[key] as name` reads `value[key]`, and `5 as name` reads position 5 (keyIsPosition)
+    AstExpr* keyExpr = nullptr;
+    bool keyIsPosition = false;
 };
 
 class AstStatLocal : public AstStat
@@ -1255,7 +1283,7 @@ public:
     // Location of the leading 'for' keyword token only.
     Location forLocation;
 
-    // Luwu If Local (rfcs/if-local.md): the `if` holding the loop's `when` chain (`for i = 1, n when i % 2 == 0 do`),
+    // Luwu If Local (rfcs/control-flow/if-local.md): the `if` holding the loop's `when` chain (`for i = 1, n when i % 2 == 0 do`),
     // or null. It is then the only statement of `body`, and the loop's block as written is its `thenbody`: a
     // failing chain skips the iteration. Table comprehensions store their `when`s the same way.
     AstStatIf* whenGuard = nullptr;
@@ -1293,7 +1321,7 @@ public:
     // Location of the leading 'for' keyword token only.
     Location forLocation;
 
-    // Luwu If Local (rfcs/if-local.md): see AstStatFor::whenGuard. With destructured bindings, `body` starts with
+    // Luwu If Local (rfcs/control-flow/if-local.md): see AstStatFor::whenGuard. With destructured bindings, `body` starts with
     // their fields and the guard follows them.
     AstStatIf* whenGuard = nullptr;
 
@@ -1994,7 +2022,7 @@ public:
     AstArray<AstType*> types;
 };
 
-// Luwu Do Expressions (rfcs/do-expressions.md): `do block`, an expression that runs a block and evaluates to
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `do block`, an expression that runs a block and evaluates to
 // what its `give` gives. The block ends in a `give`, `return`, `break` or `continue` (see Parser::parseDoExpr);
 // a `give` in a nested block exits early. There is no closing `end`.
 class AstExprDo : public AstExpr
@@ -2008,43 +2036,126 @@ public:
 
     AstStatBlock* body;
 
-    // Written as `x or return v` or `x or break` rather than with `do`: the body is that one statement
-    // (see Parser::parseOrLeave).
+    // Written as `x or return v`, `x or break` or `x or give v` rather than with `do`: the body is that one statement
+    // (see Parser::parseOrLeave). It has no value of its own: a `give` in it gives from the enclosing `do` expression.
     bool shorthand = false;
 
-    // Luwu match expressions: parsed from a `match` expression (see Parser::parseMatchExpr). The body is the subject's
-    // `local` and a `give` of an if-else expression with one arm per `case`, none of them written as statements.
-    bool fromMatch = false;
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): made by `x is A | B` to read a value that isn't a
+    // local once (see Parser::makePatternTest). The body is that value's hidden `local` and a `give` of the test.
+    bool fromTypeTest = false;
 
     // Does every path leave it with `return`, `break` or `continue`, so it never has a value? True for the shorthand,
     // and for a `do` expression with no `give` of its own.
     bool alwaysLeaves() const;
+
+    // The `give`s that give this expression's value, the shorthand's included: not those of a nested `do` expression
+    // or function
+    std::vector<class AstStatGive*> gives() const;
 };
 
-// Luwu Do Expressions (rfcs/do-expressions.md): `expr` without the parentheses around it.
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the value a `match` tests, from its header
+struct AstMatchSubject
+{
+    // The value as written after `match` (or after `=` in `match const name = value`)
+    AstExpr* value = nullptr;
+    // The local each arm tests: the header's name, a hidden local holding the value, or the value itself when it's a
+    // local and the header doesn't name it (so each arm narrows that local)
+    AstLocal* local = nullptr;
+    // The declaration of `local` that runs before the arms, or null when `value` is a local tested as itself
+    AstStatLocal* declaration = nullptr;
+};
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): one arm of a `match`
+struct AstMatchArm
+{
+    enum Kind
+    {
+        // `case [name] [is pattern] [when ...] then`
+        Case,
+        // `when condition [when ...] then`, an arm with no pattern
+        When,
+        // `else`
+        Else,
+    };
+
+    Kind kind = Case;
+    // The `case`, `when` or `else` that opens the arm
+    Location keywordLocation;
+    // The arm's test of the subject followed by its `when` chain, in AstStatIf's convention: `condition` is the first
+    // clause's expression and `clauses` is the whole chain when it has more than one clause. Null for `else`.
+    AstExpr* condition = nullptr;
+    AstArray<AstIfClause> clauses{nullptr, 0};
+    std::optional<Location> thenLocation;
+    // `case name` with no pattern and no `when`, which matches every value like `else`
+    bool catchAll = false;
+    // The arm's value in an AstExprMatch, null in an AstStatMatch
+    AstExpr* value = nullptr;
+    // The arm's block in an AstStatMatch, null in an AstExprMatch
+    AstStatBlock* body = nullptr;
+
+    // Visits the condition (see AstExprIfElse::visitCondition); nothing for `else`
+    void visitCondition(AstVisitor* visitor) const;
+};
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): does the last of `arms` match every value? It does when it's
+// an `else`, or a `case name` with no `when`.
+bool matchesEveryValue(const AstArray<AstMatchArm>& arms);
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `match subject case ... then value ... else value`. The
+// arms are tested in order and the first that matches gives the value. The last arm is an `else` or a catch-all.
+class AstExprMatch : public AstExpr
+{
+public:
+    LUAU_RTTI(AstExprMatch)
+
+    AstExprMatch(const Location& location, const AstMatchSubject& subject, const AstArray<AstMatchArm>& arms);
+
+    void visit(AstVisitor* visitor) override;
+
+    AstMatchSubject subject;
+    AstArray<AstMatchArm> arms;
+};
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `match subject case ... then block ... end`. The first arm
+// that matches runs its block; with no `else`, a subject no arm matches runs nothing.
+class AstStatMatch : public AstStat
+{
+public:
+    LUAU_RTTI(AstStatMatch)
+
+    AstStatMatch(const Location& location, const AstMatchSubject& subject, const AstArray<AstMatchArm>& arms, bool hasEnd);
+
+    void visit(AstVisitor* visitor) override;
+
+    AstMatchSubject subject;
+    AstArray<AstMatchArm> arms;
+    bool hasEnd;
+};
+
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `expr` without the parentheses around it.
 AstExpr* withoutGroups(AstExpr* expr);
 
-// Luwu Do Expressions (rfcs/do-expressions.md): `operand` (parenthesized or not) as a `do` expression that always leaves
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `operand` (parenthesized or not) as a `do` expression that always leaves
 // (AstExprDo::alwaysLeaves), or null.
 AstExprDo* asLeave(AstExpr* operand);
 
-// Luwu Do Expressions (rfcs/do-expressions.md): `expr` as `x or <leave>` or `x and <leave>` (asLeave), or null. As a
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `expr` as `x or <leave>` or `x and <leave>` (asLeave), or null. As a
 // whole statement, or as a declaration's or assignment's value, `x or <leave>` only completes when `x` is truthy, and
 // `x and <leave>` when it's falsy.
 class AstExprBinary* asLeaveGuard(AstExpr* expr);
 
-// Luwu Do Expressions (rfcs/do-expressions.md): `expr` as `x or <leave>` (asLeaveGuard), or null.
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `expr` as `x or <leave>` (asLeaveGuard), or null.
 class AstExprBinary* asOrLeave(AstExpr* expr);
 
-// Luwu Do Expressions (rfcs/do-expressions.md): the `x and <leave>` in `x and <leave> or <leave>`, or null. Such an `expr`
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the `x and <leave>` in `x and <leave> or <leave>`, or null. Such an `expr`
 // never completes: its left side is never truthy, so the right side always runs.
 class AstExprBinary* asLeaveEitherWay(AstExpr* expr);
 
-// Luwu Do Expressions (rfcs/do-expressions.md): can `expr` be a statement? It can when it is a leave guard
+// Luwu Do Expressions (rfcs/control-flow/do-expressions.md): can `expr` be a statement? It can when it is a leave guard
 // (asLeaveGuard), or an `or` or `and` whose right operand can be one: `x or y and continue`.
 bool isLeaveStatement(AstExpr* expr);
 
-// Luwu Table Comprehensions (rfcs/table-comprehensions.md): `{ for ... in ... when ... give item }`, a table built by
+// Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): `{ for ... in ... when ... give item }`, a table built by
 // a loop. It is stored as the loop it runs: `loop` is an ordinary AstStatFor or AstStatForIn, so every pass that
 // handles loops and if-local chains handles a comprehension through that code. A clause's `when` chain is the
 // loop's `whenGuard` (an ordinary condition for a single plain `when`, the chain's `clauses` otherwise), the last
@@ -2322,6 +2433,10 @@ public:
     {
         return visit(static_cast<AstExpr*>(node));
     }
+    virtual bool visit(class AstExprMatch* node)
+    {
+        return visit(static_cast<AstExpr*>(node));
+    }
     virtual bool visit(class AstExprInterpString* node)
     {
         return visit(static_cast<AstExpr*>(node));
@@ -2353,6 +2468,10 @@ public:
         return visit(static_cast<AstStat*>(node));
     }
     virtual bool visit(class AstStatIf* node)
+    {
+        return visit(static_cast<AstStat*>(node));
+    }
+    virtual bool visit(class AstStatMatch* node)
     {
         return visit(static_cast<AstStat*>(node));
     }

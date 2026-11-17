@@ -838,7 +838,14 @@ void* lua_pushcclosurewithdatak(lua_State* L, lua_CFunction fn, const char* debu
     return (void*)cl->fatc.data;
 }
 
-void* lua_pushdatacfunctionk(lua_State* L, lua_DataCFunction fn, const char* debugname, lua_Continuation cont, size_t size, lua_ClosureWithDataFree dtor)
+void* lua_pushdatacfunctionk(
+    lua_State* L,
+    lua_DataCFunction fn,
+    const char* debugname,
+    lua_Continuation cont,
+    size_t size,
+    lua_ClosureWithDataFree dtor
+)
 {
     api_check(L, fn != nullptr);
     void* data = lua_pushcclosurewithdatak(L, luaF_calldatacfunction, debugname, cont, size, dtor);
@@ -1757,21 +1764,15 @@ int lua_istrait(lua_State* L, int idx)
 void lua_packbundle(lua_State* L, int n)
 {
     api_checknelems(L, n);
-    if (n > LUWU_BUNDLE_MAX)
-        luaG_runerror(L, "a bundle holds at most %d values, but got %d", LUWU_BUNDLE_MAX, n);
-
-    LuauClass* classdef = L->global->builtinclasses[LUWU_BUILTIN_BUNDLE0 + n];
-    if (!classdef)
-        luaG_runerror(L, "open the bundle library (luaopen_bundle) before building a bundle");
-
     luaC_checkGC(L);
     luaC_threadbarrier(L);
 
     // A new object is white, so storing into it needs no barrier
-    LuauObject* bundle = luaR_newobjectuninit(L, classdef);
+    LuauObject* bundle = luaR_newbundleuninit(L, n, "lua_packbundle");
     TValue* members = luaR_members(bundle);
     for (int i = 0; i < n; i++)
         setobj(L, &members[i], L->top - n + i);
+    luaR_sealbundle(bundle);
 
     L->top -= n;
     setobjectvalue(L, L->top, bundle);
@@ -1781,7 +1782,7 @@ void lua_packbundle(lua_State* L, int n)
 int lua_unpackbundle(lua_State* L, int idx)
 {
     const TValue* value = index2addr(L, idx);
-    int size = luaR_bundlesize(L, value);
+    int size = luaR_bundlesize(value);
     if (size < 0)
         return -1;
 

@@ -45,7 +45,7 @@ struct DataFlowGraph
     DefId getDef(const AstStatDeclareFunction* func) const;
 
     const RefinementKey* getRefinementKey(const AstExpr* expr) const;
-    // Luwu If Local (rfcs/if-local.md): the key that refines a `when` chain's binding to truthy in the clauses after
+    // Luwu If Local (rfcs/control-flow/if-local.md): the key that refines a `when` chain's binding to truthy in the clauses after
     // it and in its branch. Null for any other local.
     const RefinementKey* getRefinementKey(const AstLocal* local) const;
 
@@ -149,7 +149,7 @@ private:
 
     DfgScope* makeChildScope(DfgScope::ScopeType scopeType = DfgScope::Linear);
 
-    // Luwu Do Expressions (rfcs/do-expressions.md): the `do` expressions being visited, innermost last. `outer` is the
+    // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the `do` expressions being visited, innermost last. `outer` is the
     // scope around the expression; `joined` merges what each `give` so far saw, relative to `outer`.
     struct GiveExit
     {
@@ -170,6 +170,12 @@ private:
 
     ControlFlow visit(AstStat* s);
     ControlFlow visit(AstStatIf* i);
+    ControlFlow joinBranches(DfgScope* thenScope, DfgScope* elseScope, ControlFlow thencf, ControlFlow elsecf);
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
+    ControlFlow visit(AstStatMatch* m);
+    void visitMatchSubject(const AstMatchSubject& subject);
+    ControlFlow visitMatchArmBlocks(const AstArray<AstMatchArm>& arms, size_t index);
+    void visitMatchArmValues(const AstArray<AstMatchArm>& arms, size_t index);
     ControlFlow visit(AstStatWhile* w);
     ControlFlow visit(AstStatRepeat* r);
     ControlFlow visit(AstStatBreak* b);
@@ -215,6 +221,7 @@ private:
     DataFlowResult visitExpr(AstExprTypeAssertion* t);
     DataFlowResult visitExpr(AstExprIfElse* i);
     DataFlowResult visitExpr(AstExprDo* d);
+    DataFlowResult visitExpr(AstExprMatch* m);
     DataFlowResult visitExpr(AstExprTableComprehension* c);
     DataFlowResult visitExpr(AstExprInterpString* i);
     DataFlowResult visitExpr(AstExprInstantiate* i);
@@ -225,6 +232,7 @@ private:
     DefId visitLValue(AstExprLocal* l, DefId incomingDef);
     DefId visitLValue(AstExprGlobal* g, DefId incomingDef);
     DefId visitLValue(AstExprIndexName* i, DefId incomingDef);
+    void forgetPositions(DefId parentDef, const Location& location);
     DefId visitLValue(AstExprIndexExpr* i, DefId incomingDef);
     DefId visitLValue(AstExprError* e, DefId incomingDef);
 

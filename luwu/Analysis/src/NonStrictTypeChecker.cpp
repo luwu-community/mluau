@@ -272,6 +272,8 @@ struct NonStrictTypeChecker
             return visit(s);
         else if (auto s = stat->as<AstStatIf>())
             return visit(s);
+        else if (auto s = stat->as<AstStatMatch>())
+            return visitMatch(s->subject, s->arms);
         else if (auto s = stat->as<AstStatWhile>())
             return visit(s);
         else if (auto s = stat->as<AstStatRepeat>())
@@ -362,7 +364,7 @@ struct NonStrictTypeChecker
         return ctx;
     }
 
-    // Luwu If Local (rfcs/if-local.md): only a `when` chain's first clause always runs, so only its context is kept.
+    // Luwu If Local (rfcs/control-flow/if-local.md): only a `when` chain's first clause always runs, so only its context is kept.
     // The clauses after it are still checked.
     NonStrictContext visitIfCondition(AstExpr* condition, const AstArray<AstIfClause>& clauses)
     {
@@ -628,6 +630,8 @@ struct NonStrictTypeChecker
             return visit(e->classOf);
         else if (auto e = expr->as<AstExprDo>())
             return visit(e);
+        else if (auto e = expr->as<AstExprMatch>())
+            return visitMatch(e->subject, e->arms);
         else if (auto e = expr->as<AstExprTableComprehension>())
             return visit(e);
         else if (auto e = expr->as<AstExprPop>())
@@ -916,7 +920,29 @@ struct NonStrictTypeChecker
         return visit(typeAssertion->expr, ValueContext::RValue);
     }
 
-    // Luwu Do Expressions (rfcs/do-expressions.md): the block is checked, but since a `give` can leave it early, none of
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): every part is checked, but any arm may be the one
+    // that runs, so none of their context carries out of the `match`
+    NonStrictContext visitMatch(const AstMatchSubject& subject, const AstArray<AstMatchArm>& arms)
+    {
+        if (subject.declaration)
+            visit(subject.declaration);
+        else
+            visit(subject.value, ValueContext::RValue);
+
+        for (const AstMatchArm& arm : arms)
+        {
+            if (arm.condition)
+                visitIfCondition(arm.condition, arm.clauses);
+            if (arm.value)
+                visit(arm.value, ValueContext::RValue);
+            if (arm.body)
+                visit(arm.body);
+        }
+
+        return {};
+    }
+
+    // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the block is checked, but since a `give` can leave it early, none of
     // its context carries out of the expression
     NonStrictContext visit(AstExprDo* doExpr)
     {
@@ -926,11 +952,14 @@ struct NonStrictTypeChecker
 
     NonStrictContext visit(AstStatGive* give)
     {
+        if (give->item)
+            return visit(give->item);
+
         visit(give->value, ValueContext::RValue);
         return {};
     }
 
-    // Luwu Table Comprehensions (rfcs/table-comprehensions.md): the loop may run zero times, so like any loop's, its
+    // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): the loop may run zero times, so like any loop's, its
     // context doesn't carry out
     NonStrictContext visit(AstExprTableComprehension* comprehension)
     {
