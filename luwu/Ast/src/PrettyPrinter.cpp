@@ -1007,6 +1007,23 @@ struct Printer
                 visualize(*arm.value);
             }
         }
+        else if (const auto& a = expr.as<AstExprMatchPattern>())
+        {
+            if (a->value)
+                visualize(*a->value);
+
+            advance(a->keywordLocation.begin);
+            writer.keyword(a->implements ? "implements" : "is");
+            if (a->negated)
+                writer.keyword("not");
+
+            for (size_t i = 0; i < a->alternatives.size; ++i)
+            {
+                if (i != 0)
+                    writer.symbol("|");
+                visualizePatternAlternative(a->alternatives.data[i]);
+            }
+        }
         else if (const auto& a = expr.as<AstExprDo>())
         {
             // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): the shorthand (`x or return v`) is just its statement
@@ -1291,6 +1308,11 @@ struct Printer
                 visualizeMatchArmHead(arm);
                 visualizeBlock(*arm.body);
             }
+            if (a->armsEndLocation)
+            {
+                advance(a->armsEndLocation->begin);
+                writer.keyword("end");
+            }
             if (a->hasEnd)
             {
                 advanceBefore(a->location.end, 3);
@@ -1377,7 +1399,7 @@ struct Printer
                 if (a->keywordLocation.has_value())
                 {
                     advance(a->keywordLocation->begin);
-                    writer.keyword(a->isConst ? "const" : "local");
+                    writer.keyword(a->isConst && !a->exportWrittenAsLocal ? "const" : "local");
                 }
             }
             else if (a->isConst)
@@ -2269,8 +2291,18 @@ struct Printer
         visualize(*subject.value);
     }
 
-    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): an arm up to its value or block. A `case` arm's pattern
-    // is stored as the test it means, so every arm with a condition prints as a `when` chain, which tests the same thing.
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): one alternative of a pattern, as written
+    void visualizePatternAlternative(const AstPatternAlternative& alternative)
+    {
+        advance(alternative.location.begin);
+        if (alternative.kind == AstPatternAlternative::Tag)
+            writer.identifier(alternative.tag.value);
+        else if (alternative.operand)
+            visualize(*alternative.operand);
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): an arm up to its value or block, as written:
+    // `case [name] [pattern] [when ...] then`, `when ... then` or `else`
     void visualizeMatchArmHead(const AstMatchArm& arm)
     {
         advance(arm.keywordLocation.begin);
@@ -2280,24 +2312,22 @@ struct Printer
             return;
         }
 
-        writer.keyword("when");
+        if (arm.kind == AstMatchArm::Case)
+        {
+            writer.keyword("case");
+            if (arm.binding)
+                writer.identifier(arm.binding->name.value);
+        }
+
         if (arm.clauses.size == 0)
         {
+            if (arm.kind == AstMatchArm::When)
+                writer.keyword("when");
             visualize(*arm.condition);
         }
         else
         {
-            for (size_t i = 0; i < arm.clauses.size; ++i)
-            {
-                const AstIfClause& clause = arm.clauses.data[i];
-                if (i != 0)
-                    writer.keyword("when");
-
-                if (clause.declaration)
-                    visualize(static_cast<AstStat&>(*clause.declaration));
-                else
-                    visualize(*clause.expr);
-            }
+            visualizeIfCondition(*arm.condition, arm.clauses);
         }
 
         writer.keyword("then");
@@ -2315,6 +2345,10 @@ struct Printer
 
         for (const AstIfClause& clause : clauses)
         {
+            // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): what a pattern made isn't written
+            if (clause.fromPattern)
+                continue;
+
             if (clause.declaration && clause.declaration->destructuredFrom)
                 continue;
 

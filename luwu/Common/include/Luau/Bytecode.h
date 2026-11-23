@@ -79,6 +79,7 @@
 //   Luwu try expressions: WRAPRESULT, RESULTGET, and each function's protected ranges after its inlining cost: a varint count,
 //   then per range the varints start pc, end pc (exclusive) and handler pc, and a byte for the target register.
 //   Luwu bundles: LBF_BUNDLE_PACK and LBF_BUNDLE_UNPACK.
+//   Luwu string.format fastcall: LBF_STRING_FORMAT, including after the format string of an interpolated string.
 
 // # Bytecode type information history
 // Version 1: (from bytecode version 4) Type information for function signature. Currently supported.
@@ -525,7 +526,7 @@ enum LuauOpcode
     // Emitted for a call whose callee is a class declared in this module and certainly assigned at that
     // point, in place of the `__call` metamethod dispatch and C constructor frame a generic CALL would go
     // through. Operands the VM asserts rather than checks: B holds a class, C agrees with that class
-    // (below), and the class has no `__defaults` closure unless C is LBC_NEWOBJECT_INIT.
+    // (below), and the class has no `__defaults` closure unless C is LBC_NEWOBJECT_INIT or LBC_NEWOBJECT_ALLOC.
     // A: destination register, which holds the instance afterwards
     // B: register holding the class
     // C: how the instance is initialized, and what AUX counts:
@@ -545,7 +546,11 @@ enum LuauOpcode
     //       defaults and nothing else. The site finishes it with INITTRAITS (unless no trait has anything to
     //       initialize) and then SETOBJECTMEMBER stores of the class's own fields. The FIELDS form can't do this,
     //       since it takes the class's values before the instance exists. Only for a class with no `__init` other
-    //       than a primary constructor's. AUX is 0.
+    //       than a primary constructor's. AUX is 0. A class without `__init` whose field defaults aren't all constant
+    //       is also allocated this way, and the site stores the defaults itself.
+    //   LBC_NEWOBJECT_APPLY - finishes a POD instance (no `__init`) the ALLOC form started, once the site has stored
+    //       its trait fields and defaults: A holds the instance and B its class. AUX is the argument count (0 or 1),
+    //       and the table of field values, if AUX is 1, is in A + 1. Applying it can run `__index`.
     LOP_NEWOBJECT,
 
     // GETOBJECTMEMBER: read an instance member at a known offset, for a receiver whose class the
@@ -578,13 +583,15 @@ enum LuauOpcode
 
     // INITTRAITS: Luwu Traits (rfcs/classes/traits.md): starts initializing the fields an object gets from its class's
     // traits, which construction does after allocating the object and before the class's own fields. Emitted at the
-    // top of a class's `__init`, in a class's synthesized `__implements`, and after NEWOBJECT's ALLOC form, always
-    // followed by `CALL A`, which it jumps over when no trait has a field to compute. Otherwise it puts the trait
-    // initializer runner (luaR_newtraitinitrunner) in A, and the CALL runs the class's copy of each trait's
-    // `__traitinit` in dependency order, each with its own `implements` entry's arguments. The initializers may yield.
-    // A: register for the runner; A + 1 holds the object, and A + 2 onwards the `implements` arguments (every entry's,
-    //    in list order, one value each)
-    // D: jump offset (-32768..32767) past the CALL, taken when the class has no trait initializers
+    // top of a class's `__init`, in a class's synthesized `__implements`, and after NEWOBJECT's ALLOC form, as a loop:
+    // `INITTRAITS A; CALL F, N + 2, 1; JUMPBACK` to the INITTRAITS. Each run lays out the CALL's frame for the class's
+    // copy of the next trait's `__traitinit`, in dependency order: the function in F, the object in F + 1, and that
+    // trait's `implements` arguments from F + 2, padded with nil to N values. Once every initializer has run, it puts
+    // back the overridden constant fields (LuauClass::overriddenconsts) and jumps past the loop. The initializers are
+    // ordinary calls, so they may yield.
+    // A: how many initializers have run, 0 at first; A + 1 holds the object, and A + 2 onwards the N `implements`
+    //    arguments (every entry's, in list order, one value each)
+    // D: jump offset (-32768..32767) past the loop, taken once every initializer has run
     LOP_INITTRAITS,
 
     // PRESIZETABLE: Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): sizes the table a comprehension builds from
@@ -614,6 +621,20 @@ enum LuauOpcode
     // C: register holding the element count so far
     LOP_APPENDTABLE,
 
+    // WRAPRESULT: Luwu try expressions: wraps a value in an `Ok` or an `Err`. A `try` expression ends with the `Ok` form,
+    // and its protected range's handler starts with the `Err` form: when the VM resumes there, it has put the caught
+    // error in A and where it was raised in A + 1 to A + 3 (module, line, traceback).
+    // A: register holding the value, and receiving the result
+    // B: LBC_WRAPRESULT_OK or LBC_WRAPRESULT_ERR
+    LOP_WRAPRESULT,
+
+    // RESULTGET: Luwu try expressions: `r:ok()` or `r:err()` of a `try` result the compiler keeps in registers instead of
+    // an object: its value or error at B, and at B + LBC_TRYRESULT_OKFLAG whether it's an `ok`
+    // A: target register
+    // B: the result's first register
+    // C: LBC_RESULTGET_OK (the value of an ok, else none) or LBC_RESULTGET_ERR (the error of an err, else none)
+    LOP_RESULTGET,
+
     // GETQUALIFIED: Luwu Traits (rfcs/classes/traits.md): reads the class's version of a trait's member, for
     // `obj:Trait:name(...)` and `Class:Trait.name`: the class's qualified implementation, its copy of a scoped default, or
     // else the class's member of that name (luaR_getqualified). Raises when B's class doesn't implement the trait.
@@ -632,6 +653,25 @@ enum LuauOpcode
     // C: position - 1 (0..255)
     LOP_GETPOSITIONAL,
 
+    // JUMPXTYPE: Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): jumps when R(A)'s type is the one `type()`
+    // names in AUX, as `x is string` checks, without calling `type()`
+    // A: value register
+    // D: jump offset (-32768..32767)
+    // AUX: the type as an LBC_TYPE_* in bits 0..7: BOOLEAN, NUMBER, INTEGER, STRING, TABLE, FUNCTION, THREAD, USERDATA
+    //   (light userdata included, as `type()` says "userdata" for both), VECTOR, BUFFER, OBJECT or SYMNONE (`x is none`,
+    //   since `none` is a primitive value whatever the global holds). Bit 31 is the NOT flag
+    //   (LUAU_INSN_AUX_NOT): when set, the jump is taken when the type differs.
+    LOP_JUMPXTYPE,
+
+    // JUMPXMATCH: Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): jumps when R(A) matches a name in a
+    // pattern (`x is Foo`) the compiler can't resolve. When the name holds a class, R(A) matches an instance of it as
+    // JUMPXISA tests. Otherwise R(A) matches a value equal to it as JUMPIFEQ compares.
+    // A: value register
+    // D: jump offset (-32768..32767)
+    // AUX: the register holding the name's value in bits 0..7. Bit 31 is the NOT flag (LUAU_INSN_AUX_NOT): when set,
+    //   the jump is taken when R(A) doesn't match.
+    LOP_JUMPXMATCH,
+
     // PUSH: Luwu Push and Pop Operators (rfcs/push-pop-operators.md): `A <+ values`. Calls A's `__push` once with every
     // non-nil value when it has one; otherwise A must be a table, and each non-nil value is stored raw at its length + 1,
     // like table.insert.
@@ -647,19 +687,19 @@ enum LuauOpcode
     // B: register holding the container
     LOP_POP,
 
-    // WRAPRESULT: Luwu try expressions: wraps a value in an `Ok` or an `Err`. A `try` expression ends with the `Ok` form,
-    // and its protected range's handler starts with the `Err` form: when the VM resumes there, it has put the caught
-    // error in A and where it was raised in A + 1 to A + 3 (module, line, traceback).
-    // A: register holding the value, and receiving the result
-    // B: LBC_WRAPRESULT_OK or LBC_WRAPRESULT_ERR
-    LOP_WRAPRESULT,
-
-    // RESULTGET: Luwu try expressions: `r:ok()` or `r:err()` of a `try` result the compiler keeps in registers instead of
-    // an object: its value or error at B, and at B + LBC_TRYRESULT_OKFLAG whether it's an `ok`
+    // GETTABLEBUNDLE: Luwu bundles: `t[.(a, b)]` without building the bundle. A table answers from its hash part, and
+    // only a miss in a table with `__index`, or a value that isn't a table, gets a new bundle and an ordinary lookup.
     // A: target register
-    // B: the result's first register
-    // C: LBC_RESULTGET_OK (the value of an ok, else none) or LBC_RESULTGET_ERR (the error of an err, else none)
-    LOP_RESULTGET,
+    // B: register holding the table
+    // C: first of AUX registers holding the bundle's values
+    // AUX: how many values (1 to the largest fixed-size bundle)
+    LOP_GETTABLEBUNDLE,
+
+    // SETTABLEBUNDLE: Luwu bundles: `t[.(a, b)] = v`, building the bundle only to insert a new key or for a table that
+    // isn't plain
+    // A: source register
+    // B, C and AUX: as in GETTABLEBUNDLE
+    LOP_SETTABLEBUNDLE,
 
     // Enum entry for number of opcodes, not a valid opcode by itself!
     LOP__COUNT
@@ -727,6 +767,7 @@ enum LuauResultGetForm
 #define LBC_NEWOBJECT_INIT 1
 #define LBC_NEWOBJECT_FIELDS 2
 #define LBC_NEWOBJECT_ALLOC 3
+#define LBC_NEWOBJECT_APPLY 4
 
 // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): operand C of LOP_PRESIZETABLE (see LOP_PRESIZETABLE)
 #define LBC_PRESIZE_ITER_ARRAY 0
@@ -847,6 +888,9 @@ enum LuwuBytecodeTag
 // Luwu Traits (rfcs/classes/traits.md): operand B of LOP_NEWCLASSMEMBER for a class's qualified implementation of a trait's
 // function, `function Json.name`: C holds the function, C+1 the trait, and AUX names the function as a constant string
 #define LBC_NEWCLASSMEMBER_QUALIFIED 3
+// Luwu Classes (rfcs/classes): operand B of LOP_NEWCLASSMEMBER for the class's constructor, the function a call on the
+// class runs (LuauClass::constructor). C holds the function; AUX is unused.
+#define LBC_NEWCLASSMEMBER_CONSTRUCTOR 4
 
 // Luwu Traits (rfcs/classes/traits.md): bits of the shape flags varint of LBC_CONSTANT_CLASS_SHAPE, written after the member
 // counts.
@@ -1111,6 +1155,9 @@ enum LuauBuiltinFunction
     // Luwu bundles: `bundle.pack` and `bundle.unpack` without a call frame
     LBF_BUNDLE_PACK,
     LBF_BUNDLE_UNPACK,
+
+    // Luwu: string.format(format, ...) -> string, which interpolated strings compile to
+    LBF_STRING_FORMAT,
 };
 
 // Capture type, used in LOP_CAPTURE

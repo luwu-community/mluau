@@ -119,6 +119,55 @@ AstAttr::DeprecatedInfo AstAttr::deprecatedInfo() const
     return info;
 }
 
+std::string toString(AstAttr::Type type)
+{
+    switch (type)
+    {
+    case AstAttr::Type::Checked:
+        return "checked";
+    case AstAttr::Type::Native:
+        return "native";
+    case AstAttr::Type::Deprecated:
+        return "deprecated";
+    case AstAttr::Type::Noinline:
+        return "noinline";
+    case AstAttr::Type::Truthy:
+        return "truthy";
+    case AstAttr::Type::Nolint:
+        return "nolint";
+    case AstAttr::Type::Lint:
+        return "lint";
+    case AstAttr::Type::Nodiscard:
+        return "nodiscard";
+    default:
+        return "unknown";
+    }
+}
+
+template<>
+std::optional<AstAttr::Type> fromString<AstAttr::Type>(std::string_view s)
+{
+    if (s == "checked")
+        return AstAttr::Type::Checked;
+    if (s == "native")
+        return AstAttr::Type::Native;
+    if (s == "deprecated")
+        return AstAttr::Type::Deprecated;
+    if (s == "noinline")
+        return AstAttr::Type::Noinline;
+    if (s == "truthy")
+        return AstAttr::Type::Truthy;
+    if (s == "nolint")
+        return AstAttr::Type::Nolint;
+    if (s == "lint")
+        return AstAttr::Type::Lint;
+    if (s == "nodiscard")
+        return AstAttr::Type::Nodiscard;
+    if (s == "unknown")
+        return AstAttr::Type::Unknown;
+    return std::nullopt;
+}
+
 int gAstRttiIndex = 0;
 
 AstGenericType::AstGenericType(const Location& location, AstName name, AstType* defaultValue)
@@ -225,6 +274,37 @@ void AstExprConstantString::visit(AstVisitor* visitor)
 bool AstExprConstantString::isQuoted() const
 {
     return quoteStyle == QuoteStyle::QuotedSimple || quoteStyle == QuoteStyle::QuotedRaw;
+}
+
+std::string toString(AstExprConstantString::QuoteStyle style)
+{
+    switch (style)
+    {
+    case AstExprConstantString::QuoteStyle::QuotedSimple:
+        return "simple";
+    case AstExprConstantString::QuoteStyle::QuotedSingle:
+        return "single";
+    case AstExprConstantString::QuoteStyle::QuotedRaw:
+        return "raw";
+    case AstExprConstantString::QuoteStyle::Unquoted:
+        return "unquoted";
+    default:
+        return "simple";
+    }
+}
+
+template<>
+std::optional<AstExprConstantString::QuoteStyle> fromString<AstExprConstantString::QuoteStyle>(std::string_view s)
+{
+    if (s == "simple")
+        return AstExprConstantString::QuoteStyle::QuotedSimple;
+    if (s == "single")
+        return AstExprConstantString::QuoteStyle::QuotedSingle;
+    if (s == "raw")
+        return AstExprConstantString::QuoteStyle::QuotedRaw;
+    if (s == "unquoted")
+        return AstExprConstantString::QuoteStyle::Unquoted;
+    return std::nullopt;
 }
 
 AstExprLocal::AstExprLocal(const Location& location, AstLocal* local, bool upvalue)
@@ -465,6 +545,33 @@ std::optional<AstExpr*> AstExprTable::getRecord(const char* key) const
     return {};
 }
 
+std::string toString(AstExprTable::Item::Kind kind)
+{
+    switch (kind)
+    {
+    case AstExprTable::Item::Kind::List:
+        return "list";
+    case AstExprTable::Item::Kind::Record:
+        return "record";
+    case AstExprTable::Item::Kind::General:
+        return "general";
+    default:
+        return "list";
+    }
+}
+
+template<>
+std::optional<AstExprTable::Item::Kind> fromString<AstExprTable::Item::Kind>(std::string_view s)
+{
+    if (s == "list")
+        return AstExprTable::Item::Kind::List;
+    if (s == "record")
+        return AstExprTable::Item::Kind::Record;
+    if (s == "general")
+        return AstExprTable::Item::Kind::General;
+    return std::nullopt;
+}
+
 AstExprUnary::AstExprUnary(const Location& location, Op op, AstExpr* expr)
     : AstExpr(ClassIndex(), location)
     , op(op)
@@ -492,6 +599,18 @@ std::string toString(AstExprUnary::Op op)
         LUAU_ASSERT(false);
         return ""; // MSVC requires this even though the switch/case is exhaustive
     }
+}
+
+template<>
+std::optional<AstExprUnary::Op> fromString<AstExprUnary::Op>(std::string_view s)
+{
+    if (s == "-")
+        return AstExprUnary::Op::Minus;
+    if (s == "not")
+        return AstExprUnary::Op::Not;
+    if (s == "#")
+        return AstExprUnary::Op::Len;
+    return std::nullopt;
 }
 
 AstExprBinary::AstExprBinary(const Location& location, Op op, AstExpr* left, AstExpr* right)
@@ -553,6 +672,44 @@ std::string toString(AstExprBinary::Op op)
     }
 }
 
+template<>
+std::optional<AstExprBinary::Op> fromString<AstExprBinary::Op>(std::string_view s)
+{
+    if (s == "+")
+        return AstExprBinary::Add;
+    if (s == "-")
+        return AstExprBinary::Sub;
+    if (s == "*")
+        return AstExprBinary::Mul;
+    if (s == "/")
+        return AstExprBinary::Div;
+    if (s == "//")
+        return AstExprBinary::FloorDiv;
+    if (s == "%")
+        return AstExprBinary::Mod;
+    if (s == "^")
+        return AstExprBinary::Pow;
+    if (s == "..")
+        return AstExprBinary::Concat;
+    if (s == "~=")
+        return AstExprBinary::CompareNe;
+    if (s == "==")
+        return AstExprBinary::CompareEq;
+    if (s == "<")
+        return AstExprBinary::CompareLt;
+    if (s == "<=")
+        return AstExprBinary::CompareLe;
+    if (s == ">")
+        return AstExprBinary::CompareGt;
+    if (s == ">=")
+        return AstExprBinary::CompareGe;
+    if (s == "and")
+        return AstExprBinary::And;
+    if (s == "or")
+        return AstExprBinary::Or;
+    return std::nullopt;
+}
+
 AstExprTypeAssertion::AstExprTypeAssertion(const Location& location, AstExpr* expr, AstType* annotation)
     : AstExpr(ClassIndex(), location)
     , expr(expr)
@@ -603,6 +760,9 @@ static void visitIfCondition(AstExpr* condition, const AstArray<AstIfClause>& cl
 
     for (const AstIfClause& clause : clauses)
     {
+        if (clause.fromPattern && !visitor->visitsPatternClauses())
+            continue;
+
         if (clause.declaration)
             clause.declaration->visit(visitor);
         else
@@ -637,6 +797,62 @@ void AstExprIfElse::visit(AstVisitor* visitor)
         visitCondition(visitor);
         trueExpr->visit(visitor);
         falseExpr->visit(visitor);
+    }
+}
+
+AstExprMatchPattern::AstExprMatchPattern(
+    const Location& location,
+    AstExpr* value,
+    AstLocal* subject,
+    const Location& keywordLocation,
+    bool negated,
+    bool implements,
+    const AstArray<AstPatternAlternative>& alternatives
+)
+    : AstExpr(ClassIndex(), location)
+    , value(value)
+    , subject(subject)
+    , keywordLocation(keywordLocation)
+    , negated(negated)
+    , implements(implements)
+    , alternatives(alternatives)
+{
+}
+
+// Luwu Destructuring (rfcs/destructuring.md): the expressions and nested patterns in a pattern's fields
+static void visitPatternFields(const AstDestructurePattern& pattern, AstVisitor* visitor)
+{
+    for (const AstDestructureField& field : pattern.fields)
+    {
+        if (field.keyExpr)
+            field.keyExpr->visit(visitor);
+        visitPatternFields(field.target, visitor);
+    }
+
+    if (pattern.test)
+        pattern.test->visit(visitor);
+}
+
+void AstExprMatchPattern::visit(AstVisitor* visitor)
+{
+    if (!visitor->visit(this))
+        return;
+
+    // a pattern nested in a field of several alternatives has no plain-code meaning of its own
+    if (visitor->visitsPatternChecks() && checked)
+    {
+        checked->visit(visitor);
+        return;
+    }
+
+    if (value)
+        value->visit(visitor);
+    for (const AstPatternAlternative& alternative : alternatives)
+    {
+        if (alternative.operand)
+            alternative.operand->visit(visitor);
+        if (alternative.fields)
+            visitPatternFields(*alternative.fields, visitor);
     }
 }
 
@@ -1482,6 +1698,9 @@ void AstStatClass::visit(AstVisitor* visitor)
         for (AstGenericTypePack* genericPack : genericPacks)
             genericPack->visit(visitor);
 
+        if (extendsBase)
+            extendsBase->visit(visitor);
+
         if (primaryConstructor)
         {
             for (AstLocal* arg : primaryConstructor->args)
@@ -2099,6 +2318,33 @@ Location getLocation(const AstTypeList& typeList)
         result.end = typeList.tailType->location.end;
 
     return result;
+}
+
+std::string toString(AstTableAccess access)
+{
+    switch (access)
+    {
+    case AstTableAccess::Read:
+        return "read";
+    case AstTableAccess::Write:
+        return "write";
+    case AstTableAccess::ReadWrite:
+        return "readwrite";
+    default:
+        return "unknown";
+    }
+}
+
+template<>
+std::optional<AstTableAccess> fromString<AstTableAccess>(std::string_view s)
+{
+    if (s == "read")
+        return AstTableAccess::Read;
+    if (s == "write")
+        return AstTableAccess::Write;
+    if (s == "readwrite")
+        return AstTableAccess::ReadWrite;
+    return std::nullopt;
 }
 
 } // namespace Luau

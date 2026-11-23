@@ -70,7 +70,11 @@ static void forEachAttributeList(const std::vector<AstNode*>& ancestry, Visit vi
 
         if (AstExprFunction* fn = node->as<AstExprFunction>())
         {
-            if (visit(fn->attributes, AstAttr::Context::Function))
+            // A global `function f()` is the one function with a body the compiler can't inline
+            AstStatFunction* global = it + 1 != ancestry.rend() ? (*(it + 1))->as<AstStatFunction>() : nullptr;
+            bool inlinable = !global || global->func != fn;
+
+            if (visit(fn->attributes, inlinable ? AstAttr::Context::InlinableFunction : AstAttr::Context::Function))
                 return;
 
             for (AstLocal* arg : fn->args)
@@ -127,7 +131,7 @@ static void forEachAttributeList(const std::vector<AstNode*>& ancestry, Visit vi
                 }
                 else if (const AstClassMethod* method = member.get_if<AstClassMethod>())
                 {
-                    if (method->function && visit(method->function->attributes, AstAttr::Context::Function))
+                    if (method->function && visit(method->function->attributes, AstAttr::Context::InlinableFunction))
                         return;
                 }
             }
@@ -154,11 +158,17 @@ static void forEachAttributeList(const std::vector<AstNode*>& ancestry, Visit vi
     }
 }
 
-// The position the cursor is writing an attribute for, when it sits inside one that is not a known
-// attribute yet.
-static std::optional<AstAttr::Context> findIncompleteAttributeContext(const std::vector<AstNode*>& ancestry, Position position)
+// An attribute the cursor is writing, and the position it's written on
+struct IncompleteAttribute
 {
-    std::optional<AstAttr::Context> result;
+    const AstAttr* attr;
+    AstAttr::Context context;
+};
+
+// The attribute the cursor sits inside, when it isn't a known attribute yet
+static std::optional<IncompleteAttribute> findIncompleteAttribute(const std::vector<AstNode*>& ancestry, Position position)
+{
+    std::optional<IncompleteAttribute> result;
     forEachAttributeList(
         ancestry,
         [&](const AstArray<AstAttr*>& attributes, AstAttr::Context context)
@@ -167,7 +177,7 @@ static std::optional<AstAttr::Context> findIncompleteAttributeContext(const std:
             {
                 if (attr->location.begin <= position && position <= attr->location.end && attr->type == AstAttr::Type::Unknown)
                 {
-                    result = context;
+                    result = IncompleteAttribute{attr, context};
                     return true;
                 }
             }
@@ -177,6 +187,19 @@ static std::optional<AstAttr::Context> findIncompleteAttributeContext(const std:
     );
 
     return result;
+}
+
+// Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): an attribute that needs arguments inserts
+// them too. After a bare `@` that means the list form, `@[inline("reason")]`, since only a list takes arguments.
+static AutocompleteEntry autocompleteAttributeEntry(const AttributeInfo& info, bool bare)
+{
+    AutocompleteEntry entry{AutocompleteEntryKind::Keyword};
+    if (info.requiredArguments)
+    {
+        std::string written = std::string(info.name) + info.requiredArguments;
+        entry.insertText = bare ? "[" + written + "]" : written;
+    }
+    return entry;
 }
 
 // The attribute whose arguments the cursor is inside, as in `@[deprecated { | }]`.
@@ -2123,6 +2146,44 @@ static bool stringPartOfInterpString(const AstNode* node, Position position)
     return true;
 }
 
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the type of the value a pattern tests, when the last
+// node of `ancestry` is one of its alternatives: the value in `x is ...`, or the match's subject for a `case` arm. A
+// fragment's type check records types only for what the pattern stands for, so a tested name is looked up in `scope`.
+static std::optional<TypeId> patternTestedType(const Module& module, const std::vector<AstNode*>& ancestry, const ScopePtr& scope)
+{
+    if (ancestry.size() < 2)
+        return std::nullopt;
+
+    const AstExprMatchPattern* pattern = ancestry[ancestry.size() - 2]->as<AstExprMatchPattern>();
+    if (!pattern)
+        return std::nullopt;
+
+    const AstExpr* tested = pattern->value;
+    const AstLocal* testedLocal = pattern->subject;
+    for (auto it = ancestry.rbegin() + 2; !tested && it != ancestry.rend(); ++it)
+    {
+        if (const AstStatMatch* statMatch = (*it)->as<AstStatMatch>())
+            tested = statMatch->subject.value;
+        else if (const AstExprMatch* exprMatch = (*it)->as<AstExprMatch>())
+            tested = exprMatch->subject.value;
+    }
+
+    if (const TypeId* ty = tested ? module.astTypes.find(tested) : nullptr)
+        return *ty;
+
+    const char* name = testedLocal ? testedLocal->name.value : nullptr;
+    if (const AstExprLocal* local = tested ? tested->as<AstExprLocal>() : nullptr)
+        name = local->local->name.value;
+    else if (const AstExprGlobal* global = tested ? tested->as<AstExprGlobal>() : nullptr)
+        name = global->name.value;
+
+    if (!name || !scope)
+        return std::nullopt;
+    if (std::optional<Binding> binding = scope->linearSearchForBinding(name, /* traverseScopeChain= */ true))
+        return binding->typeId;
+    return std::nullopt;
+}
+
 static bool isSimpleInterpolatedString(const AstNode* node)
 {
     const AstExprInterpString* interpString = node->as<AstExprInterpString>();
@@ -2545,6 +2606,32 @@ static AutocompleteResult autocompleteWhileLoopKeywords(std::vector<AstNode*> an
 // bounds, the values, the condition or the last clause of its `when` chain) and before its `do`: `do` and `when`, plus
 // `give` and `for` for a table comprehension's clause. Nothing when the cursor isn't there, or the part before it
 // is unfinished.
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the arm of the innermost match whose `then` is at
+// `position`, or whose `then` is missing after a finished test, where the keyword is being typed
+static const AstMatchArm* matchArmHeadAt(const std::vector<AstNode*>& ancestry, Position position)
+{
+    for (auto it = ancestry.rbegin(); it != ancestry.rend(); ++it)
+    {
+        AstArray<AstMatchArm> arms{nullptr, 0};
+        if (const AstStatMatch* statMatch = (*it)->as<AstStatMatch>())
+            arms = statMatch->arms;
+        else if (const AstExprMatch* exprMatch = (*it)->as<AstExprMatch>())
+            arms = exprMatch->arms;
+        else
+            continue;
+
+        for (const AstMatchArm& arm : arms)
+        {
+            bool onThen = arm.thenLocation && arm.thenLocation->containsClosed(position);
+            bool thenMissing = !arm.thenLocation && arm.condition && !arm.condition->is<AstExprError>() && position > arm.condition->location.end;
+            if (onThen || thenMissing)
+                return &arm;
+        }
+        return nullptr;
+    }
+    return nullptr;
+}
+
 static std::optional<AutocompleteResult> autocompleteLoopHeaderKeywords(const std::vector<AstNode*>& ancestry, Position position)
 {
     for (auto it = ancestry.rbegin(); it != ancestry.rend(); ++it)
@@ -2842,9 +2929,10 @@ struct DestructureCursor
     // For a pattern in a `for` loop's bindings: the loop. `block` is then its body, which starts with the fields.
     const AstStatForIn* loop = nullptr;
 
-    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): for the `{...}` or `(...)` after a type test's class (`x is Point {x, y}`), the test's call. Its fields are
-    // declared by the clauses of the condition it's in, which are in `clauseDeclarations`.
-    const AstExprCall* typeTest = nullptr;
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): for the `{...}` or `(...)` after a pattern's class
+    // (`x is Point {x, y}`), the alternative it belongs to. Its fields are declared by the clauses of the condition it's
+    // in, which are in `clauseDeclarations`.
+    const AstPatternAlternative* alternative = nullptr;
     std::vector<const AstStatLocal*> clauseDeclarations;
 };
 
@@ -2915,14 +3003,18 @@ static std::optional<DestructureCursor> findDestructureCursor(const std::vector<
 {
     for (auto it = ancestry.rbegin(); it != ancestry.rend(); ++it)
     {
-        const AstExprCall* call = (*it)->as<AstExprCall>();
-        if (call && call->typeTestPattern)
+        if (const AstExprMatchPattern* pattern = (*it)->as<AstExprMatchPattern>())
         {
-            if (std::optional<DestructureCursor> cursor = findDestructureCursorInPattern(*call->typeTestPattern, position))
+            for (const AstPatternAlternative& alternative : pattern->alternatives)
             {
-                cursor->typeTest = call;
-                cursor->clauseDeclarations = clauseDeclarationsIn(ancestry);
-                return cursor;
+                std::optional<DestructureCursor> cursor =
+                    alternative.fields ? findDestructureCursorInPattern(*alternative.fields, position) : std::nullopt;
+                if (cursor)
+                {
+                    cursor->alternative = &alternative;
+                    cursor->clauseDeclarations = clauseDeclarationsIn(ancestry);
+                    return cursor;
+                }
             }
         }
 
@@ -3008,7 +3100,7 @@ static std::optional<TypeId> propertyTypeOf(TypeId ty, const std::string& name)
 // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the type of `target`, a level of a type test's pattern, found by walking down from `level`,
 // whose value has type `levelType`: by field name in a `.{...}`, by primary constructor parameter in a `.(...)`. The
 // pattern's own reads don't see the type test's refinement while autocomplete checks the code, so their types can't be used.
-static std::optional<TypeId> typeTestLevelType(const AstDestructurePattern& level, TypeId levelType, const AstDestructurePattern* target)
+static std::optional<TypeId> patternLevelType(const AstDestructurePattern& level, TypeId levelType, const AstDestructurePattern* target)
 {
     if (&level == target)
         return levelType;
@@ -3028,23 +3120,24 @@ static std::optional<TypeId> typeTestLevelType(const AstDestructurePattern& leve
         if (!fieldType)
             continue;
 
-        if (std::optional<TypeId> found = typeTestLevelType(field.target, *fieldType, target))
+        if (std::optional<TypeId> found = patternLevelType(field.target, *fieldType, target))
             return found;
     }
     return std::nullopt;
 }
 
-static std::optional<TypeId> typeTestValueType(const Module& module, NotNull<BuiltinTypes> builtinTypes, const DestructureCursor& cursor)
+static std::optional<TypeId> patternValueType(const Module& module, NotNull<BuiltinTypes> builtinTypes, const DestructureCursor& cursor)
 {
-    const TypeId* classValue = cursor.typeTest->args.size == 2 ? module.astTypes.find(cursor.typeTest->args.data[1]) : nullptr;
+    const AstPatternAlternative& alternative = *cursor.alternative;
+    const TypeId* classValue = alternative.operand ? module.astTypes.find(alternative.operand) : nullptr;
     std::optional<TypeId> testedType = classValue ? objectTypeOfClassValue(builtinTypes, *classValue) : std::nullopt;
     if (testedType)
     {
-        if (std::optional<TypeId> levelType = typeTestLevelType(*cursor.typeTest->typeTestPattern, *testedType, cursor.level))
+        if (std::optional<TypeId> levelType = patternLevelType(*alternative.fields, *testedType, cursor.level))
             return levelType;
     }
 
-    if (cursor.level == cursor.typeTest->typeTestPattern)
+    if (cursor.level == alternative.fields)
         return testedType;
 
     for (const AstStatLocal* declaration : cursor.clauseDeclarations)
@@ -3068,8 +3161,8 @@ static std::optional<TypeId> destructuredValueType(
 {
     const AstDestructurePattern& level = *cursor.level;
 
-    if (cursor.typeTest)
-        return typeTestValueType(module, builtinTypes, cursor);
+    if (cursor.alternative)
+        return patternValueType(module, builtinTypes, cursor);
 
     if (level.local->annotation)
     {
@@ -3158,13 +3251,13 @@ AutocompleteResult autocomplete_(
     // `local` would be read as completing a local declaration). Only the attributes legal in that
     // position are offered, taken from the parser's registry, so each attribute is suggested exactly
     // where it declares itself valid.
-    if (std::optional<AstAttr::Context> attributeContext = findIncompleteAttributeContext(ancestry, position))
+    if (std::optional<IncompleteAttribute> incomplete = findIncompleteAttribute(ancestry, position))
     {
         AutocompleteEntryMap ret;
         for (const AttributeInfo& info : getKnownAttributes())
         {
-            if (AstAttr::contextAllows(info.allowedContexts, *attributeContext))
-                ret[info.name] = {AutocompleteEntryKind::Keyword};
+            if (AstAttr::contextAllows(info.allowedContexts, incomplete->context))
+                ret[info.name] = autocompleteAttributeEntry(info, incomplete->attr->bare);
         }
 
         return {std::move(ret), ancestry, AutocompleteContext::Keyword};
@@ -3247,6 +3340,17 @@ AutocompleteResult autocomplete_(
     {
         if (std::optional<AutocompleteResult> loopKeywords = autocompleteLoopHeaderKeywords(ancestry, position))
             return std::move(*loopKeywords);
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a match arm's `then`, as for an `if`. Completing a
+    // name there would replace the keyword being typed.
+    if (const AstMatchArm* arm = matchArmHeadAt(ancestry, position))
+    {
+        AutocompleteEntryMap keywords;
+        keywords["then"] = {AutocompleteEntryKind::Keyword};
+        if (!arm->thenLocation)
+            keywords["when"] = {AutocompleteEntryKind::Keyword};
+        return {std::move(keywords), ancestry, AutocompleteContext::Keyword};
     }
 
     AstNode* node = ancestry.back();
@@ -3567,6 +3671,9 @@ AutocompleteResult autocomplete_(
 
         if (auto it = module->astExpectedTypes.find(node->asExpr()))
             autocompleteStringSingleton(*it, false, node, position, result);
+
+        if (std::optional<TypeId> tested = patternTestedType(*module, ancestry, scopeAtPosition))
+            autocompleteStringSingleton(*tested, false, node, position, result);
 
         // Luwu bundles: a string in a bundle literal `.(a, b)` completes what its position of the bundle's expected type
         // allows. The bundle is a `bundle.pack` call, whose own argument check records `unknown` for the string.

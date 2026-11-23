@@ -2054,6 +2054,29 @@ int lua_getpayload(lua_State* L, int idx)
 
 }
 
+void lua_setobjectdtor(lua_State* L, int tag, lua_Destructor dtor)
+{
+    api_check(L, unsigned(tag) < LUA_OTAG_LIMIT);
+    L->global->objectdtors[tag] = dtor;
+}
+
+lua_Destructor lua_getobjectdtor(lua_State* L, int tag)
+{
+    api_check(L, unsigned(tag) < LUA_OTAG_LIMIT);
+    return L->global->objectdtors[tag];
+}
+
+void* lua_toobjectdata(lua_State* L, int idx, int tag)
+{
+    const TValue* o = index2addr(L, idx);
+    if (!ttisobject(o))
+        return NULL;
+
+    LuauObject* object = objectvalue(o);
+    const LuauNativeData* native = luaR_nativedata(object);
+    return native && native->tag == tag ? luaR_objectdata(object) : NULL;
+}
+
 static const char* aux_upvalue(StkId fi, int n, TValue** val)
 {
     Closure* f;
@@ -2134,6 +2157,30 @@ uintptr_t lua_encodepointer(lua_State* L, uintptr_t p)
 {
     global_State* g = L->global;
     return uintptr_t((g->ptrenckey[0] * p + g->ptrenckey[2]) ^ (g->ptrenckey[1] * p + g->ptrenckey[3]));
+}
+
+int lua_cstackdepth(lua_State* L)
+{
+    return L->nCcalls;
+}
+
+int lua_cstacklimit(lua_State* L)
+{
+    return LUAI_MAXCCALLS;
+}
+
+void lua_cstackreserve(lua_State* L, int n)
+{
+    api_check(L, n >= 0);
+    if (n >= LUAI_MAXCCALLS - int(L->nCcalls))
+        luaG_runerror(L, "C stack overflow");
+    L->nCcalls = (unsigned short)(L->nCcalls + n);
+}
+
+void lua_cstackrelease(lua_State* L, int n)
+{
+    api_check(L, n >= 0 && int(L->nCcalls) - n >= int(L->baseCcalls));
+    L->nCcalls = (unsigned short)(L->nCcalls - n);
 }
 
 int lua_refpool(lua_State* L, int idx)

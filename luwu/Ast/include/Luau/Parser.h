@@ -110,6 +110,20 @@ private:
     static ParseResult finishParse(Parser& p, AstStatBlock* root, const char* buffer, size_t bufferSize);
 
     bool blockFollow(const Lexeme& l);
+    // Luwu: extra `end` recovery (see Parser::parse)
+    static ParseResult parseOnce(
+        const char* buffer,
+        std::size_t bufferSize,
+        AstNameTable& names,
+        Allocator& allocator,
+        const ParseOptions& options,
+        std::optional<Location> extraEnd,
+        std::vector<Location>* extraEndSuspects
+    );
+    void noteEndClosing(const Position& openerBegin);
+    void skipExtraEnd();
+    bool blockEnds();
+    bool classBodyEnds();
 
     AstStatBlock* parseChunk();
 
@@ -380,6 +394,9 @@ private:
     bool traitsEnabled() const;
     void declareClassValue(AstStatClass* shape, AstName valueType, const Location& declareLocation);
     bool startsClassType();
+    bool classFollowsOpen(const Location& openLocation);
+    AstStat* reportOpenClass(const Location& openLocation, AstStat* stat);
+    AstExpr* parseClassRefExpr();
     AstStat* parseClassType(const Location& start, const Location& classKeywordLocation, bool exported, bool isTrait = false);
     bool legacyDeclareClass();
     void skipClassOnlyExternTypeKeywords();
@@ -390,7 +407,12 @@ private:
     // varlist `=' explist
     AstStat* parseAssignment(AstExpr* initial);
 
-    void reportRedundantExportKeyword(const Location& keywordLocation, const char* keyword, AstStatLocal* stat);
+    void reportRedundantExportKeyword(
+        const Location& keywordLocation,
+        const char* keyword,
+        AstStatLocal* stat,
+        size_t errorsBeforeDeclaration
+    );
     void reportValuelessExports(AstStatBlock* root);
     AstStat* parseExportValue(
         const Location& start,
@@ -604,19 +626,23 @@ private:
     struct PatternAlternative
     {
         Location location;
-        // What the value is compared with (`nil`, `none`, a literal), or the class it's an instance of
+        // What the value is compared with (`nil`, `none`, a literal), the class it's an instance of, or the trait it
+        // implements
         AstExpr* operand = nullptr;
         bool isClass = false;
+        bool isTrait = false;
         // The name `type(value)` (or `typeof(value)` for a builtin class) gives
         std::optional<std::string> tag;
         bool tagIsTypeof = false;
         // The fields or elements a class pattern binds (`Cat(name)`, `Pod {x}`), or a bundle pattern's elements
         std::shared_ptr<DestructureTarget> destructure;
     };
-    // `is <alternatives>`, `is not <alternatives>` or `implements Trait`
+    // `is <alternatives>`, `is not <alternatives>` or `implements <traits>`
     struct Pattern
     {
         Location location;
+        // The `is` or `implements`
+        Location keywordLocation;
         bool negated = false;
         bool implements = false;
         std::vector<PatternAlternative> alternatives;
@@ -624,11 +650,13 @@ private:
 
     // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `match` and the `is` / `implements` operators
     bool matchExpressionsAvailable();
-    bool typeTestFollows();
-    AstExpr* parseTypeTest(AstExpr* value, const Location& start, const std::string& subject);
+    bool patternFollows();
+    AstExpr* parseMatchPatternExpr(AstExpr* value, AstLocal* subject, const Location& start, const std::string& written);
     Pattern parsePattern(const std::string& subject);
     PatternAlternative parsePatternAlternative(const std::optional<std::string>& subject);
-    void parseTypeTestPatternFields(DestructureTarget& target);
+    PatternAlternative parseTraitAlternative();
+    bool patternAlternativeFollows(const char* expected);
+    void parsePatternFields(DestructureTarget& target);
     void parseBindingTest(DestructureTarget& target);
     void rejectPatternAnnotation(DestructureTarget& target);
     AstExpr* parsePatternClass(bool implements, const std::optional<std::string>& subject);
@@ -638,13 +666,18 @@ private:
     std::optional<std::string> fieldTestsForTypeArguments(AstExpr* cls, const AstArray<AstTypeOrPack>& arguments);
     void parseClassPatternFields(PatternAlternative& alternative);
     const PatternAlternative* bindingAlternative(const Pattern& pattern);
-    AstExpr* buildTypeTest(AstExpr* value, const Pattern& pattern, const Location& start);
-    AstExpr* makePatternTest(AstExpr* value, const Pattern& pattern, const Location& start);
+    AstExpr* buildMatchPattern(AstExpr* value, AstLocal* subject, const Pattern& pattern, const Location& start);
+    AstExprMatchPattern* makeMatchPattern(AstExpr* value, AstLocal* subject, const Pattern& pattern, const Location& start);
+    AstArray<AstPatternAlternative> patternAlternatives(const Pattern& pattern);
+    AstExpr* makePatternCheck(AstExpr* value, const Pattern& pattern, const Location& start);
     AstExpr* makeAlternativeTest(AstExpr* value, const PatternAlternative& alternative, bool negated, const Location& start);
-    AstExpr* bindTypeTestPattern(AstExpr* value, const Pattern& pattern, const PatternAlternative& binding, const Location& location);
-    AstDestructurePattern* appendPatternTest(const Pattern& pattern, AstLocal* local, std::vector<AstStat*>& out, const Location& location);
+    AstExpr* bindPattern(AstExpr* value, AstLocal* subject, const Pattern& pattern, const PatternAlternative& binding, const Location& location);
+    AstExprMatchPattern* appendPatternTest(const Pattern& pattern, AstLocal* local, std::vector<AstStat*>& out, const Location& location);
     AstExpr* makeBundleRest(AstLocal* bundle, size_t count, const Location& location);
     AstExpr* cloneOperand(AstExpr* operand);
+    AstExpr* useOperand(AstExpr* operand);
+    AstDestructurePattern sourceDestructurePattern(const DestructureTarget& target, const std::vector<AstLocal*>& bound);
+    AstExprMatchPattern* sourcePattern(const Pattern& pattern, AstLocal* local, const std::vector<AstLocal*>& bound);
     // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): alternatives that bind (appendAlternativesTest)
     using FieldBody = std::function<AstExpr*(AstLocal*)>;
     AstExpr* withField(AstLocal* local, const DestructureTarget& target, size_t i, const Location& location, const FieldBody& body);
@@ -657,25 +690,25 @@ private:
     AstExpr* makeUnreachable(const Location& location);
     AstExpr* patternValue(AstLocal* local, const Pattern& pattern, AstName name, const Location& location);
     AstExpr* targetValue(AstLocal* local, const DestructureTarget& target, AstName name, const Location& location);
-    void appendAlternativesTest(const Pattern& pattern, AstLocal* local, std::vector<AstStat*>& out, const Location& location);
+    AstExprMatchPattern* appendAlternativesTest(const Pattern& pattern, AstLocal* local, std::vector<AstStat*>& out, const Location& location);
     void collectBoundNames(const DestructureTarget& target, std::vector<Name>& names);
     bool literalPatternFollows();
     std::optional<AstExpr*> parseNothingValue();
-    struct TypeTestBindings;
-    struct TypeTestBindingsFrame;
-    void reportTryAroundTypeTest(AstExprTry* tryExpr, const TypeTestBindings& bindings);
-    TypeTestBindingsFrame allowTypeTestBindings();
+    struct PatternBindings;
+    struct PatternBindingsFrame;
+    void reportTryAroundPattern(AstExprTry* tryExpr, const PatternBindings& bindings);
+    PatternBindingsFrame allowPatternBindings();
     void appendConditionClauses(
         std::vector<AstIfClause>& chain,
         AstExpr* condition,
         const std::optional<Location>& whenLocation,
-        TypeTestBindingsFrame outer
+        PatternBindingsFrame outer
     );
     bool matchExpressionFollows();
     AstExpr* parseMatchExpr(AstExprTry* tried = nullptr);
     // Luwu try expressions: set while a `match` subject is parsed, so a `try` there leaves the `case` arms to the `match`
     bool inMatchSubject = false;
-    AstStat* parseMatchStat();
+    AstStat* parseMatchStat(AstExprTry* tried = nullptr);
     bool matchStatementFollows();
     bool matchArmFollows();
     AstMatchSubject parseMatchSubject(const Location& start, AstExprTry* tried = nullptr);
@@ -686,8 +719,8 @@ private:
     void recordArmContinues(AstArray<AstMatchArm>& arms, const std::vector<size_t>& continues);
     bool parseCaseHead(AstLocal* subject, std::vector<AstIfClause>& chain);
     bool checkCaseBindingName(const Name& name);
-    AstExpr* parseMatchPattern(AstLocal* subject);
-    AstExpr* parseMatchAlternative(AstLocal* subject, bool reportMissingIs);
+    AstExpr* parseCasePattern(AstLocal* subject);
+    AstExpr* parseCaseAlternative(AstLocal* subject, bool reportMissingIs);
     AstExprCall* makeGlobalCall(AstName library, std::optional<AstName> function, const Location& location, std::initializer_list<AstExpr*> args);
     // Luwu: a missing `then`/`else` in an if-else expression is reported on its keyword (see parseIfElseExpr)
     enum class IfElseKeyword
@@ -718,7 +751,9 @@ private:
 
     // Luwu try expressions
     bool tryExpressionFollows();
-    AstExpr* parseTryExpr();
+    AstExpr* parseTryExpr(bool startsStatement = false);
+    AstStat* parseTryStat();
+    bool armKeywordBeingTyped();
 
     // stringinterp ::= <INTERP_BEGIN> exp {<INTERP_MID> exp} <INTERP_END>
     AstExpr* parseInterpString();
@@ -1092,7 +1127,7 @@ private:
     // adds to the condition it's in: a hidden local holding the tested value when it isn't a local already, the test,
     // then one untested binding per name, each followed by the test of a binding tested in turn. `test` is the expression
     // the condition must be for the bindings to apply.
-    struct TypeTestBindings
+    struct PatternBindings
     {
         AstExpr* test = nullptr;
         Location location;
@@ -1102,15 +1137,15 @@ private:
     };
     // Whether a type test here may bind (the condition being parsed is a whole `if`, `when` or `case` condition), and
     // the bindings it made. Saved and restored around each condition, so a nested one has its own.
-    struct TypeTestBindingsFrame
+    struct PatternBindingsFrame
     {
         bool allowed = false;
-        std::optional<TypeTestBindings> bindings;
+        std::optional<PatternBindings> bindings;
     };
-    TypeTestBindingsFrame typeTestBindings;
+    PatternBindingsFrame patternBindings;
     // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): set while parsing the fields or elements of a pattern
     // after `is`, where a binding can be tested (`age is number`) and a bundle pattern can end in `..`
-    bool parsingTypeTestPattern = false;
+    bool parsingPattern = false;
     AstName nameNumber;
     AstName nameAny;
     AstName nameError;
@@ -1136,12 +1171,20 @@ private:
 
     MatchLexeme endMismatchSuspect;
 
+    // Luwu: `end`s that may be extra, each indented past the opener it closes with the block's code continuing after it
+    std::vector<Location> extraEndSuspects;
+    // Luwu: in a recovery parse, the `end` to report as extra and skip
+    std::optional<Location> extraEnd;
+
     std::vector<Function> functionStack;
     size_t typeFunctionDepth = 0;
 
     DenseHashMap<AstName, AstLocal*> localMap;
     std::vector<AstLocal*> localStack;
     DenseHashMap<AstName, AstStatClass*> classesWithinModule{{}};
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the operands of patterns whose node a pattern's
+    // plain-code meaning already uses (useOperand)
+    DenseHashSet<AstExpr*> usedPatternOperands{nullptr};
 
     // Luwu Traits (rfcs/classes/traits.md): the class or trait whose body is being parsed, which `Self` refers to
     struct SelfClassContext

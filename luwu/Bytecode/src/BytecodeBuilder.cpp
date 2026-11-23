@@ -12,8 +12,10 @@ LUAU_FASTFLAG(LuauIntegerType2)
 LUAU_FASTFLAG(LuwuClasses)
 LUAU_FASTFLAG(LuwuDestructuring)
 LUAU_FASTFLAG(LuwuTableComprehensions)
+LUAU_FASTFLAG(DebugLuwuMatchExpressions)
 LUAU_FASTFLAG(DebugLuwuPoperators)
 LUAU_FASTFLAG(DebugLuwuTryExpressions)
+LUAU_FASTFLAG(LuwuStringFormatFastcall)
 LUAU_FASTFLAG(LuauEmitCallFeedback)
 LUAU_FASTFLAGVARIABLE(LuauVirtualBcBuilder)
 
@@ -213,6 +215,10 @@ uint32_t BytecodeBuilder::beginFunction(uint8_t numparams, bool isvararg)
     hasLongJumps = false;
     debugLine = 0;
 
+    inlinedDumpScopes.assign(1, InlinedDumpScope{});
+    currentInlinedDumpScope = 0;
+    inlinedDumpScopeChanges.clear();
+
     return id;
 }
 
@@ -240,6 +246,7 @@ void BytecodeBuilder::clearState()
 
     debugRemarks.clear();
     debugRemarkBuffer.clear();
+    debugRemarkScopes.clear();
 }
 
 void BytecodeBuilder::endFunction(uint8_t maxstacksize, uint8_t numupvalues, uint8_t flags, uint64_t cost)
@@ -298,6 +305,7 @@ void BytecodeBuilder::endFunction(uint8_t maxstacksize, uint8_t numupvalues, uin
 
         debugRemarks.clear();
         debugRemarkBuffer.clear();
+        debugRemarkScopes.clear();
     }
 }
 
@@ -670,6 +678,58 @@ void BytecodeBuilder::patchAux(size_t targetAux, int32_t newValue)
     insns[targetAux] = newValue;
 }
 
+void BytecodeBuilder::stubFunction(uint32_t fid)
+{
+    LUAU_ASSERT(currentFunction == ~0u);
+    LUAU_ASSERT(fid < functions.size() && fid != mainFunction);
+
+    Function& func = functions[fid];
+
+    // The stub keeps the upvalue count, since its closures are still created and capture upvalues
+    func.numparams = 0;
+    func.isvararg = false;
+    func.typeinfo.clear();
+
+    // RETURN R0 0
+    uint32_t insn = LOP_RETURN | (1 << 16);
+
+    if (dumpFunctionPtr)
+    {
+        func.dump = "RETURN R0 0\n";
+        func.dumpinstoffs = {0, int(func.dump.size())};
+    }
+
+    if (encoder)
+        encoder->encode(&insn, 1);
+
+    std::string& ss = func.data;
+    ss.clear();
+
+    writeByte(ss, func.maxstacksize);
+    writeByte(ss, func.numparams);
+    writeByte(ss, func.numupvalues);
+    writeByte(ss, func.isvararg);
+    writeByte(ss, 0); // flags
+    writeVarInt(ss, 0); // type info
+
+    writeVarInt(ss, 1);
+    writeInt(ss, insn);
+
+    writeVarInt(ss, 0); // constants
+    writeVarInt(ss, 0); // child protos
+
+    writeVarInt(ss, func.debuglinedefined);
+    writeVarInt(ss, func.debugname);
+    writeByte(ss, 0); // line info
+    writeByte(ss, 0); // debug info
+
+    writeVarInt(ss, 0); // feedback slots
+
+    // Luwu try expressions: WIP bytecode has a count of protected ranges after the feedback slots
+    if (getVersion() == LWBC_VERSION_WIP)
+        writeVarInt(ss, 0);
+}
+
 void BytecodeBuilder::setFunctionTypeInfo(std::string value)
 {
     functions[currentFunction].typeinfo = std::move(value);
@@ -797,6 +857,33 @@ void BytecodeBuilder::addDebugRemark(const char* format, ...)
 
     debugRemarks.emplace_back(uint32_t(insns.size()), uint32_t(offset));
     dumpRemarks.emplace_back(debugLine, debugRemarkBuffer.c_str() + offset);
+    debugRemarkScopes.push_back(currentInlinedDumpScope);
+}
+
+void BytecodeBuilder::pushInlinedDumpScope(int firstLine, int lastLine)
+{
+    if ((dumpFlags & Dump_Pretty) == 0)
+        return;
+
+    InlinedDumpScope scope;
+    scope.parent = currentInlinedDumpScope;
+    scope.depth = inlinedDumpScopes[currentInlinedDumpScope].depth + 1;
+    scope.firstLine = firstLine;
+    scope.lastLine = lastLine;
+
+    currentInlinedDumpScope = uint32_t(inlinedDumpScopes.size());
+    inlinedDumpScopes.push_back(scope);
+    inlinedDumpScopeChanges.emplace_back(uint32_t(insns.size()), currentInlinedDumpScope);
+}
+
+void BytecodeBuilder::popInlinedDumpScope()
+{
+    if ((dumpFlags & Dump_Pretty) == 0)
+        return;
+
+    LUAU_ASSERT(currentInlinedDumpScope != 0);
+    currentInlinedDumpScope = inlinedDumpScopes[currentInlinedDumpScope].parent;
+    inlinedDumpScopeChanges.emplace_back(uint32_t(insns.size()), currentInlinedDumpScope);
 }
 
 void BytecodeBuilder::finalize()
@@ -1549,6 +1636,10 @@ std::vector<uint32_t> BytecodeBuilder::expandJumps()
         typedLocal.startpc = remap[typedLocal.startpc];
     }
 
+    // Luwu pretty bytecode dumps: a scope can start or end after the last instruction
+    for (std::pair<uint32_t, uint32_t>& change : inlinedDumpScopeChanges)
+        change.first = change.first < remap.size() ? remap[change.first] : uint32_t(insns.size());
+
     for (TryRange& range : tryRanges)
     {
         // endpc is exclusive, and a range is never empty
@@ -1572,6 +1663,10 @@ std::string BytecodeBuilder::getError(const std::string& message)
 
 uint8_t BytecodeBuilder::getVersion()
 {
+    // Luwu: the string.format fastcall (LBF_STRING_FORMAT) is WIP bytecode too
+    if (FFlag::LuwuStringFormatFastcall)
+        return LWBC_VERSION_WIP;
+
     // Luwu Classes (rfcs/classes) and Luwu try expressions: work-in-progress formats
     if (FFlag::LuwuClasses || FFlag::DebugLuwuTryExpressions)
         return LWBC_VERSION_WIP;
@@ -1582,6 +1677,10 @@ uint8_t BytecodeBuilder::getVersion()
 
     // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): LOP_PRESIZETABLE is WIP bytecode too
     if (FFlag::LuwuTableComprehensions)
+        return LWBC_VERSION_WIP;
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): LOP_JUMPXTYPE and LOP_JUMPXMATCH are WIP bytecode too
+    if (FFlag::DebugLuwuMatchExpressions)
         return LWBC_VERSION_WIP;
 
     // Luwu Push and Pop Operators (rfcs/push-pop-operators.md): LOP_PUSH and LOP_POP are WIP bytecode too
@@ -2054,6 +2153,10 @@ void BytecodeBuilder::validateInstructions() const
                 VREGRANGE(LUAU_INSN_C(insn), 2);
                 VCONST(insns[i + 1], String);
             }
+            else if (LUAU_INSN_B(insn) == LBC_NEWCLASSMEMBER_CONSTRUCTOR)
+            {
+                VREG(LUAU_INSN_C(insn));
+            }
             else
             {
                 LUAU_ASSERT(LUAU_INSN_B(insn) == 0);
@@ -2096,6 +2199,20 @@ void BytecodeBuilder::validateInstructions() const
             LUAU_ASSERT((insns[i + 1] & ~(0xffu | LBC_JUMPXISA_JUMPIFINSTANCE | LBC_JUMPXISA_CHECKCLASS)) == 0);
             break;
 
+        case LOP_JUMPXTYPE:
+            VREG(LUAU_INSN_A(insn));
+            VJUMP(LUAU_INSN_D(insn));
+            LUAU_ASSERT((insns[i + 1] & ~(0xffu | 0x80000000u)) == 0);
+            LUAU_ASSERT(getJumpxTypeName(insns[i + 1] & 0xff));
+            break;
+
+        case LOP_JUMPXMATCH:
+            VREG(LUAU_INSN_A(insn));
+            VJUMP(LUAU_INSN_D(insn));
+            VREG(insns[i + 1] & 0xff);
+            LUAU_ASSERT((insns[i + 1] & ~(0xffu | 0x80000000u)) == 0);
+            break;
+
         case LOP_GETOBJECTMEMBER:
         case LOP_SETOBJECTMEMBER:
             VREG(LUAU_INSN_A(insn));
@@ -2108,7 +2225,7 @@ void BytecodeBuilder::validateInstructions() const
             break;
 
         case LOP_NEWOBJECT:
-            LUAU_ASSERT(LUAU_INSN_C(insn) <= LBC_NEWOBJECT_ALLOC);
+            LUAU_ASSERT(LUAU_INSN_C(insn) <= LBC_NEWOBJECT_APPLY);
             // with a user __init the instruction lays out `__init`, `self` and the arguments above A;
             // the other forms use one register per argument or per field
             VREG(LUAU_INSN_A(insn) + (LUAU_INSN_C(insn) == LBC_NEWOBJECT_INIT ? 2 : 0) + insns[i + 1]);
@@ -2116,7 +2233,7 @@ void BytecodeBuilder::validateInstructions() const
             break;
 
         case LOP_INITTRAITS:
-            // the runner goes in A and the object is in A + 1; the CALL that follows covers the arguments
+            // the count is in A and the object in A + 1; the CALL that follows names the arguments and the frame
             VREG(LUAU_INSN_A(insn) + 1);
             VJUMP(LUAU_INSN_D(insn));
             break;
@@ -2125,19 +2242,6 @@ void BytecodeBuilder::validateInstructions() const
             VREG(LUAU_INSN_A(insn));
             VREG(LUAU_INSN_B(insn));
             VREG(LUAU_INSN_C(insn));
-            break;
-
-        case LOP_PUSH:
-        {
-            int count = LUAU_INSN_C(insn) - 1;
-            VREG(LUAU_INSN_A(insn));
-            VREGRANGE(LUAU_INSN_B(insn), count);
-        }
-        break;
-
-        case LOP_POP:
-            VREG(LUAU_INSN_A(insn));
-            VREG(LUAU_INSN_B(insn));
             break;
 
         case LOP_PRESIZETABLE:
@@ -2169,6 +2273,26 @@ void BytecodeBuilder::validateInstructions() const
             VREG(LUAU_INSN_B(insn));
             VREG(LUAU_INSN_C(insn));
             VCONST(insns[i + 1], String);
+            break;
+
+        case LOP_PUSH:
+        {
+            int count = LUAU_INSN_C(insn) - 1;
+            VREG(LUAU_INSN_A(insn));
+            VREGRANGE(LUAU_INSN_B(insn), count);
+        }
+        break;
+
+        case LOP_POP:
+            VREG(LUAU_INSN_A(insn));
+            VREG(LUAU_INSN_B(insn));
+            break;
+
+        case LOP_GETTABLEBUNDLE:
+        case LOP_SETTABLEBUNDLE:
+            VREG(LUAU_INSN_A(insn));
+            VREG(LUAU_INSN_B(insn));
+            VREGRANGE(LUAU_INSN_C(insn), int(insns[i + 1]));
             break;
 
         default:
@@ -2953,6 +3077,10 @@ void BytecodeBuilder::dumpInstruction(const uint32_t* code, std::string& result,
             dumpConstant(result, *code, false);
             result.append("]\n");
         }
+        else if (LUAU_INSN_B(insn) == LBC_NEWCLASSMEMBER_CONSTRUCTOR)
+        {
+            formatAppend(result, "NEWCLASSMEMBER R%d CONSTRUCTOR R%d\n", LUAU_INSN_A(insn), LUAU_INSN_C(insn));
+        }
         else
         {
             formatAppend(result, "NEWCLASSMEMBER R%d R%d [", LUAU_INSN_A(insn), LUAU_INSN_C(insn));
@@ -2973,6 +3101,16 @@ void BytecodeBuilder::dumpInstruction(const uint32_t* code, std::string& result,
             formatAppend(result, "CHECKSELFCLASS R%d R%d K%d [", LUAU_INSN_A(insn), LUAU_INSN_B(insn), *code);
         dumpConstant(result, int(*code++), false);
         formatAppend(result, "]%s\n", LUAU_INSN_C(insn) ? " SELF" : "");
+        break;
+
+    case LOP_JUMPXTYPE:
+        formatAppend(result, "JUMPXTYPE R%d L%d%s ['%s']\n", LUAU_INSN_A(insn), targetLabel, LUAU_INSN_AUX_NOT(*code) ? " NOT" : "", getJumpxTypeName(*code & 0xff));
+        code++;
+        break;
+
+    case LOP_JUMPXMATCH:
+        formatAppend(result, "JUMPXMATCH R%d R%d L%d%s\n", LUAU_INSN_A(insn), *code & 0xff, targetLabel, LUAU_INSN_AUX_NOT(*code) ? " NOT" : "");
+        code++;
         break;
 
     case LOP_JUMPXISA:
@@ -3001,8 +3139,8 @@ void BytecodeBuilder::dumpInstruction(const uint32_t* code, std::string& result,
 
     case LOP_NEWOBJECT:
     {
-        static const char* const kForms[] = {"", " INIT", " FIELDS", " ALLOC"};
-        LUAU_ASSERT(LUAU_INSN_C(insn) <= LBC_NEWOBJECT_ALLOC);
+        static const char* const kForms[] = {"", " INIT", " FIELDS", " ALLOC", " APPLY"};
+        LUAU_ASSERT(LUAU_INSN_C(insn) <= LBC_NEWOBJECT_APPLY);
         formatAppend(result, "NEWOBJECT R%d R%d %d%s\n", LUAU_INSN_A(insn), LUAU_INSN_B(insn), *code++, kForms[LUAU_INSN_C(insn)]);
         break;
     }
@@ -3013,14 +3151,6 @@ void BytecodeBuilder::dumpInstruction(const uint32_t* code, std::string& result,
 
     case LOP_APPENDTABLE:
         formatAppend(result, "APPENDTABLE R%d R%d R%d\n", LUAU_INSN_A(insn), LUAU_INSN_B(insn), LUAU_INSN_C(insn));
-        break;
-
-    case LOP_PUSH:
-        formatAppend(result, "PUSH R%d R%d %d\n", LUAU_INSN_A(insn), LUAU_INSN_B(insn), LUAU_INSN_C(insn) - 1);
-        break;
-
-    case LOP_POP:
-        formatAppend(result, "POP R%d R%d\n", LUAU_INSN_A(insn), LUAU_INSN_B(insn));
         break;
 
     case LOP_PRESIZETABLE:
@@ -3041,11 +3171,28 @@ void BytecodeBuilder::dumpInstruction(const uint32_t* code, std::string& result,
         );
         break;
 
+    case LOP_GETTABLEBUNDLE:
+    case LOP_SETTABLEBUNDLE:
+    {
+        const char* name = LUAU_INSN_OP(insn) == LOP_GETTABLEBUNDLE ? "GETTABLEBUNDLE" : "SETTABLEBUNDLE";
+        formatAppend(result, "%s R%d R%d R%d %d\n", name, LUAU_INSN_A(insn), LUAU_INSN_B(insn), LUAU_INSN_C(insn), int(*code));
+        code++;
+        break;
+    }
+
     case LOP_GETQUALIFIED:
         formatAppend(result, "GETQUALIFIED R%d R%d R%d K%d [", LUAU_INSN_A(insn), LUAU_INSN_B(insn), LUAU_INSN_C(insn), *code);
         dumpConstant(result, *code, false);
         result.append("]\n");
         code++;
+        break;
+
+    case LOP_PUSH:
+        formatAppend(result, "PUSH R%d R%d %d\n", LUAU_INSN_A(insn), LUAU_INSN_B(insn), LUAU_INSN_C(insn) - 1);
+        break;
+
+    case LOP_POP:
+        formatAppend(result, "POP R%d R%d\n", LUAU_INSN_A(insn), LUAU_INSN_B(insn));
         break;
 
     default:
@@ -3115,6 +3262,7 @@ std::string BytecodeBuilder::dumpCurrentFunction(std::vector<int>& dumpinstoffs)
                 LUAU_ASSERT(l.startpc < lines.size());
 
                 // it would be nice to emit name as well but it requires reverse lookup through stringtable
+                appendDumpIndent(result, 0);
                 formatAppend(result, "local %d: reg %d, start pc %d line %d, no live range\n", int(i), l.reg, l.startpc, lines[l.startpc]);
             }
             else
@@ -3124,6 +3272,7 @@ std::string BytecodeBuilder::dumpCurrentFunction(std::vector<int>& dumpinstoffs)
                 LUAU_ASSERT(l.endpc <= lines.size()); // endpc is exclusive in the debug info, but it's more intuitive to print inclusive data
 
                 // it would be nice to emit name as well but it requires reverse lookup through stringtable
+                appendDumpIndent(result, 0);
                 formatAppend(
                     result,
                     "local %d: reg %d, start pc %d line %d, end pc %d line %d\n",
@@ -3151,6 +3300,7 @@ std::string BytecodeBuilder::dumpCurrentFunction(std::vector<int>& dumpinstoffs)
             const char* name = userdata ? userdata : getBaseTypeString(et);
             const char* optional = (et & LBC_TYPE_OPTIONAL_BIT) ? "?" : "";
 
+            appendDumpIndent(result, 0);
             formatAppend(result, "R%d: %s%s [argument]\n", i - 2, name, optional);
         }
 
@@ -3162,6 +3312,7 @@ std::string BytecodeBuilder::dumpCurrentFunction(std::vector<int>& dumpinstoffs)
             const char* name = userdata ? userdata : getBaseTypeString(l.type);
             const char* optional = (l.type & LBC_TYPE_OPTIONAL_BIT) ? "?" : "";
 
+            appendDumpIndent(result, 0);
             formatAppend(result, "U%d: %s%s\n", int(i), name, optional);
         }
 
@@ -3173,6 +3324,7 @@ std::string BytecodeBuilder::dumpCurrentFunction(std::vector<int>& dumpinstoffs)
             const char* name = userdata ? userdata : getBaseTypeString(l.type);
             const char* optional = (l.type & LBC_TYPE_OPTIONAL_BIT) ? "?" : "";
 
+            appendDumpIndent(result, 0);
             formatAppend(result, "R%d: %s%s from %d to %d\n", l.reg, name, optional, l.startpc, l.endpc);
         }
     }
@@ -3188,6 +3340,7 @@ std::string BytecodeBuilder::dumpCurrentFunction(std::vector<int>& dumpinstoffs)
     {
         for (size_t i = 0; i < constants.size(); ++i)
         {
+            appendDumpIndent(result, 0);
             formatAppend(result, "K%d: ", int(i));
             dumpConstant(result, int(i), true);
             formatAppend(result, "\n");
@@ -3222,10 +3375,16 @@ std::string BytecodeBuilder::dumpCurrentFunction(std::vector<int>& dumpinstoffs)
 
         dumpinstoffs.resize(insns.size() + 1, -1);
 
+        size_t nextScopeChange = 0;
+        uint32_t scope = 0;
+
         for (size_t i = 0; i < insns.size();)
         {
             const uint32_t* code = &insns[i];
             uint8_t op = LUAU_INSN_OP(*code);
+
+            while (nextScopeChange < inlinedDumpScopeChanges.size() && inlinedDumpScopeChanges[nextScopeChange].first <= i)
+                scope = inlinedDumpScopeChanges[nextScopeChange++].second;
 
             dumpinstoffs[i] = int(result.size());
 
@@ -3240,6 +3399,7 @@ std::string BytecodeBuilder::dumpCurrentFunction(std::vector<int>& dumpinstoffs)
             {
                 while (nextRemark < debugRemarks.size() && debugRemarks[nextRemark].first == i)
                 {
+                    appendDumpIndent(result, debugRemarkScopes[nextRemark]);
                     formatAppend(result, "REMARK %s\n", debugRemarkBuffer.c_str() + debugRemarks[nextRemark].second);
                     nextRemark++;
                 }
@@ -3252,10 +3412,15 @@ std::string BytecodeBuilder::dumpCurrentFunction(std::vector<int>& dumpinstoffs)
                 if (line > 0 && line != lastLine)
                 {
                     LUAU_ASSERT(size_t(line - 1) < dumpSource.size());
-                    formatAppend(result, "%5d: %s\n", line, dumpSource[line - 1].c_str());
+                    if (dumpFlags & Dump_Pretty)
+                        appendDumpSourceLine(result, line, scope);
+                    else
+                        formatAppend(result, "%5d: %s\n", line, dumpSource[line - 1].c_str());
                     lastLine = line;
                 }
             }
+
+            appendDumpIndent(result, scope);
 
             if (dumpFlags & Dump_Lines)
                 formatAppend(result, "%d: ", lines[i]);
@@ -3275,6 +3440,47 @@ std::string BytecodeBuilder::dumpCurrentFunction(std::vector<int>& dumpinstoffs)
     }
 
     return result;
+}
+
+// Luwu pretty bytecode dumps: the spaces in one level of indentation
+static constexpr size_t kPrettyDumpIndentWidth = 4;
+
+// Luwu pretty bytecode dumps: a function's lines sit one level under its header, and each inlined call one more
+void BytecodeBuilder::appendDumpIndent(std::string& result, uint32_t scope) const
+{
+    if (dumpFlags & Dump_Pretty)
+        result.append(kPrettyDumpIndentWidth * (inlinedDumpScopes[scope].depth + 1), ' ');
+}
+
+// Luwu pretty bytecode dumps: a source line, in the innermost scope whose function it's in. The line with an inlined
+// call is the caller's. Its code is indented relative to that function's first line instead of the file.
+void BytecodeBuilder::appendDumpSourceLine(std::string& result, int line, uint32_t scope) const
+{
+    while (scope != 0)
+    {
+        const InlinedDumpScope& inlined = inlinedDumpScopes[scope];
+        bool inFunction = inlined.firstLine <= line && line <= inlined.lastLine;
+        if (inFunction)
+            break;
+
+        scope = inlined.parent;
+    }
+
+    int firstLine = scope == 0 ? functions[currentFunction].debuglinedefined : inlinedDumpScopes[scope].firstLine;
+    const std::string& code = dumpSource[line - 1];
+
+    size_t indent = code.find_first_not_of(" \t");
+    if (indent == std::string::npos)
+        indent = code.size();
+
+    bool hasFirstLine = firstLine > 0 && size_t(firstLine - 1) < dumpSource.size();
+    if (hasFirstLine)
+        indent = std::min(indent, dumpSource[firstLine - 1].find_first_not_of(" \t"));
+    else
+        indent = 0;
+
+    appendDumpIndent(result, scope);
+    formatAppend(result, "%d: %s\n", line, code.c_str() + indent);
 }
 
 void BytecodeBuilder::setDumpSource(const std::string& source)

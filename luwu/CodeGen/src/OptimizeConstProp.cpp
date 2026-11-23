@@ -1551,6 +1551,7 @@ static void handleBuiltinEffects(ConstPropState& state, LuauBuiltinFunction bfid
     case LBF_RAWEQUAL:
     case LBF_CLASS_ISINSTANCE:
     case LBF_CLASS_OF:
+    case LBF_STRING_FORMAT:
     case LBF_TABLE_UNPACK:
     case LBF_VECTOR:
     case LBF_BIT32_COUNTLZ:
@@ -3706,8 +3707,11 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
         state.invalidateUserCall();
         break;
     case IrCmd::FALLBACK_INITTRAITS:
-        // writes the runner or nil, and runs nothing; the CALL after it runs the initializers
+        // writes the count and the call frame, and puts back overridden constant fields; the CALL after it runs the
+        // initializer
         state.invalidate(OP_B(inst));
+        state.invalidateRegisterRange(vmRegOp(OP_C(inst)), 2 + function.intOp(OP_D(inst)));
+        state.invalidateHeap();
         break;
     case IrCmd::FALLBACK_PRESIZETABLE:
         // writes no registers and runs no Luau code, but reallocates the table's array and hash parts
@@ -3722,6 +3726,12 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
     case IrCmd::FALLBACK_GETQUALIFIED:
         // writes the function, and runs nothing
         state.invalidate(OP_B(inst));
+        break;
+    case IrCmd::FALLBACK_TABLEBUNDLE:
+        // a read writes its target, and either can run `__index` or `__newindex`
+        if (function.intOp(OP_F(inst)) == 0)
+            state.invalidate(OP_B(inst));
+        state.invalidateUserCall();
         break;
     case IrCmd::FALLBACK_NEWOBJECT:
         // Construction writes the instance (and, for a user __init, the frame it lays out above it),

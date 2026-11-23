@@ -21,6 +21,10 @@ LUAU_FASTFLAGVARIABLE(LuwuDestructuring)
 // is on, the compiler emits WIP bytecode (version 200), which has LOP_PRESIZETABLE.
 LUAU_FASTFLAGVARIABLE(LuwuTableComprehensions)
 
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `match` and the `is` and `implements` patterns (in
+// progress). While it is on, the compiler emits WIP bytecode (version 200), which has LOP_JUMPXTYPE and LOP_JUMPXMATCH.
+LUAU_FASTFLAGVARIABLE(DebugLuwuMatchExpressions)
+
 // Luwu Push and Pop Operators (rfcs/push-pop-operators.md): `target <+ values` and `<-container` (in progress). While it
 // is on, the compiler emits WIP bytecode (version 200), which has LOP_PUSH and LOP_POP.
 LUAU_FASTFLAGVARIABLE(DebugLuwuPoperators)
@@ -63,3 +67,11 @@ LUAU_FASTFLAGVARIABLE(DebugLuwuTryExpressions)
 // Luwu bundles: the `bundle` library, its classes, and the compiler's fastcalls and unfolding for it. A prototype whose
 // API can still change. Needs LuwuClasses.
 LUAU_FASTFLAGVARIABLE(DebugLuwuBundles)
+
+// Luwu: the `@[inline(reason)]` attribute. The compiler weighs a marked function by a third of its size at its call sites,
+// and a call it still can't inline is a compile error at the call. In progress, so a Debug flag.
+LUAU_FASTFLAGVARIABLE(DebugLuwuEncourageInline)
+
+// Luwu: string.format and interpolated strings compile to a fastcall (LBF_STRING_FORMAT). While it is on, the compiler
+// emits WIP bytecode (version 200), which a VM without the builtin can't run.
+LUAU_FASTFLAGVARIABLE(LuwuStringFormatFastcall)

@@ -210,8 +210,10 @@ static void visitVmRegDefsUses(T& visitor, IrFunction& function, IrInst& inst)
         visitor.defRange(vmRegOp(OP_B(inst)), 3);
         break;
     case IrCmd::FALLBACK_INITTRAITS:
-        visitor.use(OP_C(inst));
+        // the count, the object and the arguments; then the count again and the call frame
+        visitor.useRange(vmRegOp(OP_B(inst)), 2 + function.intOp(OP_D(inst)));
         visitor.def(OP_B(inst));
+        visitor.defRange(vmRegOp(OP_C(inst)), 2 + function.intOp(OP_D(inst)));
         break;
     case IrCmd::FALLBACK_PRESIZETABLE:
     {
@@ -225,6 +227,11 @@ static void visitVmRegDefsUses(T& visitor, IrFunction& function, IrInst& inst)
             visitor.useRange(vmRegOp(OP_C(inst)), form <= LBC_PRESIZE_ITER_HASH ? 2 : 3);
         break;
     }
+    case IrCmd::FALLBACK_WRAPRESULT:
+        // the ERR form also reads where the error was raised
+        visitor.useRange(vmRegOp(OP_B(inst)), function.intOp(OP_C(inst)) == LBC_WRAPRESULT_ERR ? 4 : 1);
+        visitor.def(OP_B(inst));
+        break;
     case IrCmd::FALLBACK_GETQUALIFIED:
         visitor.use(OP_C(inst));
         visitor.use(OP_D(inst));
@@ -238,10 +245,14 @@ static void visitVmRegDefsUses(T& visitor, IrFunction& function, IrInst& inst)
         visitor.use(OP_C(inst));
         visitor.def(OP_B(inst));
         break;
-    case IrCmd::FALLBACK_WRAPRESULT:
-        // the ERR form also reads where the error was raised
-        visitor.useRange(vmRegOp(OP_B(inst)), function.intOp(OP_C(inst)) == LBC_WRAPRESULT_ERR ? 4 : 1);
-        visitor.def(OP_B(inst));
+    case IrCmd::FALLBACK_TABLEBUNDLE:
+        visitor.use(OP_C(inst));
+        visitor.useRange(vmRegOp(OP_D(inst)), function.intOp(OP_E(inst)));
+
+        if (function.intOp(OP_F(inst)) != 0)
+            visitor.use(OP_B(inst));
+        else
+            visitor.def(OP_B(inst));
         break;
     case IrCmd::FALLBACK_NEWCLASSMEMBER:
         visitor.use(OP_B(inst));
@@ -269,6 +280,12 @@ static void visitVmRegDefsUses(T& visitor, IrFunction& function, IrInst& inst)
                 visitor.useRange(ra + 3, count);
 
             visitor.defRange(ra, 3);
+        }
+        else if (form == LBC_NEWOBJECT_APPLY)
+        {
+            // finishes the instance already in ra, reading its argument from the register above
+            visitor.useRange(ra, 1 + count);
+            visitor.def(OP_B(inst));
         }
         else
         {

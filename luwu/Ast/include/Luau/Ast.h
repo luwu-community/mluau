@@ -251,6 +251,8 @@ public:
         Lint,
         // Luwu: `@nodiscard` or `@[nodiscard("reason")]` on a function: calling it without using its result is a mistake
         Nodiscard,
+        // Luwu: `@[inline(reason)]`, which asks the compiler to inline every call it can (DebugLuwuEncourageInline)
+        Inline,
         Unknown
     };
 
@@ -347,6 +349,8 @@ public:
     // Luwu Attributes (rfcs/attributes-for-types-variables-fields-classes.md): written as a `--@[...]` comment. It means
     // the same as an attribute in the code, but the pretty printer doesn't print it.
     bool comment = false;
+    // Written as `@name` instead of in a `@[...]` list. Only the list form takes arguments.
+    bool bare = false;
 };
 
 // The `@deprecated` attribute's payload, or nullopt when the array has no `@deprecated`.
@@ -363,10 +367,17 @@ struct AttributeInfo
     // The record fields the attribute takes as `@[name { field = ... }]`, ending in nullptr; nullptr for an
     // attribute that takes no arguments.
     const char* const* argumentFields;
+    // The arguments the attribute can't be written without, as an editor inserts them after its name
+    // (`("reason")`); nullptr when it needs none.
+    const char* requiredArguments;
 };
 
 // Every attribute this build accepts, including flag-gated ones whose flag is currently on.
 std::vector<AttributeInfo> getKnownAttributes();
+
+std::string toString(AstAttr::Type type);
+template<>
+std::optional<AstAttr::Type> fromString<AstAttr::Type>(std::string_view s);
 
 class AstExpr : public AstNode
 {
@@ -534,6 +545,10 @@ public:
     QuoteStyle quoteStyle;
 };
 
+std::string toString(AstExprConstantString::QuoteStyle style);
+template<>
+std::optional<AstExprConstantString::QuoteStyle> fromString<AstExprConstantString::QuoteStyle>(std::string_view s);
+
 class AstExprLocal : public AstExpr
 {
 public:
@@ -600,12 +615,9 @@ public:
     Location argLocation;
     // Luwu bundles: `.(a, b)`, which the parser writes as `bundle.pack(a, b)` (Parser::parseDotPositional)
     bool fromDotPositional = false;
-    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a call the parser wrote for a type test (`x is Point`
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a call the parser wrote for a pattern (`x is Point`
     // is `class.isinstance(x, Point)`), not one in the code. Editor features that show a call's parameters skip it.
-    bool fromTypeTest = false;
-    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the `{...}` or `(...)` after the type test's class (`x is Point {x, y}`), kept even with no fields yet so
-    // autocomplete can offer the class's fields there
-    const AstDestructurePattern* typeTestPattern = nullptr;
+    bool fromPattern = false;
 };
 
 class AstExprIndexName : public AstExpr
@@ -735,6 +747,10 @@ public:
     AstArray<Item> items;
 };
 
+std::string toString(AstExprTable::Item::Kind kind);
+template<>
+std::optional<AstExprTable::Item::Kind> fromString<AstExprTable::Item::Kind>(std::string_view s);
+
 class AstExprUnary : public AstExpr
 {
 public:
@@ -756,6 +772,8 @@ public:
 };
 
 std::string toString(AstExprUnary::Op op);
+template<>
+std::optional<AstExprUnary::Op> fromString<AstExprUnary::Op>(std::string_view s);
 
 class AstExprBinary : public AstExpr
 {
@@ -797,6 +815,8 @@ public:
 };
 
 std::string toString(AstExprBinary::Op op);
+template<>
+std::optional<AstExprBinary::Op> fromString<AstExprBinary::Op>(std::string_view s);
 
 class AstExprTypeAssertion : public AstExpr
 {
@@ -829,8 +849,13 @@ struct AstIfClause
     // The `when` before this clause. Unset on the first clause.
     std::optional<Location> whenLocation;
     // False for a binding that holds its value whatever it is, with no truthiness test: a field a pattern binds after
-    // a type test (`x is Point {x, y}`), which has to bind even when the field is `false`.
+    // a pattern (`x is Point {x, y}`), which has to bind even when the field is `false`.
     bool tested = true;
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): made by a pattern rather than written: a hidden local
+    // holding the matched value, a name the pattern binds, or a `case` arm's name. The type checker and the compiler see
+    // it like any clause. An AstVisitor skips it unless it asks for it (visitsPatternClauses): the AstExprMatchPattern or
+    // AstMatchArm holds what was written.
+    bool fromPattern = false;
 };
 
 class AstExprIfElse : public AstExpr
@@ -1190,6 +1215,9 @@ struct AstDestructurePattern
     // `.[a, b]`: the fields are elements read by index, `value[1]` on, and have no keys.
     bool array = false;
     AstArray<AstDestructureField> fields{nullptr, 0};
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the pattern the bound value matches in a pattern that
+    // tests its fields (`Cat(name is string)`), or null
+    class AstExprMatchPattern* test = nullptr;
 };
 
 struct AstDestructureField
@@ -1250,6 +1278,10 @@ public:
     {
         return destructuredFrom || destructuredFromLoop;
     }
+
+    // Luwu Export Values (rfcs/export-values.md): set for `export local x = v`, a parse error that still declares a const
+    // export. `keywordLocation` is then the `local` keyword.
+    bool exportWrittenAsLocal = false;
 };
 
 class AstStatFor : public AstStat
@@ -1606,6 +1638,10 @@ enum class AstTableAccess
     ReadWrite = 0b11,
 };
 
+std::string toString(AstTableAccess access);
+template<>
+std::optional<AstTableAccess> fromString<AstTableAccess>(std::string_view s);
+
 struct AstDeclaredExternTypeProperty
 {
     AstName name;
@@ -1784,6 +1820,11 @@ public:
     std::optional<Location> needsLocation = std::nullopt;
     // Luwu Traits (rfcs/classes/traits.md): a trait's `needs` list; entries never have trait arguments. Always empty on a class.
     AstArray<AstClassTraitRef> needs{nullptr, 0};
+    // Luwu Classes (rfcs/classes): upstream Luau's `open class` and `extends Base`, which are parse errors since Luwu has
+    // no inheritance. They're kept so tools can rewrite upstream classes. Null and nullopt when not written.
+    std::optional<Location> openLocation = std::nullopt;
+    std::optional<Location> extendsLocation = std::nullopt;
+    AstExpr* extendsBase = nullptr;
 };
 
 // Luwu Declare Statements (rfcs/declare-statements.md): `[export] declare class`, a class that exists at runtime but
@@ -2041,8 +2082,8 @@ public:
     bool shorthand = false;
 
     // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): made by `x is A | B` to read a value that isn't a
-    // local once (see Parser::makePatternTest). The body is that value's hidden `local` and a `give` of the test.
-    bool fromTypeTest = false;
+    // local once (see Parser::makePatternCheck). The body is that value's hidden `local` and a `give` of the test.
+    bool fromPattern = false;
 
     // Does every path leave it with `return`, `break` or `continue`, so it never has a value? True for the shorthand,
     // and for a `do` expression with no `give` of its own.
@@ -2051,6 +2092,84 @@ public:
     // The `give`s that give this expression's value, the shorthand's included: not those of a nested `do` expression
     // or function
     std::vector<class AstStatGive*> gives() const;
+};
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): one alternative of a pattern, the alternatives joined by
+// `|` after `is` or `implements`
+struct AstPatternAlternative
+{
+    enum Kind
+    {
+        // `nil`, `none` or a literal, compared with `==`
+        Value,
+        // A primitive tag (`string`, `integer`, `object`): what `type()` gives
+        Tag,
+        // A name or a dotted path: the value is an instance of it when it holds a class, and equal to it otherwise
+        Class,
+        // A trait after `implements`: the value's class implements it
+        Trait,
+        // Luwu bundles: `.(a, b)`, a bundle of exactly that many values (or at least that many, ending in `..`)
+        Bundle,
+    };
+
+    Kind kind = Value;
+    Location location;
+    // The literal, `nil` or `none` for a Value, the class or trait as written for a Class or Trait, null for a Tag
+    AstExpr* operand = nullptr;
+    // A Tag's name
+    AstName tag;
+    // Luwu builtin classes: the Tag is what `typeof` names an object of a builtin class (`bundle`, `vec`), not `type`
+    bool tagIsTypeof = false;
+    // Luwu Destructuring (rfcs/destructuring.md): what the alternative binds, as written (`Cat(name)`, `Pod {x}`,
+    // `vector {x, y, z}`, `.(a, b)`), or null. It's kept with no fields yet too, so autocomplete can offer them.
+    const AstDestructurePattern* fields = nullptr;
+    // Luwu bundles: a Bundle ending in `..` matches a bundle of at least as many values as it has elements, and
+    // `.. as rest` binds the values after them
+    bool openEnded = false;
+    AstLocal* rest = nullptr;
+};
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `value is <pattern>`, `value is not <pattern>` or
+// `value implements <traits>`. A `case` arm's pattern has no value: it matches the `match`'s subject.
+class AstExprMatchPattern : public AstExpr
+{
+public:
+    LUAU_RTTI(AstExprMatchPattern)
+
+    AstExprMatchPattern(
+        const Location& location,
+        AstExpr* value,
+        AstLocal* subject,
+        const Location& keywordLocation,
+        bool negated,
+        bool implements,
+        const AstArray<AstPatternAlternative>& alternatives
+    );
+
+    // The value and each alternative's operand, or `checked` for a visitor that asks for it (visitsPatternChecks)
+    void visit(AstVisitor* visitor) override;
+
+    // The matched value as written, or null in a `case` arm
+    AstExpr* value;
+    // The local holding the matched value: a `case` arm's `match` subject, or a hidden local a pattern that binds reads its
+    // value into. Null when `value` is read directly.
+    AstLocal* subject;
+    // The `is`, `is not` or `implements`
+    Location keywordLocation;
+    // `is not`
+    bool negated;
+    // `implements`: every alternative is a Trait
+    bool implements;
+    AstArray<AstPatternAlternative> alternatives;
+    // Luwu Destructuring (rfcs/destructuring.md): the patterns nested in its fields (`Cat(name is string)`) are clauses of
+    // their own after it, so matching it only tests each alternative itself. Otherwise matching it tests them too.
+    bool nestedPatternsAreClauses = false;
+
+    // What the pattern means as plain code, which the type checker checks: `x is 1 | string` is
+    // `x == 1 or type(x) == "string"`, and `x is Point` is `class.isinstance(x, Point)`. The value is read in it once for
+    // each alternative, and those reads aren't in the source, so only the type checker's visitors visit it
+    // (AstVisitor::visitsPatternChecks).
+    AstExpr* checked = nullptr;
 };
 
 // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the value a `match` tests, from its header
@@ -2088,6 +2207,9 @@ struct AstMatchArm
     std::optional<Location> thenLocation;
     // `case name` with no pattern and no `when`, which matches every value like `else`
     bool catchAll = false;
+    // The name in `case name ...`, which holds the subject for the arm, or null. Its declaration is a clause that
+    // AstVisitor skips (AstIfClause::fromPattern).
+    AstLocal* binding = nullptr;
     // The arm's value in an AstExprMatch, null in an AstStatMatch
     AstExpr* value = nullptr;
     // The arm's block in an AstStatMatch, null in an AstExprMatch
@@ -2130,6 +2252,8 @@ public:
     AstMatchSubject subject;
     AstArray<AstMatchArm> arms;
     bool hasEnd;
+    // The `end` that closes arms indented under `match`, when a second `end` at the `match`'s column closes the statement
+    std::optional<Location> armsEndLocation;
 };
 
 // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `expr` without the parentheses around it.
@@ -2254,7 +2378,7 @@ public:
 
     void visit(AstVisitor* visitor) override;
 
-    const AstArray<char> value;
+    AstArray<char> value;
 };
 
 class AstTypeGroup : public AstType
@@ -2318,6 +2442,22 @@ class AstVisitor
 {
 public:
     virtual ~AstVisitor() {}
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): does this visitor visit what a pattern means as plain
+    // code (AstExprMatchPattern::checked) instead of the pattern as written? The type checker's passes do, since that's
+    // what they check. Tools that work on the source and the compiler, which compiles the pattern itself, don't.
+    virtual bool visitsPatternChecks() const
+    {
+        return false;
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): does this visitor visit the clauses a pattern makes
+    // (AstIfClause::fromPattern)? Tools that work on the source don't. The type checker's passes and the compiler's
+    // analyses of locals do, so every local they see has its declaration.
+    virtual bool visitsPatternClauses() const
+    {
+        return visitsPatternChecks();
+    }
 
     virtual bool visit(class AstNode*)
     {
@@ -2434,6 +2574,10 @@ public:
         return visit(static_cast<AstExpr*>(node));
     }
     virtual bool visit(class AstExprMatch* node)
+    {
+        return visit(static_cast<AstExpr*>(node));
+    }
+    virtual bool visit(class AstExprMatchPattern* node)
     {
         return visit(static_cast<AstExpr*>(node));
     }

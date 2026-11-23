@@ -94,7 +94,7 @@ struct LintWarning
         Code_Any = 59,
         Code_AnyCast = 60,                 // `x :: any` without a comment saying why
         Code_AnyAnnotation = 61,           // `x: any` on a parameter, local or property, which `unknown` would type safely
-        Code_LuwuOnlyApi = 62,             // Luwu: a Luwu-only library function (`table.drop`) used in a `.luau` or `.lua` file
+        Code_LuwuOnlyApi = 62,             // Luwu: a Luwu-only library function (`table.discard`) used in a `.luau` or `.lua` file
         Code_DuplicateKey = 63,            // Luwu: a key or index repeated in a table literal (part of TableLiteral)
         Code_DuplicateProperty = 64,       // Luwu: a property declared twice in a table type (part of TableLiteral)
         Code_DuplicateReadWrite = 65,      // Luwu: a table type property given its read or write type twice (part of TableLiteral)
@@ -119,6 +119,7 @@ struct LintWarning
         Code_StringOperations = 83,        // Luwu: a string library call that `""` makes pointless or wrong (`s:startswith("")`)
         Code_UncaughtErrors = 84,          // Luwu: a call to a function with error hints outside a `try`. Off by default.
         Code_ConfusingGuard = 85,          // Luwu: `x and return`, a long or chained guard statement, or one returning several values
+        Code_IsComparison = 86,            // Luwu: `x is "meow"`, a pattern with one value that reads better as `x == "meow"`
 
         Code__Count
     };
@@ -254,6 +255,7 @@ inline constexpr const char* kWarningNames[] = {
     "StringOperations",
     "UncaughtErrors",
     "ConfusingGuard",
+    "IsComparison",
 };
 // clang-format on
 

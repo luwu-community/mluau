@@ -1300,6 +1300,7 @@ static void markDeadStoresInInst(RemoveDeadStoreState& state, IrBuilder& build, 
     case IrCmd::FALLBACK_GETPOSITIONAL:
     case IrCmd::FALLBACK_PUSH:
     case IrCmd::FALLBACK_POP:
+    case IrCmd::FALLBACK_TABLEBUNDLE:
         if (state.hasGcoToClear)
             state.flushGcoRegs();
 
@@ -1354,6 +1355,7 @@ static void markDeadStoresInInst(RemoveDeadStoreState& state, IrBuilder& build, 
     case IrCmd::FALLBACK_GETPOSITIONAL:
     case IrCmd::FALLBACK_PUSH:
     case IrCmd::FALLBACK_POP:
+    case IrCmd::FALLBACK_TABLEBUNDLE:
         // CALL directly executes a Luau function on the same native stack frame
     case IrCmd::CALL:
         // These instructions use lowering that is not aware of register allocator and demand no active values to exist

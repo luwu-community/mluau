@@ -23,8 +23,12 @@ pub static ENABLED_FFLAGS: &[&str] = &[
     "LuwuManagedReferences2",
     "LuwuPcallMulti",
     "LuwuStringExtensions",
+    // string.format and interpolated strings compile to a fastcall (LBF_STRING_FORMAT)
+    "LuwuStringFormatFastcall",
+    // the @[inline(reason)] attribute: parsed, and honored by the compiler
+    "DebugLuwuEncourageInline",
     "LuwuBufferBatched",
-    "LuwuBufferMemcmp",
+    "DebugLuwuBufferComparison",
     // destructuring; positional patterns `.(a, b)` compile to LOP_GETPOSITIONAL only with it on
     "LuwuDestructuring",
     // the `collections` library; it also needs LuwuClasses and LuwuNonePrimitive, and stays closed without them

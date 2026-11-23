@@ -249,9 +249,6 @@ typedef struct global_State
     TString* ttname[LUA_T_COUNT]; // names for basic types, as returned by tostring()/error messages (LUA_TSYMNONE reports as "none")
     TString* ttypename[LUA_T_COUNT]; // names for basic types, as returned by type() (matches luaT_typenames verbatim)
     TString* traittypename;          // Luwu Traits (rfcs/classes/traits.md): "trait", which type() and typeof() give for a trait
-    // Luwu Traits (rfcs/classes/traits.md): the C function LOP_INITTRAITS calls to run an object's trait initializers. One per
-    // state, made with it and marked as a root, so construction never allocates it.
-    Closure* traitinitrunner;
     // Luwu builtin classes: each builtin class once its library has built it, NULL until then. A GC root, so a class
     // lives as long as the state even when no library table holds it. Native methods check `self` against these.
     struct LuauClass* builtinclasses[LUWU_BUILTIN__COUNT];
@@ -288,6 +285,10 @@ typedef struct global_State
     void (*udatagc[LUA_UTAG_LIMIT])(lua_State*, void*); // for each userdata tag, a gc callback to be called immediately before freeing memory
     lua_UserdataMark udatamark[LUA_UTAG_LIMIT]; // gc callbacks allowing the embedder to mark underlying native objects for the given userdata
     LuaTable* udatamt[LUA_UTAG_LIMIT]; // metatables for tagged userdata
+
+    // Luwu Native Classes (rfcs/native-classes.md): for each native data tag, the function that runs when an object
+    // carrying such data is freed
+    lua_Destructor objectdtors[LUA_OTAG_LIMIT];
 
     TValue weakregistry; // backing table for lua_weakref/lua_weakunref/lua_getweakref
     int weakregistryfree; // next free slot in weakregistry

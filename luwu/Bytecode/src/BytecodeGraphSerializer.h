@@ -534,6 +534,18 @@ struct BytecodeGraphSerializer
             );
             break;
 
+        case LOP_JUMPXTYPE:
+            recordJump(insn, 2);
+            bcb.emitAD(LOP_JUMPXTYPE, getRegInput(insn, 0), 0);
+            bcb.emitAux(static_cast<uint32_t>(getImmBool(insn, 1)) << 31 | static_cast<uint32_t>(getImmInt(insn, 3)));
+            break;
+
+        case LOP_JUMPXMATCH:
+            recordJump(insn, 2);
+            bcb.emitAD(LOP_JUMPXMATCH, getRegInput(insn, 0), 0);
+            bcb.emitAux(static_cast<uint32_t>(getImmBool(insn, 1)) << 31 | getRegInput(insn, 3));
+            break;
+
         case LOP_IDIV:
             bcb.emitABC(LOP_IDIV, getRegister(insnOp), getRegInput(insn, 0), getRegInput(insn, 1));
             break;
@@ -544,6 +556,14 @@ struct BytecodeGraphSerializer
 
         case LOP_NEWCLASSMEMBER:
             LUAU_ASSERT(FFlag::LuwuClasses);
+            // Luwu Classes (rfcs/classes): the constructor's form is an immediate where a member's name would be
+            if (insn.ops[2].kind == BcOpKind::Imm)
+            {
+                bcb.emitABC(LOP_NEWCLASSMEMBER, getRegInput(insn, 0), uint8_t(getImmInt(insn, 2)), getRegInput(insn, 1));
+                bcb.emitAux(0);
+                break;
+            }
+
             bcb.emitABC(LOP_NEWCLASSMEMBER, getRegInput(insn, 0), 0, getRegInput(insn, 1));
             bcb.emitAux(getVmConstInputAux(insn, 2));
             break;
@@ -586,11 +606,14 @@ struct BytecodeGraphSerializer
             bcb.emitAux(getImmInt(insn, 2));
             break;
 
+        // Luwu: BytecodeGraphParser doesn't build a graph for a function using these
         case LOP_INITTRAITS:
-            // the runner's register is the one below the object's
-            recordJump(insn, 1);
-            bcb.emitAD(LOP_INITTRAITS, uint8_t(getRegInput(insn, 0) - 1), 0);
-            break;
+        case LOP_GETTABLEBUNDLE:
+        case LOP_SETTABLEBUNDLE:
+        // Luwu try expressions: the parser refuses functions with protected ranges
+        case LOP_WRAPRESULT:
+        case LOP_RESULTGET:
+            LUAU_UNREACHABLE();
 
         case LOP_GETPOSITIONAL:
             bcb.emitABC(LOP_GETPOSITIONAL, getRegister(insnOp), getRegInput(insn, 0), getImmInt(insn, 1));
@@ -612,11 +635,6 @@ struct BytecodeGraphSerializer
         case LOP_PRESIZETABLE:
             bcb.emitABC(LOP_PRESIZETABLE, getRegInput(insn, 0), getRegInput(insn, 1), uint8_t(getImmInt(insn, 2)));
             break;
-
-        case LOP_WRAPRESULT:
-        case LOP_RESULTGET:
-            // Luwu try expressions: the parser refuses functions with protected ranges
-            LUAU_UNREACHABLE();
 
         case LOP__COUNT:
             LUAU_UNREACHABLE();

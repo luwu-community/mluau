@@ -180,7 +180,7 @@ struct TypeChecker2
     // Returns whether `subjectType` is one; only types that are so without normalizing are recognized.
     bool reportImproperUse(AstExpr* subject, TypeId subjectType, ImproperUse use);
     void reportUnreachableUse(AstExpr* subject, ImproperUse use);
-    void checkImpossibleTypeTest(AstExprCall* call);
+    void checkImpossiblePattern(AstExprCall* call);
     // Why the local read at `use` is `never`, when something the reader wrote says so; nullopt when it may be a type
     // checker bug
     std::optional<UnreachableCodeUse::Reason> unreachableReason(const AstExprLocal* use);
@@ -367,6 +367,7 @@ private:
     // Luwu literal types: each argument of a call, against its parameter's literal check or literal fields
     void checkLiteralArguments(AstExprCall* call, const FunctionType* fty, size_t selfOffset, NotNull<Scope> scope);
     void visit(AstExprCall* call);
+    void checkRaisedError(AstExprCall* call);
     std::optional<TypeId> tryStripUnionFromNil(TypeId ty) const;
     TypeId stripFromNilAndReport(TypeId ty, const Location& location);
     TypeId stripWeakUnknown(TypeId ty) const;

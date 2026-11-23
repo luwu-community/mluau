@@ -3,6 +3,7 @@
 
 #include "Luau/Ast.h"
 #include "Luau/AstQuery.h"
+#include "Luau/BuiltinDefinitions.h"
 #include "Luau/Common.h"
 #include "Luau/Def.h"
 #include "Luau/Error.h"
@@ -632,6 +633,9 @@ struct NonStrictTypeChecker
             return visit(e);
         else if (auto e = expr->as<AstExprMatch>())
             return visitMatch(e->subject, e->arms);
+        // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a pattern is checked as what it means in plain code
+        else if (auto e = expr->as<AstExprMatchPattern>())
+            return visit(e->checked, ValueContext::RValue);
         else if (auto e = expr->as<AstExprTableComprehension>())
             return visit(e);
         else if (auto e = expr->as<AstExprPop>())
@@ -719,6 +723,11 @@ struct NonStrictTypeChecker
             visit(arg, ValueContext::RValue);
 
         NonStrictContext fresh{};
+
+        // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the `class.isinstance` call `x is LIMIT` is
+        // checked as can't fail. A name that doesn't hold a class is compared with `==`.
+        if (isPatternIsinstance(*call))
+            return fresh;
         TypeId* originalCallTy = module->astOriginalCallTypes.find(call->func);
         if (!originalCallTy)
             return fresh;

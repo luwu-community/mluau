@@ -3,6 +3,7 @@
 
 #include "Luau/Ast.h"
 #include "Luau/BytecodeBuilder.h"
+#include "Luau/BytecodeUtils.h"
 #include "Luau/Common.h"
 #include "Luau/Parser.h"
 #include "Luau/InsertionOrderedMap.h"
@@ -48,9 +49,12 @@ LUAU_FASTINTVARIABLE(LuwuCompileInlineNativeCallCost, 16)
 LUAU_FASTINTVARIABLE(LuwuCompileInlineFewCallSites, 6)
 // Luwu: the most instructions inlining may add to one function, however the thresholds and the only-call-site rule are
 // set. It keeps bytecode size bounded: a module grows by at most this much per function. The cost model can't do that
-// on its own because it saturates at 127 and doesn't measure real size. The benchmarks, the classes benches, seal and
-// chimera never spend more than 2048.
+// on its own because it saturates at 127 and doesn't measure real size. A lower budget refuses inlines native code gains
+// from: at 512, bench/tests' sha3_bit32 runs 2.7x slower native.
 LUAU_FASTINTVARIABLE(LuwuCompileInlineBudget, 4096)
+// Luwu: the most a function marked @[inline(reason)] may weigh at its call sites, in instructions (see
+// encouragedInlineSize). It replaces the cost model's threshold for such a function.
+LUAU_FASTINTVARIABLE(LuwuCompileEncouragedInlineLimit, 256)
 
 LUAU_FASTFLAGVARIABLE(LuauCompileIifeInline)
 LUAU_FASTFLAG(LuwuDoExpr)
@@ -59,10 +63,12 @@ LUAU_FASTFLAG(DebugLuwuTryExpressions)
 LUAU_FASTFLAG(LuauIntegerType2)
 LUAU_FASTFLAGVARIABLE(LuauCompileStringInterpTargetTop)
 LUAU_FASTFLAG(LuwuNoinlineAttribute)
+LUAU_FASTFLAG(DebugLuwuEncourageInline)
 LUAU_FASTFLAGVARIABLE(LuauEmitCallFeedback)
 LUAU_FASTFLAG(LuwuDefaultArguments)
 LUAU_FASTFLAG(DebugLuwuBuiltinClasses)
 LUAU_FASTFLAG(DebugLuwuBundles)
+LUAU_FASTFLAG(LuwuStringFormatFastcall)
 LUAU_FASTFLAGVARIABLE(LuwuExportedClassIsNilWorkaround)
 LUAU_FASTFLAG(LuwuStringExtensions)
 
@@ -104,6 +110,7 @@ static const uint32_t kMaxInstructionCount = 1'000'000'000;
 static const uint8_t kInvalidReg = 255;
 
 static const uint32_t kDefaultAllocPc = ~0u;
+static const size_t kNoClosureEdge = ~size_t(0);
 
 void escapeAndAppend(std::string& buffer, const char* str, size_t len)
 {
@@ -256,6 +263,8 @@ struct Compiler
         , traitInitFn(nullptr)
         , traitNeedsFn(nullptr)
         , classImplementsFn(nullptr)
+        , classConstructors(nullptr)
+        , constructorClass(nullptr)
         , traitInitHosts(nullptr)
         , classPrimaryInitCost(nullptr)
         , classPodConstDefaults(nullptr)
@@ -291,7 +300,12 @@ struct Compiler
     {
         Local* l = locals.find(local);
 
-        return l && l->allocated ? l->reg : -1;
+        if (!l || !l->allocated)
+            return -1;
+
+        // Luwu: markUnreadClosures finds the local functions whose closures nothing reads
+        l->read = true;
+        return l->reg;
     }
 
     uint8_t getUpval(AstLocal* local)
@@ -578,6 +592,7 @@ struct Compiler
 
         bool self = func->self != 0;
         uint32_t fid = bytecode.beginFunction(uint8_t(self + func->args.size), func->vararg);
+        currentFunctionId = fid;
 
         setDebugLine(func);
 
@@ -663,6 +678,13 @@ struct Compiler
 
         if (traitInitClass && traitInitAfterArgDefaults)
             compileTraitInit(*traitInitClass, args);
+
+        // Luwu Classes (rfcs/classes): a class's constructor has an empty body in the tree; its construction is emitted here
+        if (FFlag::LuwuClasses)
+        {
+            if (AstStatClass* const* constructed = constructorClass.find(func))
+                compileClassConstructor(*constructed);
+        }
 
         AstStatBlock* stat = func->body;
 
@@ -869,16 +891,55 @@ struct Compiler
         if (fi && fi->returnsOne)
             return false;
 
+        // Luwu Classes (rfcs/classes): a class's static function and a method on a proven receiver are known the same way
+        if (FFlag::LuwuClasses)
+        {
+            AstExprFunction* member = knownClassCallee(expr);
+            Function* mfi = member ? functions.find(member) : nullptr;
+            if (mfi && mfi->returnsOne)
+                return false;
+        }
+
         // unrecognized call, so we conservatively assume multret
         return true;
     }
 
+    // Luwu Classes (rfcs/classes): the function a `Cls.f(...)` or `obj:m(...)` call always runs, or null. A class binding
+    // is const and its members can't be replaced. Before the declaration runs `Cls.f` raises, so its results don't
+    // matter. A method counts only on a proven receiver: an annotation can lie about the object's class.
+    AstExprFunction* knownClassCallee(AstExprCall* expr)
+    {
+        AstExprIndexName* idx = expr->func->as<AstExprIndexName>();
+        if (!idx)
+            return nullptr;
+
+        if (!expr->self)
+        {
+            AstStatClass* cls = classBindingOf(idx->expr);
+            return cls ? findStaticFunction(cls, idx->index) : nullptr;
+        }
+
+        ReceiverClass receiver = resolveReceiverClass(idx->expr);
+        return receiver && receiver.proven ? findInstanceMethod(receiver.cls, idx->index) : nullptr;
+    }
+
     // note: this doesn't just clobber target (assuming it's temp), but also clobbers *all* allocated registers >= target!
     // this is important to be able to support "multret" semantics due to Lua call frame structure
-    bool compileExprTempMultRet(AstExpr* node, uint8_t target)
+    // Luwu: where a multret value is compiled, for the advice in an `@[inline]` call's error
+    enum class MultRetUse
+    {
+        Return,
+        Argument,
+        ListItem,
+    };
+    MultRetUse multRetUse = MultRetUse::Return;
+
+    bool compileExprTempMultRet(AstExpr* node, uint8_t target, MultRetUse use = MultRetUse::Return)
     {
         if (AstExprCall* expr = node->as<AstExprCall>())
         {
+            multRetUse = use;
+
             // Luwu try expressions: compiled to one value (compileTryResultMethod, compileTryResultVariantTest)
             if (isTryResultCall(expr))
             {
@@ -1104,14 +1165,127 @@ struct Compiler
         }
     }
 
+    // Luwu: `@[inline(reason)]` weighs a function's size at a third (DebugLuwuEncourageInline, encouragedInlineSize)
+    static constexpr int kEncouragedInlineFactor = 3;
+
+    // Luwu: whether `func` is marked `@[inline(reason)]`, which asks for every call the compiler can inline to be inlined
+    bool encouragesInline(AstExprFunction* func) const
+    {
+        return FFlag::DebugLuwuEncourageInline && func->hasAttribute(AstAttr::Type::Inline);
+    }
+
+    // Luwu: a call to a function marked `@[inline]` that isn't inlined is a compile error at the call, since the attribute
+    // asked for it. `because` says why, after "can't be inlined here because".
+    void refuseEncouragedInline(AstExprCall* call, AstExprFunction* func, const std::string& because)
+    {
+        if (!encouragesInline(func))
+            return;
+
+        const char* owner = nullptr;
+        char separator = 0;
+        const char* name = describeInlineTarget(func, owner, separator);
+        std::string written = owner ? format("%s%c%s", owner, separator, name) : name;
+        CompileError::raise(call->location, "'%s' is marked @[inline] but cannot be inlined here because %s", written.c_str(), because.c_str());
+    }
+
+    // Luwu: why an `@[inline]` call that passes on all its values can't be inlined, and how to keep one
+    const char* multRetRefusal() const
+    {
+        switch (multRetUse)
+        {
+        case MultRetUse::Argument:
+            return "a last argument accepts multiple values; wrap this call in parentheses, pass another argument after it, or "
+                   "otherwise truncate it to its first return value to prove this expression evaluates to exactly 1 value at "
+                   "runtime";
+        case MultRetUse::ListItem:
+            return "a table's last item accepts multiple values; wrap this call in parentheses or otherwise truncate it to its "
+                   "first return value to prove this expression evaluates to exactly 1 value at runtime";
+        case MultRetUse::Return:
+            break;
+        }
+        return "a return accepts multiple values; wrap this call in parentheses or otherwise truncate it to its first return "
+               "value to prove this expression evaluates to exactly 1 value at runtime";
+    }
+
+    // Luwu Classes (rfcs/classes): the class `func` is a static function of, or null
+    AstStatClass* staticFunctionClass(AstExprFunction* func)
+    {
+        AstStatClass* cls = FFlag::LuwuClasses ? lexicalClassOf(func) : nullptr;
+        if (!cls)
+            return nullptr;
+
+        for (const AstClassMember& member : cls->members)
+        {
+            const AstClassMethod* m = member.get_if<AstClassMethod>();
+            if (m && m->function == func)
+                return cls;
+        }
+        return nullptr;
+    }
+
+    // Luwu: how many calls of `func` the module has. A class method's are its name's method calls (`x:name()`), which
+    // also counts calls of other classes' methods of that name: never fewer than the real number.
+    unsigned encouragedCallSites(AstExprFunction* func)
+    {
+        const char* owner = nullptr;
+        char separator = 0;
+        const char* name = describeInlineTarget(func, owner, separator);
+        bool method = owner && separator == ':';
+        const unsigned* sites = method ? methodCallSites.find(names.getOrAdd(name)) : directCallSites.find(func);
+        return sites ? std::max(*sites, 1u) : 1u;
+    }
+
+    // Luwu: what inlining a function marked @[inline] at all its call sites weighs, in instructions: a third of its size
+    // (kEncouragedInlineFactor), times its copies, with each copy past the first counting two thirds. The cost model
+    // can't be used for this, since it caps every cost at 127.
+    int encouragedInlineSize(uint32_t instructionCount, unsigned callSites)
+    {
+        return int(instructionCount * (3 + 2 * (callSites - 1)) / (3 * kEncouragedInlineFactor));
+    }
+
+    void refuseEncouragedInlineTooBig(AstExprCall* call, AstExprFunction* func, uint32_t instructionCount, unsigned callSites)
+    {
+        if (callSites == 1)
+            refuseEncouragedInline(
+                call, func, format("it's too big even with %dx encouragement (%u instructions)", kEncouragedInlineFactor, instructionCount)
+            );
+        else
+            refuseEncouragedInline(
+                call,
+                func,
+                format(
+                    "it's too big to copy to its %u call sites even with %dx encouragement (%u instructions)",
+                    callSites,
+                    kEncouragedInlineFactor,
+                    instructionCount
+                )
+            );
+    }
+
+    // Luwu: why `func` never inlines, which its declaration decided (see compileFunction), so an inline of it isn't even
+    // attempted. `compiled` is false for a call inside the function's own body, before the function is finished.
+    std::string whyNeverInlined(AstExprFunction* func, bool compiled)
+    {
+        if (!compiled)
+            return "it's called inside its own body";
+        if (func->vararg)
+            return "it's variadic";
+        if (func->self)
+            return "it's declared with ':' outside a class";
+        if (getfenvUsed || setfenvUsed)
+            return "the module uses getfenv or setfenv";
+        return "it's also marked @noinline";
+    }
+
     void reportInlineTooExpensive(AstExprFunction* func, int inlinedCost, int inlineProfit)
     {
         const char* owner = nullptr;
-        const char* name = describeInlineTarget(func, owner);
+        char separator = 0;
+        const char* name = describeInlineTarget(func, owner, separator);
 
         if (owner)
             bytecode.addDebugRemark(
-                "inlining failed: %s:%s is too expensive (cost %d, profit %.2fx)", owner, name, inlinedCost, double(inlineProfit) / 100
+                "inlining failed: %s%c%s is too expensive (cost %d, profit %.2fx)", owner, separator, name, inlinedCost, double(inlineProfit) / 100
             );
         else
             bytecode.addDebugRemark("inlining failed: %s is too expensive (cost %d, profit %.2fx)", name, inlinedCost, double(inlineProfit) / 100);
@@ -1149,6 +1323,7 @@ struct Compiler
         if (regTop > 128 || fi->stackSize > 32)
         {
             bytecode.addDebugRemark("inlining failed: high register pressure");
+            refuseEncouragedInline(expr, func, "the call needs too many registers");
             return false;
         }
 
@@ -1156,6 +1331,7 @@ struct Compiler
         if (int(inlineFrames.size()) >= depthLimit)
         {
             bytecode.addDebugRemark("inlining failed: too many inlined frames");
+            refuseEncouragedInline(expr, func, "the call is nested in too many inlined calls");
             return false;
         }
 
@@ -1164,6 +1340,7 @@ struct Compiler
             if (frame.func == func)
             {
                 bytecode.addDebugRemark("inlining failed: can't inline recursive calls");
+                refuseEncouragedInline(expr, func, "it's called inside its own body");
                 return false;
             }
 
@@ -1177,6 +1354,7 @@ struct Compiler
             functionContainsNestedFunctions(func))
         {
             bytecode.addDebugRemark("inlining failed: nested function would change class ownership");
+            refuseEncouragedInline(expr, func, "a function inside it would get another class's private access");
             return false;
         }
 
@@ -1187,6 +1365,7 @@ struct Compiler
             if (AstStatClass* initClass = classOfInit(currentFunction); initClass && bodyMayWriteConstMember(func, initClass))
             {
                 bytecode.addDebugRemark("inlining failed: body may write a const field of %s", initClass->name->name.value);
+                refuseEncouragedInline(expr, func, format("it may write a const field of %s inside %s's __init", initClass->name->name.value, initClass->name->name.value));
                 return false;
             }
         }
@@ -1198,6 +1377,7 @@ struct Compiler
         if (multRet)
         {
             bytecode.addDebugRemark("inlining failed: can't convert fixed returns to multret");
+            refuseEncouragedInline(expr, func, multRetRefusal());
             return false;
         }
 
@@ -1240,37 +1420,47 @@ struct Compiler
 
         // Luwu: fewer call sites raise the threshold of a loop-free function (LuwuCompileInlineFewCallSites). A loop in
         // the body does enough work per call that the call itself costs little next to it, and a call that runs once
-        // saves nothing worth a bigger body.
+        // saves nothing worth a bigger body. The count is of calls in the source, so it only holds where the call is
+        // compiled once: a call in a body inlined at two sites makes two copies of the callee.
         const unsigned* callSites = directCallSites.find(func);
         bool fewCallSites = callSites && *callSites > 0 && int(*callSites) < FInt::LuwuCompileInlineFewCallSites;
-        if (fewCallSites && !fi->hasLoops && !callRunsOnce())
+        if (fewCallSites && !fi->hasLoops && !callRunsOnce() && callCompiledOnce())
             threshold = threshold * FInt::LuwuCompileInlineFewCallSites / int(*callSites);
 
         // Luwu: a function with one call site inlines whatever it costs (isOnlyCallSite). Upstream inlines past the cost
         // only an immediately called function expression.
         bool onlyCallSite = isOnlyCallSite(func);
 
+        // Luwu: a function marked @[inline] is weighed by its size at all its call sites instead of by the cost model
+        bool encouraged = encouragesInline(func);
+        unsigned encouragedSites = encouraged ? encouragedCallSites(func) : 0;
+        bool overLimit = encouraged ? encouragedInlineSize(fi->instructionCount, encouragedSites) > FInt::LuwuCompileEncouragedInlineLimit
+                                    : inlinedCost > threshold;
+
         if (FFlag::LuauCompileIifeInline)
         {
             bool isIife = unwrapExprOfType<AstExprFunction>(expr->func) != nullptr;
 
-            if (inlinedCost > threshold && !isIife && !onlyCallSite)
+            if (overLimit && !isIife && !onlyCallSite)
             {
                 reportInlineTooExpensive(func, inlinedCost, inlineProfit);
+                refuseEncouragedInlineTooBig(expr, func, fi->instructionCount, encouragedSites);
                 return false;
             }
         }
         else
         {
-            if (inlinedCost > threshold && !onlyCallSite)
+            if (overLimit && !onlyCallSite)
             {
                 reportInlineTooExpensive(func, inlinedCost, inlineProfit);
+                refuseEncouragedInlineTooBig(expr, func, fi->instructionCount, encouragedSites);
                 return false;
             }
         }
 
         const char* inlinedOwner = nullptr;
-        const char* inlinedName = describeInlineTarget(func, inlinedOwner);
+        char inlinedSeparator = 0;
+        const char* inlinedName = describeInlineTarget(func, inlinedOwner, inlinedSeparator);
 
         // Luwu: the instructions inlining has added to this function so far, counting an inline still being compiled
         uint32_t spent = inlinedInstructions;
@@ -1285,18 +1475,32 @@ struct Compiler
                 spent,
                 FInt::LuwuCompileInlineBudget.value
             );
+            refuseEncouragedInline(expr, func, "it would pass the inlining budget of the function it's called in");
             return false;
         }
 
-        if (onlyCallSite && inlinedCost > threshold)
+        if (onlyCallSite && overLimit)
             bytecode.addDebugRemark("inlining past the cost model: the only call site of a function (cost %d)", inlinedCost);
+
+        // Luwu: a call @[inline] decided says so, and whether the cost model would have inlined it anyway
+        if (encouraged && bytecode.needsDebugRemarks())
+        {
+            std::string written = inlinedOwner ? format("%s%c%s", inlinedOwner, inlinedSeparator, inlinedName) : inlinedName;
+            if (inlinedCost <= threshold || onlyCallSite)
+                bytecode.addDebugRemark("inlining forced by @inline: %s (it would have inlined without it)", written.c_str());
+            else
+                bytecode.addDebugRemark(
+                    "inlining forced by @inline: %s (without it, cost %d is over the threshold of %d)", written.c_str(), inlinedCost, threshold
+                );
+        }
 
         // Luwu Classes: a method call's remark says how its receiver's class was known, `proven` or `trusted` (from an
         // annotation under `--!trust`), since only a trusted one turns a wrong annotation into a runtime error
         if (inlinedOwner && receiverKnownBy)
             bytecode.addDebugRemark(
-                "inlining succeeded: %s:%s (cost %d, profit %.2fx, depth %d, %s)",
+                "inlining succeeded: %s%c%s (cost %d, profit %.2fx, depth %d, %s)",
                 inlinedOwner,
+                inlinedSeparator,
                 inlinedName,
                 inlinedCost,
                 double(inlineProfit) / 100,
@@ -1305,8 +1509,9 @@ struct Compiler
             );
         else if (inlinedOwner)
             bytecode.addDebugRemark(
-                "inlining succeeded: %s:%s (cost %d, profit %.2fx, depth %d)",
+                "inlining succeeded: %s%c%s (cost %d, profit %.2fx, depth %d)",
                 inlinedOwner,
+                inlinedSeparator,
                 inlinedName,
                 inlinedCost,
                 double(inlineProfit) / 100,
@@ -1325,6 +1530,7 @@ struct Compiler
         if (outermost)
             outermostInlineStartPc = bytecode.getDebugPC();
 
+        fi->inlined = true;
         compileInlinedCall(expr, func, target, targetCount, selfExpr, onlyCallSite);
 
         if (outermost)
@@ -1334,22 +1540,40 @@ struct Compiler
 
     // Luwu: whether this call is the only time `func`'s body gets compiled into a caller. The function has one direct
     // call in the module, and that call isn't compiled more than once: not in an unrolled loop and not in a body
-    // inlined at several call sites. A class field's default that calls a function getFunctionExpr finds names a local
-    // besides the constructor's parameters. Such a default stays in `__init` instead of every construction site.
+    // inlined at several call sites. The call must also be the only use of the function: it calls a local that isn't
+    // exported and that nothing else reads, so the inlined body replaces the function (stubUncalledFunctions) instead
+    // of copying it. A class field's default that calls a function getFunctionExpr finds names a local besides the
+    // constructor's parameters. Such a default stays in `__init` instead of every construction site.
     // A `@native` function called from code that isn't is left to the cost model: inlining would run its body
     // interpreted. So is a call in top-level code outside any loop. That call runs once and saves no meaningful call
     // overhead. A loop-free chunk also runs interpreted (LPF_NATIVE_COLD).
     bool isOnlyCallSite(AstExprFunction* func)
     {
         const unsigned* calls = directCallSites.find(func);
-        if (!calls || *calls != 1 || repeatedCompileDepth > 0)
+        if (!calls || *calls != 1 || !callCompiledOnce())
+            return false;
+
+        AstLocal* const* callee = onlyCallSiteCallees.find(func);
+        if (!callee || !*callee || (*callee)->isExported)
+            return false;
+
+        const unsigned* reads = localReads.find(*callee);
+        bool callIsOnlyUse = reads && *reads == 1;
+        if (!callIsOnlyUse)
             return false;
 
         if (callRunsOnce())
             return false;
 
         bool leavesNativeCode = func->hasNativeAttribute() && currentFunction && !currentFunction->hasNativeAttribute();
-        if (leavesNativeCode)
+        return !leavesNativeCode;
+    }
+
+    // Luwu: the call being compiled appears once in the output: it isn't in an unrolled loop or in a body inlined at
+    // several call sites
+    bool callCompiledOnce() const
+    {
+        if (repeatedCompileDepth > 0)
             return false;
 
         for (const InlineFrame& frame : inlineFrames)
@@ -1378,9 +1602,50 @@ struct Compiler
 
         bool visit(AstExprCall* node) override
         {
-            if (AstExprFunction* func = node->self ? nullptr : self->getFunctionExpr(node->func))
-                self->directCallSites[func]++;
+            // a method call counts for every method of its name (encouragedCallSites)
+            if (AstExprIndexName* method = node->self ? node->func->as<AstExprIndexName>() : nullptr)
+                self->methodCallSites[method->index]++;
+
+            AstExprFunction* func = node->self ? nullptr : self->getFunctionExpr(node->func);
+
+            // a class's static function, `Cls.f(...)`
+            AstExprIndexName* member = node->self ? nullptr : node->func->as<AstExprIndexName>();
+            AstStatClass* cls = member && FFlag::LuwuClasses ? self->classBindingOf(member->expr) : nullptr;
+            if (!func && cls)
+                func = self->findStaticFunction(cls, member->index);
+
+            if (!func)
+                return true;
+
+            self->directCallSites[func]++;
+
+            // a callee reached any other way (a constant table's field, a cast) may be used elsewhere
+            AstExprLocal* callee = node->func->as<AstExprLocal>();
+            self->onlyCallSiteCallees[func] = callee ? callee->local : nullptr;
             return true;
+        }
+
+        bool visit(AstExprLocal* node) override
+        {
+            self->localReads[node->local]++;
+            return true;
+        }
+    };
+
+    // Luwu pretty bytecode dumps: the instructions of an inlined call, its arguments included, sit under the call
+    struct InlinedCallDumpScope
+    {
+        BytecodeBuilder& bytecode;
+
+        InlinedCallDumpScope(BytecodeBuilder& bytecode, AstExprFunction* func)
+            : bytecode(bytecode)
+        {
+            bytecode.pushInlinedDumpScope(func->location.begin.line + 1, func->location.end.line + 1);
+        }
+
+        ~InlinedCallDumpScope()
+        {
+            bytecode.popInlinedDumpScope();
         }
     };
 
@@ -1689,15 +1954,46 @@ struct Compiler
     //
     // Cheap enough to call unconditionally: remarks are dropped unless Dump_Remarks is set, but the
     // arguments are still evaluated, so this does lookups rather than building a string.
-    const char* describeInlineTarget(AstExprFunction* func, const char*& owner)
+    // `owner` is the class of a method (written `Class:method`, `separator` ':') or a static function (`Class.f`, '.'),
+    // and null for any other function.
+    const char* describeInlineTarget(AstExprFunction* func, const char*& owner, char& separator)
     {
         owner = nullptr;
+        separator = 0;
 
         if (FFlag::LuwuClasses)
+        {
             if (AstStatClass** cls = classMethodOwner.find(func); cls && *cls)
+            {
                 owner = (*cls)->name->name.value;
+                separator = ':';
+            }
+            else if (AstStatClass* cls = staticFunctionClass(func))
+            {
+                owner = cls->name->name.value;
+                separator = '.';
+            }
+        }
 
         return func->debugname.value ? func->debugname.value : "<anonymous>";
+    }
+
+    // Luwu @noinline (rfcs/noinline-attribute.md): the remark for a call that `@noinline` kept from inlining. False
+    // when the callee isn't marked.
+    bool remarkNoinline(AstExprFunction* func)
+    {
+        if (!FFlag::LuwuNoinlineAttribute || !func->hasAttribute(AstAttr::Type::Noinline))
+            return false;
+
+        const char* owner = nullptr;
+        char separator = 0;
+        const char* name = describeInlineTarget(func, owner, separator);
+
+        if (owner)
+            bytecode.addDebugRemark("inlining failed: %s%c%s is marked @noinline", owner, separator, name);
+        else
+            bytecode.addDebugRemark("inlining failed: %s is marked @noinline", name);
+        return true;
     }
 
     // May this compilation act on a type annotation nothing verified? Only when the file says so with
@@ -2285,6 +2581,7 @@ struct Compiler
         bool noTargetMoveElision = !fi || fi->returnLocalCaptured || targetCount == 0 || regCaptured[target];
 
         RegScope rs(this);
+        InlinedCallDumpScope dumpScope(bytecode, func);
 
         size_t oldLocals = localStack.size();
 
@@ -2678,7 +2975,7 @@ struct Compiler
     // module holds an instance of that class, with no annotation needed -- `local cat = Cat(name)` is
     // enough to inline `cat:meow()`. `Cat(...)` evaluates to a fresh instance of `Cat` and nothing
     // else: a class binding is const and cannot be reassigned (the parser rejects it), and a custom
-    // `__init`'s own result is discarded, with luaR_createobject returning the object it built. So the
+    // `__init`'s own result is discarded, with the constructor returning the object it built. So the
     // only way the local could hold something other than a `Cat` is an assignment -- and
     // `Variable::written` records those from anywhere in the module, nested closures included, so an
     // unwritten local's class holds for its whole lifetime.
@@ -2884,41 +3181,85 @@ struct Compiler
         if (!method)
             return nullptr;
 
-        // Code lexically inside recvClass (its methods and closures nested in them) runs with recvClass's private
-        // access, so the method's body behaves the same inlined there. Anywhere else, only a body whose private
-        // access doesn't depend on the running closure can move (see InlinedPrivateAccessVisitor).
-        AstStatClass* callerClass = lexicalClassOf(currentFunction);
-        bool sameClass = callerClass == recvClass;
+        return classFunctionInlinesHere(expr, recvClass, method, idx->index.value) ? method : nullptr;
+    }
 
-        // Calling a private method is itself a private access, checked by NAMECALL against the running closure.
-        // Inlining it from outside the class would skip that check entirely and let the call succeed.
-        if (!sameClass && isPrivateClassMethod(recvClass, method))
+    // Luwu Classes (rfcs/classes): may `func`, a method or static function of `cls` that `call` calls by `name`, be
+    // inlined here as far as private access goes? Code lexically inside `cls` (its methods and closures nested in
+    // them) runs with its private access, so the body behaves the same inlined there. Anywhere else, only a body whose
+    // private access doesn't depend on the running closure can move (see InlinedPrivateAccessVisitor).
+    bool classFunctionInlinesHere(AstExprCall* call, AstStatClass* cls, AstExprFunction* func, const char* name)
+    {
+        AstStatClass* callerClass = lexicalClassOf(currentFunction);
+        bool sameClass = callerClass == cls;
+
+        // Calling a private method or static is itself a private access, checked at runtime against the running
+        // closure. Inlining it from outside the class would skip that check entirely and let the call succeed.
+        if (!sameClass && isPrivateClassMethod(cls, func))
         {
-            bytecode.addDebugRemark("inlining failed: %s is private to %s", idx->index.value, recvClass->name->name.value);
-            return nullptr;
+            bytecode.addDebugRemark("inlining failed: %s is private to %s", name, cls->name->name.value);
+            refuseEncouragedInline(call, func, format("it's private to %s, so inlining it would leak private access", cls->name->name.value));
+            return false;
         }
 
-        bool bodyLosesAccess =
-            !sameClass && classesWithPrivateMembers.contains(recvClass) && !classInlinedBodyKeepsPrivateAccess(recvClass, recvClass, method);
+        bool bodyLosesAccess = !sameClass && classesWithPrivateMembers.contains(cls) && !classInlinedBodyKeepsPrivateAccess(cls, cls, func);
 
         if (bodyLosesAccess)
         {
-            bytecode.addDebugRemark("inlining failed: body needs %s's private access at runtime", recvClass->name->name.value);
-            return nullptr;
+            bytecode.addDebugRemark("inlining failed: body needs %s's private access at runtime", cls->name->name.value);
+            refuseEncouragedInline(call, func, "it would leak private access");
+            return false;
         }
 
         // A free function inlined into a method does gain its class's private access; that is accepted (a class
         // answers for the functions its own methods call). Another class's method is not the class's own logic.
         bool callerHasPrivateMembers = callerClass && classesWithPrivateMembers.contains(callerClass);
-        bool bodyGainsAccess = !sameClass && callerHasPrivateMembers && !classInlinedBodyKeepsPrivateAccess(recvClass, callerClass, method);
+        bool bodyGainsAccess = !sameClass && callerHasPrivateMembers && !classInlinedBodyKeepsPrivateAccess(cls, callerClass, func);
 
         if (bodyGainsAccess)
         {
             bytecode.addDebugRemark("inlining failed: body would gain %s's private access", callerClass->name->name.value);
+            refuseEncouragedInline(call, func, "it would leak private access");
+            return false;
+        }
+
+        return true;
+    }
+
+    // Luwu Classes (rfcs/classes): the static function `name` of `cls`: a member function the class doesn't call with
+    // `self` (classMethodOwner holds those)
+    AstExprFunction* findStaticFunction(AstStatClass* cls, AstName name)
+    {
+        for (const AstClassMember& member : cls->members)
+        {
+            const AstClassMethod* m = member.get_if<AstClassMethod>();
+            if (m && m->functionName == name && !classMethodOwner.contains(m->function))
+                return m->function;
+        }
+        return nullptr;
+    }
+
+    // Luwu Classes (rfcs/classes): resolve a `Cls.f(...)` call to the static function it reads, so it can be inlined at
+    // O2. A class binding is const and its members can't be replaced, so `Cls.f` always reads that function, once the
+    // class's declaration has run: before then the call raises, and an inlined body wouldn't.
+    AstExprFunction* tryResolveStaticCall(AstExprCall* expr)
+    {
+        AstExprIndexName* idx = expr->self ? nullptr : expr->func->as<AstExprIndexName>();
+        AstStatClass* cls = idx ? classBindingOf(idx->expr) : nullptr;
+        if (!cls)
+            return nullptr;
+
+        AstExprFunction* func = findStaticFunction(cls, idx->index);
+        if (!func)
+            return nullptr;
+
+        if (!isClassBoundAt(cls, expr->location))
+        {
+            bytecode.addDebugRemark("inlining failed: %s may not be declared yet", cls->name->name.value);
             return nullptr;
         }
 
-        return method;
+        return classFunctionInlinesHere(expr, cls, func, idx->index.value) ? func : nullptr;
     }
 
     // Luwu Classes (rfcs/classes): this class's own `__init`, or null when it uses the default
@@ -3125,9 +3466,16 @@ struct Compiler
             return inlinable && !podReadChangesAccess;
         }
 
+        // The class's constructor is in the class's scope, where `__init` and `__defaults` are too: a local the
+        // initializer reads is an upvalue there as well, and a function literal becomes the constructor's child.
+        bool inClassConstructor() const
+        {
+            return self->constructorBeingCompiled == decl;
+        }
+
         bool visit(AstExprLocal* node) override
         {
-            if (!params.contains(node->local))
+            if (!params.contains(node->local) && !inClassConstructor())
                 inlinable = false;
 
             return false;
@@ -3135,7 +3483,9 @@ struct Compiler
 
         bool visit(AstExprFunction* node) override
         {
-            inlinable = false;
+            if (!inClassConstructor())
+                inlinable = false;
+
             return false;
         }
 
@@ -3596,10 +3946,10 @@ struct Compiler
     // Luwu Classes (rfcs/classes): try to compile `ClassName(...)` into a NEWOBJECT. Only a class
     // declared in this module can be resolved statically at all (isKnownClassExpr), and only those
     // reach here; where its binding may still be nil, compileClassOperand checks it before NEWOBJECT
-    // runs. The opcode allocates the instance itself, skipping the class's `__call` metamethod
-    // and the luaR_createobject C frame a generic CALL goes through.
+    // runs. The opcode allocates the instance itself, skipping the call of the class's constructor
+    // (LuauClass::constructor) a generic CALL makes.
     //
-    // This picks which of NEWOBJECT's three forms fits, and emits the last two itself:
+    // This picks which of NEWOBJECT's forms fits, and emits the last two below itself:
     //
     //   - FIELDS (operand C = 2): the fast path, taken by `Cat(name, age)` on a class field parameter
     //     list (tryCompileNewObjectFieldParameters), and by `Cat { name = name, age = age }` on a POD
@@ -3610,15 +3960,16 @@ struct Compiler
     //     CALL follows. A primary constructor lands here when FIELDS declined.
     //   - DEFAULT (C = 0): the POD constructor's generic form -- `Cat()`, or a `Cat(t)` whose argument
     //     FIELDS couldn't take apart. AUX is the argument count, and the table in A + 1, when there
-    //     is one, is actually allocated and read by name at runtime (luaR_applyobjectfields).
+    //     is one, is actually allocated and read by name at runtime (luaR_applyobjectfields). A class
+    //     with traits or computed defaults takes ALLOC and APPLY instead (tryCompileNewObjectPod).
     //
     // Returns false without emitting anything when no form fits, and compileExprCall compiles an
-    // ordinary call instead.
+    // ordinary call instead, which runs the class's constructor.
     //
     // Reasons why this may need to fall back:
     //
-    //   - the class has non-constant field defaults, which live in a `__defaults` closure that has to
-    //     be called (classPodDefaultsFn)
+    //   - a field default or `implements` argument reads something this site can't, like a local of
+    //     the class's scope (PrimaryInitInlineVisitor)
     //   - an argument is multret, which needs the call-style argument setup the generic path does
     //   - a default constructor was passed more than one argument
     bool tryCompileNewObject(AstExprCall* expr, uint8_t target)
@@ -3637,10 +3988,6 @@ struct Compiler
 
         AstStatClass** decl = classByName.find(global->name);
         if (!decl)
-            return false;
-
-        // a class with non-constant field defaults needs its `__defaults` closure called
-        if (classPodDefaultsFn.contains(*decl))
             return false;
 
         const AstClassMethod* init = findClassInit(*decl);
@@ -3670,83 +4017,288 @@ struct Compiler
         if (!hasCustomInit)
         {
             // `ClassName { field = value }` whose keys all name declared fields doesn't need the table
-            // at all: hand the values to NEWOBJECT positionally, in member declaration order.
-            if (expr->args.size == 1)
+            // at all: hand the values to NEWOBJECT positionally, in member declaration order. Computed
+            // defaults aren't part of the class shape, so FIELDS can't keep them for the fields left out.
+            if (expr->args.size == 1 && !classPodDefaultsFn.contains(*decl))
             {
                 if (AstExprTable* fields = expr->args.data[0]->as<AstExprTable>();
                     fields && tryCompileNewObjectTableConstructor(expr, *decl, fields, target))
                     return true;
             }
 
-            // Luwu Traits (rfcs/classes/traits.md): a class that implements traits gets its trait fields between
-            // allocation and its own (NEWOBJECT's ALLOC form, then compileTraitInit). An argument table that isn't a
-            // literal, applied after the traits by the generic constructor, takes the generic path.
-            if ((*decl)->implements.size > 0)
-            {
-                DenseHashSet<AstLocal*> noParameters{nullptr};
-                bool movable = implementsArgsMovable(*decl, noParameters, lexicalClassOf(currentFunction));
-
-                if (expr->args.size != 0 || !movable)
-                    return false;
-
-                // the object reaches `target` only once it is complete: initializing its trait fields can raise or
-                // yield, and `target` may be a variable other code reads
-                uint8_t object = allocReg(expr, 1u);
-                uint8_t classReg = compileClassOperand(callee, rs);
-
-                bytecode.emitABC(LOP_NEWOBJECT, object, classReg, LBC_NEWOBJECT_ALLOC);
-                bytecode.emitAux(0);
-
-                compileTraitInit(*decl, object);
-
-                bytecode.emitABC(LOP_MOVE, target, object, 0);
-                return true;
-            }
-
-            // NEWOBJECT writes the instance to its first operand and reads the single argument, when
-            // there is one, from the register above it. With no argument that can be the destination
-            // itself; otherwise the pair has to be allocated together and copied out.
-            uint8_t base;
-
-            if (expr->args.size == 0)
-            {
-                base = target;
-            }
-            else
-            {
-                base = allocReg(expr, 2u);
-                compileExprTemp(expr->args.data[0], uint8_t(base + 1));
-            }
-
-            uint8_t classReg = compileClassOperand(callee, rs);
-
-            bytecode.emitABC(LOP_NEWOBJECT, base, classReg, LBC_NEWOBJECT_DEFAULT);
-            bytecode.emitAux(uint32_t(expr->args.size));
-
-            if (base != target)
-                bytecode.emitABC(LOP_MOVE, target, base, 0);
-
-            return true;
+            return tryCompileNewObjectPod(expr, *decl, target);
         }
+
+        compileNewObjectInit(expr, target);
+        return true;
+    }
+
+    // Luwu Classes (rfcs/classes): `Class(args)` through NEWOBJECT's INIT form. NEWOBJECT lays out `__init`'s frame above
+    // the instance, and the CALL after it runs `__init` and drops its results. A multret last argument, which only a
+    // constructor's `...` passes here, is evaluated after NEWOBJECT so that nothing comes between it and the CALL.
+    void compileNewObjectInit(AstExprCall* expr, uint8_t target)
+    {
+        RegScope rs(this);
+
+        size_t argCount = expr->args.size;
+        bool multRetLast = argCount > 0 && isExprMultRet(expr->args.data[argCount - 1]);
+        size_t fixedCount = multRetLast ? argCount - 1 : argCount;
 
         // base holds the instance and survives the call; `__init` and `self` sit above it, followed by
         // the arguments, which is exactly the frame CALL expects at base + 1
-        uint8_t base = allocReg(expr, unsigned(3 + expr->args.size));
+        uint8_t base = allocReg(expr, unsigned(3 + argCount));
 
-        for (size_t i = 0; i < expr->args.size; ++i)
+        for (size_t i = 0; i < fixedCount; ++i)
             compileExprTemp(expr->args.data[i], uint8_t(base + 3 + i));
 
-        uint8_t classReg = compileClassOperand(callee, rs);
+        uint8_t classReg = compileClassOperand(unwrapGroups(expr->func), rs);
 
+        setDebugLine(expr);
         bytecode.emitABC(LOP_NEWOBJECT, base, classReg, LBC_NEWOBJECT_INIT);
-        bytecode.emitAux(uint32_t(expr->args.size));
+        bytecode.emitAux(uint32_t(fixedCount));
+
+        bool multCall = multRetLast && compileExprTempMultRet(expr->args.data[argCount - 1], uint8_t(base + 3 + fixedCount));
 
         // `__init` takes no results; the instance is already in base
-        bytecode.emitABC(LOP_CALL, uint8_t(base + 1), uint8_t(expr->args.size + 2), 1);
+        setDebugLine(expr);
+        bytecode.emitABC(LOP_CALL, uint8_t(base + 1), multCall ? 0 : uint8_t(argCount + 2), 1);
 
         if (base != target)
             bytecode.emitABC(LOP_MOVE, target, base, 0);
+    }
 
+    static AstExpr* unwrapGroups(AstExpr* expr)
+    {
+        while (AstExprGroup* group = expr->as<AstExprGroup>())
+            expr = group->expr;
+
+        return expr;
+    }
+
+    // Luwu Classes (rfcs/classes): whether `expr`, an initializer, field default or `implements` argument of `decl`, can
+    // be evaluated by construction code in the current function (see PrimaryInitInlineVisitor), whose parameters
+    // `parameters` are bound to the construction's arguments
+    bool constructionCanEvaluate(AstStatClass* decl, AstExpr* expr, const DenseHashSet<AstLocal*>& parameters)
+    {
+        PrimaryInitInlineVisitor visitor{this, parameters, decl, lexicalClassOf(currentFunction)};
+        expr->visit(&visitor);
+        return visitor.movable();
+    }
+
+    // Luwu Classes (rfcs/classes): `Class()` or `Class(fields)` for a class without `__init`. With no traits and only
+    // constant defaults, NEWOBJECT's DEFAULT form does all of it. Otherwise the construction does the POD constructor's
+    // steps itself, in its order: allocate (ALLOC), initialize the trait fields, store every field default, then apply
+    // the argument's fields (APPLY). Returns false without emitting anything when an `implements` argument or a default
+    // can't be evaluated here.
+    bool tryCompileNewObjectPod(AstExprCall* expr, AstStatClass* decl, uint8_t target)
+    {
+        LUAU_ASSERT(expr->args.size <= 1);
+
+        AstExpr* callee = unwrapGroups(expr->func);
+        bool computedDefaults = classPodDefaultsFn.contains(decl);
+        bool hasTraits = decl->implements.size > 0;
+
+        std::vector<const AstClassProperty*> properties;
+        for (const AstClassMember& member : decl->members)
+            if (const AstClassProperty* prop = member.get_if<AstClassProperty>())
+                properties.push_back(prop);
+
+        DenseHashSet<AstLocal*> noParameters{nullptr};
+
+        if (hasTraits && !implementsArgsMovable(decl, noParameters, lexicalClassOf(currentFunction)))
+            return false;
+
+        if (computedDefaults)
+        {
+            for (const AstClassProperty* prop : properties)
+                if (prop->defaultValue && !constructionCanEvaluate(decl, prop->defaultValue, noParameters))
+                    return false;
+        }
+
+        RegScope rs(this);
+
+        bool hasArgument = expr->args.size == 1;
+        bool defaultForm = !computedDefaults && !hasTraits;
+
+        // DEFAULT and APPLY read the argument from the register above the instance. DEFAULT without an argument can
+        // write straight to `target`; otherwise the instance reaches `target` only once it is complete, since
+        // initializing it can raise or yield and `target` may be a variable other code reads.
+        uint8_t object = defaultForm && !hasArgument ? target : allocReg(expr, 2u);
+
+        if (hasArgument)
+            compileExprTemp(expr->args.data[0], uint8_t(object + 1));
+
+        uint8_t classReg = compileClassOperand(callee, rs);
+
+        setDebugLine(expr);
+
+        if (defaultForm)
+        {
+            bytecode.emitABC(LOP_NEWOBJECT, object, classReg, LBC_NEWOBJECT_DEFAULT);
+            bytecode.emitAux(uint32_t(hasArgument));
+        }
+        else
+        {
+            bytecode.emitABC(LOP_NEWOBJECT, object, classReg, LBC_NEWOBJECT_ALLOC);
+            bytecode.emitAux(0);
+
+            compileTraitInit(decl, object);
+
+            // the class's own fields come first in its layout, in declaration order
+            if (computedDefaults)
+            {
+                for (size_t offset = 0; offset < properties.size(); ++offset)
+                {
+                    AstExpr* value = properties[offset]->defaultValue;
+                    if (!value)
+                        continue;
+
+                    RegScope rsValue(this);
+                    setDebugLine(value);
+                    uint8_t valueReg = compileExprAuto(value, rsValue);
+
+                    bytecode.emitABC(LOP_SETOBJECTMEMBER, valueReg, object, 0);
+                    bytecode.emitAux(uint32_t(offset));
+                }
+            }
+
+            if (hasArgument)
+            {
+                setDebugLine(expr);
+                bytecode.emitABC(LOP_NEWOBJECT, object, classReg, LBC_NEWOBJECT_APPLY);
+                bytecode.emitAux(1);
+            }
+        }
+
+        if (object != target)
+            bytecode.emitABC(LOP_MOVE, target, object, 0);
+
+        return true;
+    }
+
+    // Luwu Classes (rfcs/classes): sets the class whose constructor is being compiled, for the rest of the scope
+    struct ConstructorScope
+    {
+        Compiler* self;
+        AstStatClass* previous;
+
+        ConstructorScope(Compiler* self, AstStatClass* decl)
+            : self(self)
+            , previous(self->constructorBeingCompiled)
+        {
+            self->constructorBeingCompiled = decl;
+        }
+
+        ~ConstructorScope()
+        {
+            self->constructorBeingCompiled = previous;
+        }
+    };
+
+    // Luwu Classes (rfcs/classes): the body of `decl`'s constructor (see LuauClass::constructor). It constructs the class
+    // the way a call site in the class's module does, and never by calling the class, which would run the constructor
+    // again. The constructor is in the class's scope, so initializers and defaults that read other locals can be
+    // evaluated in it, which a call site elsewhere can't do (constructorBeingCompiled).
+    // - A primary constructor stores its fields directly (FIELDS, or ALLOC for a class with traits), or calls the
+    //   `__init` synthesized from it when an initializer can't move (a function literal).
+    // - An explicit `__init` is called with the constructor's arguments (INIT).
+    // - A class without `__init` takes the POD constructor's steps (tryCompileNewObjectPod).
+    void compileClassConstructor(AstStatClass* decl)
+    {
+        const ClassConstructor* constructor = classConstructors.find(decl);
+        LUAU_ASSERT(constructor);
+        AstExprCall* construction = constructor->construction;
+
+        ConstructorScope scope(this, decl);
+        RegScope rs(this);
+        uint8_t object = allocReg(construction, 1u);
+
+        bool hasInit = decl->primaryConstructor || findClassInit(decl);
+        bool expanded = decl->primaryConstructor && tryCompileNewObjectFieldParameters(construction, decl, object);
+
+        if (!expanded && hasInit)
+        {
+            compileNewObjectInit(construction, object);
+        }
+        else if (!expanded)
+        {
+            [[maybe_unused]] bool compiled = tryCompileNewObjectPod(construction, decl, object);
+            LUAU_ASSERT(compiled);
+        }
+
+        setDebugLine(construction);
+        bytecode.emitABC(LOP_RETURN, object, 2, 0);
+    }
+
+    // Luwu collections: the `.(key, value)` bundles an `OrderedMap(...)` call builds for its entries, passed as its
+    // arguments or as the items of a list literal. Empty when the call passes anything else.
+    std::vector<AstExprCall*> orderedMapEntryBundles(AstExprCall* expr)
+    {
+        if (!FFlag::DebugLuwuBuiltinClasses || expr->self)
+            return {};
+
+        Builtin builtin = getBuiltin(expr->func, globals, variables);
+        if (!builtin.isMethod("collections", "OrderedMap"))
+            return {};
+
+        std::vector<AstExpr*> entries(expr->args.begin(), expr->args.end());
+        AstExprTable* list = expr->args.size == 1 ? expr->args.data[0]->as<AstExprTable>() : nullptr;
+        if (list)
+        {
+            entries.clear();
+            for (const AstExprTable::Item& item : list->items)
+            {
+                if (item.kind != AstExprTable::Item::Kind::List)
+                    return {};
+                entries.push_back(item.value);
+            }
+        }
+
+        std::vector<AstExprCall*> bundles;
+        for (AstExpr* entry : entries)
+        {
+            if (bundleConstructionSize(entry) != 2)
+                return {};
+            bundles.push_back(entry->as<AstExprCall>());
+        }
+        return bundles;
+    }
+
+    // Luwu collections: `OrderedMap(.(k, v), ...)` and `OrderedMap({ .(k, v), ... })` compile to `OrderedMap()` and a
+    // `set` call per entry, so neither the bundles nor the list are built
+    bool tryCompileOrderedMapFromBundles(AstExprCall* expr, uint8_t target)
+    {
+        if (options.optimizationLevel < 1)
+            return false;
+
+        std::vector<AstExprCall*> bundles = orderedMapEntryBundles(expr);
+        if (bundles.empty())
+            return false;
+
+        RegScope rs(this);
+        uint8_t map = allocReg(expr, 1u);
+        compileExprTemp(expr->func, map);
+        bytecode.emitABC(LOP_CALL, map, 1, 2);
+
+        BytecodeBuilder::StringRef setName = sref(AstName("set"));
+        int32_t setId = bytecode.addConstantString(setName);
+        if (setId < 0)
+            CompileError::raise(expr->location, "Exceeded constant limit; simplify the code to compile");
+
+        for (AstExprCall* bundle : bundles)
+        {
+            RegScope entryScope(this);
+            uint8_t regs = allocReg(bundle, 4u);
+            compileExprTempTop(bundle->args.data[0], uint8_t(regs + 2));
+            compileExprTempTop(bundle->args.data[1], uint8_t(regs + 3));
+
+            setDebugLine(bundle);
+            bytecode.emitABC(LOP_NAMECALL, regs, map, uint8_t(BytecodeBuilder::getStringHash(setName)));
+            bytecode.emitAux(setId);
+            bytecode.emitABC(LOP_CALL, regs, 4, 1);
+        }
+
+        bytecode.emitABC(LOP_MOVE, target, map, 0);
         return true;
     }
 
@@ -4003,78 +4555,6 @@ struct Compiler
         }
     }
 
-    // Luwu collections: the `.(key, value)` bundles an `OrderedMap(...)` call builds for its entries, passed as its
-    // arguments or as the items of a list literal. Empty when the call passes anything else.
-    std::vector<AstExprCall*> orderedMapEntryBundles(AstExprCall* expr)
-    {
-        if (!FFlag::DebugLuwuBuiltinClasses || expr->self)
-            return {};
-
-        Builtin builtin = getBuiltin(expr->func, globals, variables);
-        if (!builtin.isMethod("collections", "OrderedMap"))
-            return {};
-
-        std::vector<AstExpr*> entries(expr->args.begin(), expr->args.end());
-        AstExprTable* list = expr->args.size == 1 ? expr->args.data[0]->as<AstExprTable>() : nullptr;
-        if (list)
-        {
-            entries.clear();
-            for (const AstExprTable::Item& item : list->items)
-            {
-                if (item.kind != AstExprTable::Item::Kind::List)
-                    return {};
-                entries.push_back(item.value);
-            }
-        }
-
-        std::vector<AstExprCall*> bundles;
-        for (AstExpr* entry : entries)
-        {
-            if (bundleConstructionSize(entry) != 2)
-                return {};
-            bundles.push_back(entry->as<AstExprCall>());
-        }
-        return bundles;
-    }
-
-    // Luwu collections: `OrderedMap(.(k, v), ...)` and `OrderedMap({ .(k, v), ... })` compile to `OrderedMap()` and a
-    // `set` call per entry, so neither the bundles nor the list are built
-    bool tryCompileOrderedMapFromBundles(AstExprCall* expr, uint8_t target)
-    {
-        if (options.optimizationLevel < 1)
-            return false;
-
-        std::vector<AstExprCall*> bundles = orderedMapEntryBundles(expr);
-        if (bundles.empty())
-            return false;
-
-        RegScope rs(this);
-        uint8_t map = allocReg(expr, 1u);
-        compileExprTemp(expr->func, map);
-        bytecode.emitABC(LOP_CALL, map, 1, 2);
-
-        BytecodeBuilder::StringRef setName = sref(AstName("set"));
-        int32_t setId = bytecode.addConstantString(setName);
-        if (setId < 0)
-            CompileError::raise(expr->location, "Exceeded constant limit; simplify the code to compile");
-
-        for (AstExprCall* bundle : bundles)
-        {
-            RegScope entryScope(this);
-            uint8_t regs = allocReg(bundle, 4u);
-            compileExprTempTop(bundle->args.data[0], uint8_t(regs + 2));
-            compileExprTempTop(bundle->args.data[1], uint8_t(regs + 3));
-
-            setDebugLine(bundle);
-            bytecode.emitABC(LOP_NAMECALL, regs, map, uint8_t(BytecodeBuilder::getStringHash(setName)));
-            bytecode.emitAux(setId);
-            bytecode.emitABC(LOP_CALL, regs, 4, 1);
-        }
-
-        bytecode.emitABC(LOP_MOVE, target, map, 0);
-        return true;
-    }
-
     void compileExprCall(AstExprCall* expr, uint8_t target, uint8_t targetCount, bool targetTop = false, bool multRet = false)
     {
         LUAU_ASSERT(targetCount < 255);
@@ -4137,8 +4617,10 @@ struct Compiler
                 return;
 
             // add a debug remark for cases when we didn't even call tryCompileInlinedCall
-            if (func && !(fi && fi->canInline))
+            if (func && !(fi && fi->canInline) && !remarkNoinline(func))
             {
+                refuseEncouragedInline(expr, func, whyNeverInlined(func, fi != nullptr));
+
                 if (func->vararg)
                     bytecode.addDebugRemark("inlining failed: function is variadic");
                 else if (!fi)
@@ -4158,6 +4640,34 @@ struct Compiler
         if (!expr->self && !multRet && targetCount == 1 && tryCompileOrderedMapFromBundles(expr, target))
             return;
 
+        // Luwu Classes (rfcs/classes): inline `Cls.f(...)` calls of a class's static functions (see tryResolveStaticCall)
+        if (options.optimizationLevel >= 2 && !expr->self && FFlag::LuwuClasses)
+        {
+            if (AstExprFunction* sfunc = tryResolveStaticCall(expr))
+            {
+                Function* fi = functions.find(sfunc);
+
+                if (!(fi && fi->canInline))
+                {
+                    remarkNoinline(sfunc);
+                    refuseEncouragedInline(expr, sfunc, whyNeverInlined(sfunc, fi != nullptr));
+                }
+
+                if (fi && fi->canInline &&
+                    tryCompileInlinedCall(
+                        expr,
+                        sfunc,
+                        target,
+                        targetCount,
+                        multRet,
+                        FInt::LuauCompileInlineThreshold,
+                        FInt::LuauCompileInlineThresholdMaxBoost,
+                        FInt::LuauCompileInlineDepth
+                    ))
+                    return;
+            }
+        }
+
         // Luwu Classes (rfcs/classes): inline `obj:method()` calls whose receiver class is
         // statically known and whose body can be inlined here (see tryResolveMethodCall).
         if (options.optimizationLevel >= 2 && expr->self && FFlag::LuwuClasses)
@@ -4167,6 +4677,9 @@ struct Compiler
             {
                 Function* fi = functions.find(mfunc);
                 AstExprIndexName* idx = expr->func->as<AstExprIndexName>();
+
+                if (!(fi && fi->canInline))
+                    refuseEncouragedInline(expr, mfunc, whyNeverInlined(mfunc, fi != nullptr));
 
                 if (fi && fi->canInline && idx &&
                     tryCompileInlinedCall(
@@ -4182,6 +4695,9 @@ struct Compiler
                         /* receiverKnownBy= */ trusted ? "trusted" : "proven"
                     ))
                     return;
+
+                if (fi && !fi->canInline)
+                    remarkNoinline(mfunc);
             }
         }
 
@@ -4325,7 +4841,7 @@ struct Compiler
 
         for (size_t i = 0; i < expr->args.size; ++i)
             if (i + 1 == expr->args.size)
-                multCall = compileExprTempMultRet(expr->args.data[i], uint8_t(regs + 1 + expr->self + i));
+                multCall = compileExprTempMultRet(expr->args.data[i], uint8_t(regs + 1 + expr->self + i), MultRetUse::Argument);
             else
                 compileExprTempTop(expr->args.data[i], uint8_t(regs + 1 + expr->self + i));
 
@@ -4448,7 +4964,8 @@ struct Compiler
         return true;
     }
 
-    void compileExprFunction(AstExprFunction* expr, uint8_t target)
+    // Luwu: returns the closure's index in closureEdges
+    size_t compileExprFunction(AstExprFunction* expr, uint8_t target)
     {
         RegScope rs(this);
 
@@ -4534,6 +5051,9 @@ struct Compiler
         {
             bytecode.emitABC(LOP_CAPTURE, uint8_t(c.type), c.data, 0);
         }
+
+        closureEdges.push_back({currentFunctionId, expr, true});
+        return closureEdges.size() - 1;
     }
 
     // Luwu Traits (rfcs/classes/traits.md): if `expr` (an `implements` or `needs` entry) names a trait declared earlier
@@ -5016,9 +5536,9 @@ struct Compiler
 
     // Luwu Traits (rfcs/classes/traits.md): initializes the trait fields of the object in `objectReg`, an instance of
     // `cls` under construction. Evaluates every `implements` argument, one value each and in list order, then runs the
-    // traits' initializers with them: inline when the compiler knows them (compileInlinedTraitInit), otherwise through
-    // INITTRAITS and the CALL of its runner. Construction code calls this between allocating the object and initializing
-    // the class's own fields, which come later so they can override the traits'.
+    // traits' initializers with them: inline when the compiler knows them (compileInlinedTraitInit), otherwise in a loop
+    // that calls each one (INITTRAITS). Construction code calls this between allocating the object and initializing the
+    // class's own fields, which come later so they can override the traits'.
     void compileTraitInit(AstStatClass* cls, uint8_t objectReg)
     {
         if (traitInitDoesNothing(cls))
@@ -5030,9 +5550,9 @@ struct Compiler
 
         RegScope rs(this);
 
-        // the runner's call frame: the runner, the object, then the arguments
-        uint8_t frame = inlined ? 0 : allocReg(cls, unsigned(2 + argCount));
-        uint8_t argBase = inlined ? 0 : uint8_t(frame + 2);
+        // the loop's state: how many initializers have run, the object, then the arguments (see LOP_INITTRAITS)
+        uint8_t state = inlined ? 0 : allocReg(cls, unsigned(2 + argCount));
+        uint8_t argBase = inlined ? 0 : uint8_t(state + 2);
 
         if (inlined && argCount > 0)
             argBase = allocReg(cls, unsigned(argCount));
@@ -5048,13 +5568,23 @@ struct Compiler
             return;
         }
 
-        bytecode.emitABC(LOP_MOVE, uint8_t(frame + 1), objectReg, 0);
+        // each initializer's call frame: the initializer, the object, then its arguments
+        uint8_t frame = allocReg(cls, unsigned(2 + argCount));
+
+        bytecode.emitABC(LOP_MOVE, uint8_t(state + 1), objectReg, 0);
+        bytecode.emitAD(LOP_LOADN, state, 0);
 
         setDebugLine(cls);
-        size_t skipLabel = bytecode.emitLabel();
-        bytecode.emitAD(LOP_INITTRAITS, frame, 0);
+        size_t loopLabel = bytecode.emitLabel();
+        bytecode.emitAD(LOP_INITTRAITS, state, 0);
         bytecode.emitABC(LOP_CALL, frame, uint8_t(argCount + 2), 1);
-        patchJump(cls, skipLabel, bytecode.emitLabel());
+
+        size_t backLabel = bytecode.emitLabel();
+        bytecode.emitAD(LOP_JUMPBACK, 0, 0);
+
+        size_t exitLabel = bytecode.emitLabel();
+        patchJump(cls, loopLabel, exitLabel);
+        patchJump(cls, backLabel, loopLabel);
     }
 
     // Luwu Traits (rfcs/classes/traits.md): `cls`'s copy of the trait function `function`, whose name is at `nameLocation`.
@@ -5416,6 +5946,15 @@ struct Compiler
 
             bytecode.emitABC(LOP_NEWCLASSMEMBER, dest, 0, temp);
             bytecode.emitAux(defaultsNameCid);
+        }
+
+        // Luwu Classes (rfcs/classes): the function a call on the class runs, which isn't a member
+        if (const ClassConstructor* constructor = classConstructors.find(decl))
+        {
+            compileExprFunction(constructor->function, temp);
+
+            bytecode.emitABC(LOP_NEWCLASSMEMBER, dest, LBC_NEWCLASSMEMBER_CONSTRUCTOR, temp);
+            bytecode.emitAux(0);
         }
 
         // Luwu Traits (rfcs/classes/traits.md): the synthesized functions the VM calls by name, private like `__defaults`
@@ -5834,6 +6373,428 @@ struct Compiler
         return true;
     }
 
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the LBC_TYPE_* JUMPXTYPE tests for `is <tag>`, or
+    // nothing when only `type()` can tell (`class` and `trait`, which share a VM tag)
+    static std::optional<uint8_t> jumpxTypeFor(AstName tag)
+    {
+        for (uint8_t type = LBC_TYPE_NIL; type < LBC_TYPE_ANY; ++type)
+        {
+            if (const char* name = getJumpxTypeName(type); name && tag == name)
+                return type;
+        }
+        return std::nullopt;
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): jumps added to `jumps` that are taken when `pattern`
+    // matches (or with `whenMatched` false, when it doesn't), falling through otherwise. The value is read into a
+    // register once, and each alternative is one test-and-jump on it.
+    void compilePatternJumps(AstExprMatchPattern* pattern, std::vector<size_t>& jumps, bool whenMatched)
+    {
+        RegScope rs(this);
+        uint8_t value = compilePatternValue(pattern, rs);
+        compilePatternJumpsOn(pattern, value, jumps, whenMatched);
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): compilePatternJumps on the value in register `value`
+    void compilePatternJumpsOn(AstExprMatchPattern* pattern, uint8_t value, std::vector<size_t>& jumps, bool whenMatched)
+    {
+        const AstArray<AstPatternAlternative>& alternatives = pattern->alternatives;
+        LUAU_ASSERT(alternatives.size > 0);
+
+        // `is not` matches when no alternative does
+        if (whenMatched != pattern->negated)
+        {
+            for (const AstPatternAlternative& alternative : alternatives)
+                compileAlternativeJump(pattern, value, alternative, /* whenMatched= */ true, jumps);
+            return;
+        }
+
+        // Jumping when no alternative matches: one that matches skips the jump
+        std::vector<size_t> matched;
+        for (size_t i = 0; i + 1 < alternatives.size; ++i)
+            compileAlternativeJump(pattern, value, alternatives.data[i], /* whenMatched= */ true, matched);
+        compileAlternativeJump(pattern, value, alternatives.data[alternatives.size - 1], /* whenMatched= */ false, jumps);
+        patchJumps(pattern, matched, bytecode.emitLabel());
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the register holding the value `pattern` matches:
+    // its subject's when it has one (a `case` arm's `match` subject, or the hidden local a pattern that binds read the
+    // value into), which is in this frame's registers unless it's an upvalue or an inlined constant, and otherwise its
+    // value's
+    uint8_t compilePatternValue(AstExprMatchPattern* pattern, RegScope& rs)
+    {
+        if (!pattern->subject)
+            return compileExprAuto(pattern->value, rs);
+
+        if (int reg = getLocalReg(pattern->subject); reg >= 0)
+            return uint8_t(reg);
+
+        // a parameter of an inlined function given a constant argument has no register
+        if (const Constant* cv = locstants.find(pattern->subject); cv && cv->type != Constant::Type_Unknown)
+        {
+            uint8_t reg = allocReg(pattern, 1u);
+            compileExprConstant(pattern, cv, reg);
+            return reg;
+        }
+
+        AstExprLocal subject(pattern->location, pattern->subject, /* upvalue= */ true);
+        return compileExprAuto(&subject, rs);
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a jump added to `jumps` that's taken when `value`
+    // matches `alternative` (or with `whenMatched` false, when it doesn't)
+    void compileAlternativeJump(
+        AstExprMatchPattern* pattern,
+        uint8_t value,
+        const AstPatternAlternative& alternative,
+        bool whenMatched,
+        std::vector<size_t>& jumps
+    )
+    {
+        // Luwu Destructuring (rfcs/destructuring.md): an alternative whose fields have patterns of their own matches when
+        // it does and they all do, unless those are clauses of their own after the pattern
+        bool matchesFields = alternative.fields && !pattern->nestedPatternsAreClauses && hasNestedPatterns(*alternative.fields);
+        if (matchesFields)
+        {
+            std::vector<size_t> failed;
+            compileAlternativeItselfJump(pattern, value, alternative, /* whenMatched= */ false, failed);
+            compileNestedPatternJumps(pattern, value, *alternative.fields, failed);
+
+            if (!whenMatched)
+            {
+                jumps.insert(jumps.end(), failed.begin(), failed.end());
+                return;
+            }
+            jumps.push_back(bytecode.emitLabel());
+            bytecode.emitAD(LOP_JUMP, 0, 0);
+            patchJumps(pattern, failed, bytecode.emitLabel());
+            return;
+        }
+
+        compileAlternativeItselfJump(pattern, value, alternative, whenMatched, jumps);
+    }
+
+    // Luwu Destructuring (rfcs/destructuring.md): does a pattern in `fields`, at any depth, test its field?
+    static bool hasNestedPatterns(const AstDestructurePattern& fields)
+    {
+        if (fields.test)
+            return true;
+        for (const AstDestructureField& field : fields.fields)
+        {
+            if (hasNestedPatterns(field.target))
+                return true;
+        }
+        return false;
+    }
+
+    // Luwu Destructuring (rfcs/destructuring.md): jumps added to `failed` that are taken when a pattern nested in `fields`
+    // doesn't match the field it's in. Each field is read from `value` into a register first.
+    void compileNestedPatternJumps(AstExprMatchPattern* pattern, uint8_t value, const AstDestructurePattern& fields, std::vector<size_t>& failed)
+    {
+        for (size_t i = 0; i < fields.fields.size; ++i)
+        {
+            const AstDestructureField& field = fields.fields.data[i];
+            if (!hasNestedPatterns(field.target))
+                continue;
+
+            RegScope rs(this);
+            uint8_t fieldValue = allocReg(pattern, 1u);
+            compilePatternFieldRead(pattern, value, fields, i, fieldValue);
+
+            if (field.target.test)
+                compilePatternJumpsOn(field.target.test, fieldValue, failed, /* whenMatched= */ false);
+            compileNestedPatternJumps(pattern, fieldValue, field.target, failed);
+        }
+    }
+
+    // Luwu Destructuring (rfcs/destructuring.md): field `i` of `fields`, read from `value` into `target` the way the
+    // pattern binds it: by name, by position, by index or by a written key
+    void compilePatternFieldRead(AstExprMatchPattern* pattern, uint8_t value, const AstDestructurePattern& fields, size_t i, uint8_t target)
+    {
+        const AstDestructureField& field = fields.fields.data[i];
+
+        double position = double(i + 1);
+        AstExprConstantNumber* written = field.keyExpr ? field.keyExpr->as<AstExprConstantNumber>() : nullptr;
+        if (written && field.keyIsPosition)
+            position = written->value;
+
+        if (fields.positional || field.keyIsPosition)
+        {
+            bytecode.emitABC(LOP_GETPOSITIONAL, target, value, uint8_t(position - 1));
+        }
+        else if (fields.array)
+        {
+            bytecode.emitABC(LOP_GETTABLEN, target, value, uint8_t(position - 1));
+        }
+        else if (field.keyExpr)
+        {
+            RegScope rs(this);
+            uint8_t key = compileExprAuto(field.keyExpr, rs);
+            bytecode.emitABC(LOP_GETTABLE, target, value, key);
+        }
+        else
+        {
+            BytecodeBuilder::StringRef name = sref(field.key);
+            int32_t cid = bytecode.addConstantString(name);
+            if (cid < 0)
+                CompileError::raise(pattern->location, "Exceeded constant limit; simplify the code to compile");
+            bytecode.emitABC(LOP_GETTABLEKS, target, value, uint8_t(BytecodeBuilder::getStringHash(name)));
+            bytecode.emitAux(cid);
+        }
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a jump added to `jumps` that's taken when `value`
+    // matches `alternative` itself (or with `whenMatched` false, when it doesn't), leaving any patterns in its fields out
+    void compileAlternativeItselfJump(
+        AstExprMatchPattern* pattern,
+        uint8_t value,
+        const AstPatternAlternative& alternative,
+        bool whenMatched,
+        std::vector<size_t>& jumps
+    )
+    {
+        RegScope rs(this);
+        setDebugLine(alternative.location);
+        uint32_t notFlag = whenMatched ? 0 : 0x80000000;
+
+        // Luwu try expressions: a result kept in registers is `Ok` or `Err` by its flag
+        if (std::optional<bool> testsOk = tryResultVariantPattern(pattern, alternative))
+        {
+            AstLocal* result = pattern->subject ? pattern->subject : pattern->value->as<AstExprLocal>()->local;
+            jumps.push_back(bytecode.emitLabel());
+            bytecode.emitAD(*testsOk == whenMatched ? LOP_JUMPIF : LOP_JUMPIFNOT, uint8_t(getLocalReg(result) + kTryResultOkFlag), 0);
+            return;
+        }
+
+        switch (alternative.kind)
+        {
+        case AstPatternAlternative::Bundle:
+        {
+            compileBundleJump(pattern, value, alternative, whenMatched, jumps);
+            return;
+        }
+
+        case AstPatternAlternative::Class:
+        {
+            // A name holding a constant (`const LIMIT = 10`) compares like the literal
+            if (const Constant* cv = constants.find(alternative.operand); cv && cv->type != Constant::Type_Unknown)
+            {
+                compileConstantEqualityJump(value, alternative.operand, *cv, notFlag, jumps);
+                return;
+            }
+
+            uint8_t operand = compileExprAuto(alternative.operand, rs);
+
+            // A name the compiler can't resolve may hold a class or any other value
+            AstStatClass* decl = classBindingOf(alternative.operand);
+            if (!decl)
+            {
+                jumps.push_back(bytecode.emitLabel());
+                bytecode.emitAD(LOP_JUMPXMATCH, value, 0);
+                bytecode.emitAux(uint32_t(operand) | notFlag);
+                return;
+            }
+
+            bool classIsKnown = isClassBoundAt(decl, alternative.operand->location);
+            jumps.push_back(bytecode.emitLabel());
+            bytecode.emitAD(LOP_JUMPXISA, value, 0);
+            bytecode.emitAux(uint32_t(operand) | (whenMatched ? LBC_JUMPXISA_JUMPIFINSTANCE : 0u) | (classIsKnown ? 0u : LBC_JUMPXISA_CHECKCLASS));
+            return;
+        }
+
+        case AstPatternAlternative::Trait:
+        {
+            uint8_t result = compileLibraryCall(nameClass(), names.getOrAdd("implements"), value, alternative.operand, pattern, rs);
+            jumps.push_back(bytecode.emitLabel());
+            bytecode.emitAD(whenMatched ? LOP_JUMPIF : LOP_JUMPIFNOT, result, 0);
+            return;
+        }
+
+        case AstPatternAlternative::Tag:
+        {
+            std::optional<uint8_t> type = alternative.tagIsTypeof ? std::nullopt : jumpxTypeFor(alternative.tag);
+            if (type)
+            {
+                jumps.push_back(bytecode.emitLabel());
+                bytecode.emitAD(LOP_JUMPXTYPE, value, 0);
+                bytecode.emitAux(*type | notFlag);
+                return;
+            }
+
+            // `class` and `trait`: the name `type()` gives (or `typeof()`, for a builtin class)
+            const char* function = alternative.tagIsTypeof ? "typeof" : "type";
+            uint8_t name = compileLibraryCall(names.getOrAdd(function), std::nullopt, value, nullptr, pattern, rs);
+            int32_t cid = bytecode.addConstantString(sref(alternative.tag));
+            if (cid < 0)
+                CompileError::raise(alternative.location, "Exceeded constant limit; simplify the code to compile");
+
+            jumps.push_back(bytecode.emitLabel());
+            bytecode.emitAD(LOP_JUMPXEQKS, name, 0);
+            bytecode.emitAux(uint32_t(cid) | notFlag);
+            return;
+        }
+
+        case AstPatternAlternative::Value:
+        {
+            if (const Constant* cv = constants.find(alternative.operand); cv && cv->type != Constant::Type_Unknown)
+            {
+                compileConstantEqualityJump(value, alternative.operand, *cv, notFlag, jumps);
+                return;
+            }
+
+            // `none` is a primitive value, so its pattern checks the type and never reads the global
+            AstExprGlobal* global = alternative.operand->as<AstExprGlobal>();
+            if (global && global->name == "none")
+            {
+                jumps.push_back(bytecode.emitLabel());
+                bytecode.emitAD(LOP_JUMPXTYPE, value, 0);
+                bytecode.emitAux(LBC_TYPE_SYMNONE | notFlag);
+                return;
+            }
+
+            // `None`, which is a global
+            uint8_t operand = compileExprAuto(alternative.operand, rs);
+            jumps.push_back(bytecode.emitLabel());
+            bytecode.emitAD(whenMatched ? LOP_JUMPIFEQ : LOP_JUMPIFNOTEQ, value, 0);
+            bytecode.emitAux(operand);
+            return;
+        }
+        }
+    }
+
+    // Luwu: the JUMPXEQK* that compares a register with the constant `operand` folds to, and its aux constant
+    std::pair<LuauOpcode, int32_t> getConstantEqualityJump(AstExpr* operand, const Constant& cv)
+    {
+        LuauOpcode opc = LOP_NOP;
+        int32_t cid = -1;
+        switch (cv.type)
+        {
+        case Constant::Type_Nil:
+            opc = LOP_JUMPXEQKNIL;
+            cid = 0;
+            break;
+        case Constant::Type_Boolean:
+            opc = LOP_JUMPXEQKB;
+            cid = cv.valueBoolean;
+            break;
+        case Constant::Type_Number:
+            opc = LOP_JUMPXEQKN;
+            cid = getConstantIndex(operand);
+            break;
+        case Constant::Type_String:
+            opc = LOP_JUMPXEQKS;
+            cid = getConstantIndex(operand);
+            break;
+        default:
+            LUAU_ASSERT(!"Unexpected constant type");
+        }
+
+        if (cid < 0)
+            CompileError::raise(operand->location, "Exceeded constant limit; simplify the code to compile");
+        return {opc, cid};
+    }
+
+    // Luwu bundles: `.(a, b)` is `typeof(value) == "bundle" and #value == 2` (`>= 2` with `..`)
+    void compileBundleJump(
+        AstExprMatchPattern* pattern,
+        uint8_t value,
+        const AstPatternAlternative& alternative,
+        bool whenMatched,
+        std::vector<size_t>& jumps
+    )
+    {
+        RegScope rs(this);
+        std::vector<size_t> failed;
+
+        uint8_t name = compileLibraryCall(names.getOrAdd("typeof"), std::nullopt, value, nullptr, pattern, rs);
+        int32_t bundleName = bytecode.addConstantString(sref(names.getOrAdd("bundle")));
+        size_t count = alternative.fields ? alternative.fields->fields.size : 0;
+        int32_t countConstant = bytecode.addConstantNumber(double(count));
+        if (bundleName < 0 || countConstant < 0)
+            CompileError::raise(pattern->location, "Exceeded constant limit; simplify the code to compile");
+
+        failed.push_back(bytecode.emitLabel());
+        bytecode.emitAD(LOP_JUMPXEQKS, name, 0);
+        bytecode.emitAux(uint32_t(bundleName) | 0x80000000);
+
+        uint8_t size = allocReg(pattern, 1u);
+        bytecode.emitABC(LOP_LENGTH, size, value, 0);
+        if (alternative.openEnded)
+        {
+            // fewer values than the elements written
+            uint8_t least = allocReg(pattern, 1u);
+            bytecode.emitAD(LOP_LOADK, least, int16_t(countConstant));
+            failed.push_back(bytecode.emitLabel());
+            bytecode.emitAD(LOP_JUMPIFLT, size, 0);
+            bytecode.emitAux(least);
+        }
+        else
+        {
+            failed.push_back(bytecode.emitLabel());
+            bytecode.emitAD(LOP_JUMPXEQKN, size, 0);
+            bytecode.emitAux(uint32_t(countConstant) | 0x80000000);
+        }
+
+        if (!whenMatched)
+        {
+            jumps.insert(jumps.end(), failed.begin(), failed.end());
+            return;
+        }
+        jumps.push_back(bytecode.emitLabel());
+        bytecode.emitAD(LOP_JUMP, 0, 0);
+        patchJumps(pattern, failed, bytecode.emitLabel());
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a JUMPXEQK* that compares `value` with the constant
+    // `operand` folds to. `notFlag` jumps when they differ.
+    void compileConstantEqualityJump(uint8_t value, AstExpr* operand, const Constant& cv, uint32_t notFlag, std::vector<size_t>& jumps)
+    {
+        auto [opc, cid] = getConstantEqualityJump(operand, cv);
+        jumps.push_back(bytecode.emitLabel());
+        bytecode.emitAD(opc, value, 0);
+        bytecode.emitAux(uint32_t(cid) | notFlag);
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `library.function(value, argument)`, or
+    // `library(value)` with no function, on the global `library` even where a local shadows it, for the code at `site`.
+    // Gives the register holding its first result.
+    uint8_t compileLibraryCall(
+        AstName library,
+        std::optional<AstName> function,
+        uint8_t value,
+        AstExpr* argument,
+        AstNode* site,
+        RegScope& rs
+    )
+    {
+        unsigned argumentCount = argument ? 2 : 1;
+        uint8_t base = allocReg(site, 1 + argumentCount);
+        const Location& location = site->location;
+
+        AstExprGlobal global(location, library);
+        if (function)
+        {
+            AstExprIndexName callee(location, &global, *function, location, location.begin, '.');
+            compileExprTemp(&callee, base);
+        }
+        else
+        {
+            compileExprTemp(&global, base);
+        }
+
+        bytecode.emitABC(LOP_MOVE, uint8_t(base + 1), value, 0);
+        if (argument)
+            compileExprTemp(argument, uint8_t(base + 2));
+
+        bytecode.emitABC(LOP_CALL, base, uint8_t(argumentCount + 1), 2);
+        return base;
+    }
+
+    AstName nameClass()
+    {
+        return names.getOrAdd("class");
+    }
+
     // Luwu Classes (rfcs/classes): does `region` write `local`, as AssignmentVisitor defines a write?
     // Used to bound a `class.isinstance` proof to a region no same-frame write can cross (see
     // matchIsinstanceProvenLocal). Writes from a nested function can run whenever that function is called,
@@ -6024,6 +6985,10 @@ struct Compiler
         while (AstExprGroup* group = expr->as<AstExprGroup>())
             expr = group->expr;
 
+        // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `c is C` proves what `class.isinstance(c, C)` does
+        if (AstExprMatchPattern* pattern = expr->as<AstExprMatchPattern>())
+            return matchClassPattern(pattern, local);
+
         AstExprCall* call = expr->as<AstExprCall>();
         if (!call || call->args.size != 2)
             return nullptr;
@@ -6040,6 +7005,45 @@ struct Compiler
         if (!isFrameLocal(le))
             return nullptr;
 
+        return provableClass(le->local, call->args.data[1], local);
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the class `pattern` tests a local against, when it's
+    // exactly `c is C` for a local of this frame and a class declared in this module. In a `case` arm the local is the
+    // `match`'s subject.
+    AstStatClass* matchClassPattern(AstExprMatchPattern* pattern, AstLocal*& local)
+    {
+        if (pattern->negated || pattern->alternatives.size != 1)
+            return nullptr;
+
+        const AstPatternAlternative& alternative = pattern->alternatives.data[0];
+        if (alternative.kind != AstPatternAlternative::Class || !isKnownClassExpr(alternative.operand))
+            return nullptr;
+
+        AstLocal* tested = pattern->subject;
+        if (pattern->value)
+        {
+            AstExpr* value = pattern->value;
+            while (AstExprGroup* group = value->as<AstExprGroup>())
+                value = group->expr;
+
+            AstExprLocal* le = value->as<AstExprLocal>();
+            if (!isFrameLocal(le))
+                return nullptr;
+            tested = le->local;
+        }
+        else if (getLocalReg(tested) < 0)
+        {
+            return nullptr;
+        }
+
+        return provableClass(tested, alternative.operand, local);
+    }
+
+    // Luwu Classes (rfcs/classes): the class `classExpr` names, as what a check proves `tested` to be, unless a function
+    // nested in this one can write `tested`
+    AstStatClass* provableClass(AstLocal* tested, AstExpr* classExpr, AstLocal*& local)
+    {
         // A write from a function nested inside this one runs whenever that closure is called. No region
         // of this function excludes it, so no proof about this local can stand.
         //
@@ -6049,10 +7053,9 @@ struct Compiler
         // Getting this wrong is not a missed optimization: the inline site skips CHECKSELFCLASS for a
         // proven receiver, so a stale proof would read constant field offsets off whatever the local now
         // holds.
-        if (Variable* v = variables.find(le->local); v && v->writtenByNestedFunction)
+        if (Variable* v = variables.find(tested); v && v->writtenByNestedFunction)
             return nullptr;
 
-        AstExpr* classExpr = call->args.data[1];
         while (AstExprGroup* group = classExpr->as<AstExprGroup>())
             classExpr = group->expr;
 
@@ -6060,7 +7063,7 @@ struct Compiler
         if (!decl)
             return nullptr;
 
-        local = le->local;
+        local = tested;
         return *decl;
     }
 
@@ -6166,38 +7169,8 @@ struct Compiler
             const Constant* cv = constants.find(right);
             LUAU_ASSERT(cv && cv->type != Constant::Type_Unknown);
 
-            LuauOpcode opc = LOP_NOP;
-            int32_t cid = -1;
             uint32_t flip = (expr->op == AstExprBinary::CompareEq) == not_ ? 0x80000000 : 0;
-
-            switch (cv->type)
-            {
-            case Constant::Type_Nil:
-                opc = LOP_JUMPXEQKNIL;
-                cid = 0;
-                break;
-
-            case Constant::Type_Boolean:
-                opc = LOP_JUMPXEQKB;
-                cid = cv->valueBoolean;
-                break;
-
-            case Constant::Type_Number:
-                opc = LOP_JUMPXEQKN;
-                cid = getConstantIndex(right);
-                break;
-
-            case Constant::Type_String:
-                opc = LOP_JUMPXEQKS;
-                cid = getConstantIndex(right);
-                break;
-
-            default:
-                LUAU_ASSERT(!"Unexpected constant type");
-            }
-
-            if (cid < 0)
-                CompileError::raise(expr->location, "Exceeded constant limit; simplify the code to compile");
+            auto [opc, cid] = getConstantEqualityJump(right, *cv);
 
             size_t jumpLabel = bytecode.emitLabel();
 
@@ -6432,6 +7405,15 @@ struct Compiler
                 return;
         }
 
+        // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a pattern is a test-and-jump per alternative
+        if (AstExprMatchPattern* pattern = node->as<AstExprMatchPattern>())
+        {
+            if (target)
+                bytecode.emitABC(LOP_LOADB, *target, onlyTruth ? 1 : 0, 0);
+            compilePatternJumps(pattern, skipJump, onlyTruth);
+            return;
+        }
+
         if (AstExprGroup* expr = node->as<AstExprGroup>())
         {
             compileConditionValue(expr->expr, target, skipJump, onlyTruth);
@@ -6461,6 +7443,9 @@ struct Compiler
         const Constant* cv = constants.find(node);
 
         if (cv && cv->type != Constant::Type_Unknown)
+            return true;
+
+        if (node->is<AstExprMatchPattern>())
             return true;
 
         if (AstExprBinary* expr = node->as<AstExprBinary>())
@@ -6922,6 +7907,33 @@ struct Compiler
         size_t elseLabel = bytecode.emitLabel();
         emitClauseFailureClose(closeReg);
         patchJumps(match, elseJump, elseLabel);
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a pattern's result as a boolean in `target`. One
+    // alternative ends like a comparison (`LOADB 0 +1`, then `LOADB 1`), which native code turns into a single compare.
+    // That shortcut assumes only the jump right before the two loads reaches them, so with several alternatives the
+    // false result jumps over the true one instead.
+    void compileExprMatchPattern(AstExprMatchPattern* expr, uint8_t target)
+    {
+        std::vector<size_t> matched;
+        compilePatternJumps(expr, matched, /* whenMatched= */ true);
+
+        std::vector<size_t> done;
+        if (expr->alternatives.size == 1)
+        {
+            bytecode.emitABC(LOP_LOADB, target, 0, 1);
+        }
+        else
+        {
+            bytecode.emitABC(LOP_LOADB, target, 0, 0);
+            done.push_back(bytecode.emitLabel());
+            bytecode.emitAD(LOP_JUMP, 0, 0);
+        }
+
+        size_t matchedLabel = bytecode.emitLabel();
+        bytecode.emitABC(LOP_LOADB, target, 1, 0);
+        patchJumps(expr, matched, matchedLabel);
+        patchJumps(expr, done, bytecode.emitLabel());
     }
 
     // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the subject, then the arms as an if-else chain whose
@@ -7630,6 +8642,17 @@ struct Compiler
         return builtinResultVariant(call->args.data[1]);
     }
 
+    // Luwu try expressions: whether `alternative` of `pattern` is `Ok` or `Err` matched against a result kept in registers,
+    // and if so, whether it's `Ok`
+    std::optional<bool> tryResultVariantPattern(AstExprMatchPattern* pattern, const AstPatternAlternative& alternative)
+    {
+        AstExprLocal* local = pattern->value ? pattern->value->as<AstExprLocal>() : nullptr;
+        AstLocal* result = pattern->subject ? pattern->subject : (local && !local->upvalue ? local->local : nullptr);
+        if (!result || !tryResultLocals.contains(result) || alternative.kind != AstPatternAlternative::Class)
+            return std::nullopt;
+        return builtinResultVariant(alternative.operand);
+    }
+
     // Luwu try expressions: a method call or a variant test that a result kept in registers answers itself
     bool isTryResultCall(AstExprCall* call)
     {
@@ -7839,7 +8862,10 @@ struct Compiler
         bool targetTop = FFlag::LuauCompileStringInterpTargetTop && targetTemp && target == regTop - 1;
         uint8_t baseReg = targetTop ? allocReg(expr, regCount - 1) - 1 : allocReg(expr, regCount);
 
-        emitLoadK(baseReg, formatStringIndex);
+        // Luwu: with the string.format fastcall, the format string goes straight into the call's first argument, where
+        // FASTCALL reads it. Upstream loads it into the call's function register for NAMECALL to read `format` from.
+        uint8_t formatReg = FFlag::LuwuStringFormatFastcall ? uint8_t(baseReg + 1) : baseReg;
+        emitLoadK(formatReg, formatStringIndex);
 
         size_t skipped = 0;
         for (size_t index = 0; index < expr->expressions.size; ++index)
@@ -7858,7 +8884,13 @@ struct Compiler
         if (formatMethodIndex < 0)
             CompileError::raise(expr->location, "Exceeded constant limit; simplify the code to compile");
 
-        bytecode.emitABC(LOP_NAMECALL, baseReg, baseReg, uint8_t(BytecodeBuilder::getStringHash(formatMethod)));
+        // Luwu: the fastcall skips the NAMECALL and its aux word along with the CALL. When it falls back (a value with
+        // __tostring, a format that could raise, or an unsafe environment), the NAMECALL finds `format` through the string
+        // metatable as before, so the call and the frame it gets are unchanged.
+        if (FFlag::LuwuStringFormatFastcall)
+            bytecode.emitABC(LOP_FASTCALL, LBF_STRING_FORMAT, 0, 2);
+
+        bytecode.emitABC(LOP_NAMECALL, baseReg, formatReg, uint8_t(BytecodeBuilder::getStringHash(formatMethod)));
         bytecode.emitAux(formatMethodIndex);
         bytecode.emitABC(LOP_CALL, baseReg, uint8_t(expr->expressions.size + 2 - skippedSubExpr), 2);
         if (target != baseReg)
@@ -8081,7 +9113,7 @@ struct Compiler
                 uint8_t temp = uint8_t(arrayChunkReg + arrayChunkCurrent);
 
                 if (i + 1 == expr->items.size)
-                    multRet = compileExprTempMultRet(value, temp);
+                    multRet = compileExprTempMultRet(value, temp, MultRetUse::ListItem);
                 else
                     compileExprTempTop(value, temp);
 
@@ -8317,6 +9349,17 @@ struct Compiler
 
             bytecode.emitABC(LOP_GETTABLEKS, target, rt, uint8_t(BytecodeBuilder::getStringHash(iname)));
             bytecode.emitAux(cid);
+
+            hintTemporaryExprRegType(expr->expr, rt, LBC_TYPE_TABLE, /* instLength */ 2);
+        }
+        else if (AstExprCall* key = bundleKeyLiteral(expr->index))
+        {
+            uint8_t rt = compileExprAuto(expr->expr, rs);
+            uint8_t values = compileBundleKeyValues(key);
+
+            setDebugLine(expr->index);
+            bytecode.emitABC(LOP_GETTABLEBUNDLE, target, rt, values);
+            bytecode.emitAux(uint32_t(key->args.size));
 
             hintTemporaryExprRegType(expr->expr, rt, LBC_TYPE_TABLE, /* instLength */ 2);
         }
@@ -8614,6 +9657,10 @@ struct Compiler
         {
             compileExprMatch(expr, target, targetTemp);
         }
+        else if (AstExprMatchPattern* expr = node->as<AstExprMatchPattern>())
+        {
+            compileExprMatchPattern(expr, target);
+        }
         else if (AstExprTableComprehension* expr = node->as<AstExprTableComprehension>())
         {
             compileExprTableComprehension(expr, target, targetTemp);
@@ -8789,6 +9836,8 @@ struct Compiler
             Kind_IndexName,
             Kind_IndexNumber,
             Kind_IndexExpr,
+            // Luwu bundles: a table indexed by a bundle literal, whose values are in `index` onwards, `number` of them
+            Kind_IndexBundle,
         };
 
         Kind kind;
@@ -8826,6 +9875,16 @@ struct Compiler
 
             return result;
         }
+        else if (AstExprCall* key = bundleKeyLiteral(index))
+        {
+            LValue result = {LValue::Kind_IndexBundle};
+            result.reg = reg;
+            result.index = compileBundleKeyValues(key);
+            result.number = uint8_t(key->args.size);
+            result.location = index->location;
+
+            return result;
+        }
         else
         {
             LValue result = {LValue::Kind_IndexExpr};
@@ -8836,6 +9895,35 @@ struct Compiler
             return result;
         }
     }
+
+    // Luwu bundles: a bundle literal used as a table key, `t[.(a, b)]`, which the lookup reads from its values in
+    // registers (GETTABLEBUNDLE, SETTABLEBUNDLE) instead of building it. Like a fastcall, this assumes `bundle` is the
+    // builtin library when the module never assigns it. Null for any other key.
+    AstExprCall* bundleKeyLiteral(AstExpr* index)
+    {
+        if (options.optimizationLevel < 1)
+            return nullptr;
+
+        unsigned size = bundleConstructionSize(index);
+        if (size == 0 || size > kMaxBundleKeyValues)
+            return nullptr;
+
+        return index->as<AstExprCall>();
+    }
+
+    // Luwu bundles: the values of the bundle literal `key`, in order, in new consecutive registers. Returns the first.
+    uint8_t compileBundleKeyValues(AstExprCall* key)
+    {
+        uint8_t values = allocReg(key, unsigned(key->args.size));
+
+        for (size_t i = 0; i < key->args.size; ++i)
+            compileExprTemp(key->args.data[i], uint8_t(values + i));
+
+        return values;
+    }
+
+    // Luwu bundles: the most values a bundle key read from registers has, which is the largest fixed-size bundle
+    static constexpr size_t kMaxBundleKeyValues = 6;
 
     LValue compileLValue(AstExpr* node, RegScope& rs)
     {
@@ -8981,6 +10069,11 @@ struct Compiler
             }
             break;
 
+        case LValue::Kind_IndexBundle:
+            bytecode.emitABC(set ? LOP_SETTABLEBUNDLE : LOP_GETTABLEBUNDLE, reg, lv.reg, lv.index);
+            bytecode.emitAux(lv.number);
+            break;
+
         case LValue::Kind_IndexExpr:
             bytecode.emitABC(set ? LOP_SETTABLE : LOP_GETTABLE, reg, lv.reg, lv.index);
 
@@ -9014,9 +10107,7 @@ struct Compiler
         if (AstExprLocal* expr = getExprLocal(node))
         {
             // note: this can't check expr->upvalue because upvalues may be upgraded to locals during inlining
-            Local* l = locals.find(expr->local);
-
-            return l && l->allocated ? l->reg : -1;
+            return getLocalReg(expr->local);
         }
         else if (FFlag::LuwuClasses)
         {
@@ -10311,8 +11402,10 @@ struct Compiler
         {
             const LValue& li = var.lvalue;
 
-            if ((li.kind == LValue::Kind_IndexName || li.kind == LValue::Kind_IndexNumber || li.kind == LValue::Kind_IndexExpr) &&
-                visitor.assigned[li.reg])
+            bool indexes = li.kind == LValue::Kind_IndexName || li.kind == LValue::Kind_IndexNumber || li.kind == LValue::Kind_IndexExpr ||
+                           li.kind == LValue::Kind_IndexBundle;
+
+            if (indexes && visitor.assigned[li.reg])
                 visitor.conflict[li.reg] = true;
 
             if (li.kind == LValue::Kind_IndexExpr && visitor.assigned[li.index])
@@ -10751,9 +11844,13 @@ struct Compiler
                 pushLocal(stat->name, var, kDefaultAllocPc);
                 if (FFlag::LuauExportValueSyntax)
                     checkExportedLocal(stat->name, stat->location);
-                compileExprFunction(stat->func, var);
+                size_t closure = compileExprFunction(stat->func, var);
 
                 Local& l = locals[stat->name];
+
+                // Luwu: when inlining compiled every call, nothing reads the local (markUnreadClosures)
+                if (options.optimizationLevel >= 2)
+                    l.closureEdge = closure;
 
                 // we *have* to pushLocal before we compile the function, since the function may refer to the local as an upvalue
                 // however, this means the debugpc for the local is at an instruction where the local value hasn't been computed yet
@@ -10852,6 +11949,8 @@ struct Compiler
 
         l.reg = reg;
         l.allocated = true;
+        l.read = false;
+        l.closureEdge = kNoClosureEdge;
         l.debugpc = bytecode.getDebugPC();
         l.allocpc = allocpc == kDefaultAllocPc ? l.debugpc : allocpc;
 
@@ -10914,9 +12013,80 @@ struct Compiler
         }
     }
 
+    // Luwu: a local function's closure is never called when nothing read the local in its scope: inlining compiled
+    // every call to it, or it has none. The closure is still made, but stubUncalledFunctions can drop its body.
+    void markUnreadClosures(size_t start)
+    {
+        LUAU_ASSERT(start <= localStack.size());
+
+        for (size_t i = start; i < localStack.size(); ++i)
+        {
+            Local* l = locals.find(localStack[i]);
+            LUAU_ASSERT(l);
+
+            if (l->closureEdge != kNoClosureEdge && !l->read)
+                closureEdges[l->closureEdge].called = false;
+        }
+    }
+
+    // Luwu: replaces the body of every inlined function none of whose closures can be called, since inlining copied it
+    // wherever it's called. A local function that's never called keeps its body: that's dead code the user wrote. Only
+    // a local function's closures can be marked unread, so every other function counts as one that can run, whatever
+    // made it (a class method, the main chunk).
+    void stubUncalledFunctions()
+    {
+        DenseHashSet<uint32_t> candidates{~0u};
+        for (const ClosureEdge& edge : closureEdges)
+        {
+            const Function* f = functions.find(edge.function);
+            LUAU_ASSERT(f);
+
+            if (!edge.called && f->inlined)
+                candidates.insert(f->id);
+        }
+
+        if (candidates.empty())
+            return;
+
+        DenseHashSet<uint32_t> live{~0u};
+        for (const auto& entry : functions)
+        {
+            if (!candidates.contains(entry.second.id))
+                live.insert(entry.second.id);
+        }
+
+        // a closure that can be called, made by a live function, makes its child live; repeat until nothing changes,
+        // for nested closures
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+
+            for (const ClosureEdge& edge : closureEdges)
+            {
+                uint32_t child = functions.find(edge.function)->id;
+
+                bool makesLive = edge.called && live.contains(edge.parent) && !live.contains(child);
+                if (makesLive)
+                {
+                    live.insert(child);
+                    changed = true;
+                }
+            }
+        }
+
+        for (uint32_t fid : candidates)
+        {
+            if (!live.contains(fid))
+                bytecode.stubFunction(fid);
+        }
+    }
+
     void popLocals(size_t start)
     {
         LUAU_ASSERT(start <= localStack.size());
+
+        markUnreadClosures(start);
 
         for (size_t i = start; i < localStack.size(); ++i)
         {
@@ -10927,7 +12097,10 @@ struct Compiler
             l->allocated = false;
             regCaptured[l->reg] = false;
 
-            if (options.debugLevel >= 2)
+            // Luwu: a debugger mustn't call a closure whose body may have been stubbed
+            bool closureUnread = l->closureEdge != kNoClosureEdge && !closureEdges[l->closureEdge].called;
+
+            if (options.debugLevel >= 2 && !closureUnread)
             {
                 uint32_t debugpc = bytecode.getDebugPC();
 
@@ -11135,6 +12308,32 @@ struct Compiler
 
             // the local itself isn't visited, so it doesn't count as escaping
             return !fieldRead;
+        }
+
+        // the bindings a pattern makes read the result by position
+        bool visitsPatternClauses() const override
+        {
+            return true;
+        }
+
+        // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `r is Ok(value)` reads its flag, so the result
+        // doesn't escape when every alternative is `Ok` or `Err`. Any other pattern needs the result's object, and a
+        // `case` arm's subject isn't read anywhere the visitor goes, so it's marked here.
+        bool visit(AstExprMatchPattern* node) override
+        {
+            for (const AstPatternAlternative& alternative : node->alternatives)
+            {
+                bool variant = alternative.kind == AstPatternAlternative::Class && compiler.builtinResultVariant(alternative.operand);
+                if (variant)
+                    continue;
+
+                if (node->subject)
+                    escaped.insert(node->subject);
+                return true;
+            }
+
+            AstExprLocal* local = node->value ? node->value->as<AstExprLocal>() : nullptr;
+            return !(local && !local->upvalue);
         }
 
         bool visit(AstExprCall* node) override
@@ -11366,6 +12565,15 @@ struct Compiler
         }
     };
 
+    // Luwu Classes (rfcs/classes): a class's constructor, the function a call on the class runs, and the call to the
+    // class its body compiles: `Class(params...)` for a primary constructor, `Class(...)` for an explicit `__init`, and
+    // `Class(fields)` for a class without one
+    struct ClassConstructor
+    {
+        AstExprFunction* function = nullptr;
+        AstExprCall* construction = nullptr;
+    };
+
     // A single `field = defaultExpr` to inline into a class's `__init` prologue.
     struct ClassFieldDefault
     {
@@ -11395,6 +12603,7 @@ struct Compiler
         DenseHashMap<AstStatClass*, AstExprFunction*>& traitInitFn;
         DenseHashMap<AstStatClass*, AstExprFunction*>& traitNeedsFn;
         DenseHashMap<AstStatClass*, AstExprFunction*>& classImplementsFn;
+        DenseHashMap<AstStatClass*, ClassConstructor>& classConstructors;
         DenseHashMap<AstStatClass*, std::vector<AstExpr*>>& podConstDefaults;
         DenseHashMap<AstExprFunction*, SelfClassCheck>& methodSelfChecks;
         DenseHashMap<AstExprFunction*, AstStatClass*>& methodOwner;
@@ -11411,6 +12620,7 @@ struct Compiler
             DenseHashMap<AstStatClass*, AstExprFunction*>& traitInitFn,
             DenseHashMap<AstStatClass*, AstExprFunction*>& traitNeedsFn,
             DenseHashMap<AstStatClass*, AstExprFunction*>& classImplementsFn,
+            DenseHashMap<AstStatClass*, ClassConstructor>& classConstructors,
             DenseHashMap<AstStatClass*, std::vector<AstExpr*>>& podConstDefaults,
             DenseHashMap<AstExprFunction*, SelfClassCheck>& methodSelfChecks,
             DenseHashMap<AstExprFunction*, AstStatClass*>& methodOwner,
@@ -11426,6 +12636,7 @@ struct Compiler
             , traitInitFn(traitInitFn)
             , traitNeedsFn(traitNeedsFn)
             , classImplementsFn(classImplementsFn)
+            , classConstructors(classConstructors)
             , podConstDefaults(podConstDefaults)
             , methodSelfChecks(methodSelfChecks)
             , methodOwner(methodOwner)
@@ -11770,6 +12981,56 @@ struct Compiler
             functionsToCompile.push_back(fn);
         }
 
+        // Luwu Classes (rfcs/classes): the constructor of the class `node`, the function a call on the class runs. Its
+        // parameters are the primary constructor's, an explicit `__init`'s (`...` when `__init` takes `...`), or the POD
+        // constructor's argument table. Its body is empty here: compileClassConstructor compiles `construction`, a call
+        // of the class with those parameters, the way a call site in the class's module would.
+        void buildConstructor(AstStatClass* node, AstExprFunction* init)
+        {
+            size_t functionDepth = node->name->functionDepth + 1;
+            const Location& loc = node->location;
+
+            std::vector<AstLocal*> params;
+            bool vararg = false;
+
+            // The construction binds the primary constructor's parameters to the arguments, so the constructor's are
+            // separate locals with the same names. A fixed `__init` gets its parameters (after `self`) the same way:
+            // `__init` drops extra arguments and reads missing ones as nil either way.
+            auto addParams = [&](const AstArray<AstLocal*>& source, size_t skip)
+            {
+                for (size_t i = skip; i < source.size; ++i)
+                    params.push_back(buildSynthesizedLocal(source.data[i]->name.value, source.data[i]->location, functionDepth));
+            };
+
+            if (node->primaryConstructor)
+                addParams(node->primaryConstructor->args, 0);
+            else if (init && init->vararg)
+                vararg = true;
+            else if (init)
+                addParams(init->args, init->self ? 0 : 1);
+            else
+                params.push_back(buildSynthesizedLocal("fields", loc, functionDepth));
+
+            std::vector<AstExpr*> args;
+            for (AstLocal* param : params)
+                args.push_back(allocator.alloc<AstExprLocal>(loc, param, /* upvalue= */ false));
+
+            if (vararg)
+                args.push_back(allocator.alloc<AstExprVarargs>(loc));
+
+            // parameter defaults are the construction's to apply (tryCompileNewObjectFieldParameters), not a prologue's
+            std::vector<AstExpr*> argsDefaults(params.size(), nullptr);
+
+            AstExprFunction* fn = buildSynthesizedFunction(node, loc, copyToAst(params), copyToAst(argsDefaults), {}, node->name->name.value);
+            fn->vararg = vararg;
+
+            AstExpr* callee = allocator.alloc<AstExprGlobal>(loc, node->name->name);
+            AstExprCall* construction = allocator.alloc<AstExprCall>(loc, callee, copyToAst(args), /* self= */ false, AstArray<AstTypeOrPack>{}, loc);
+
+            classConstructors[node] = ClassConstructor{fn, construction};
+            functionsToCompile.push_back(fn);
+        }
+
         bool visit(AstStatClass* node) override
         {
             // Luwu Traits (rfcs/classes/traits.md): a trait is never constructed and its members are copied into classes at
@@ -11916,6 +13177,8 @@ struct Compiler
                 podDefaultsFn[node] = fn;
                 functionsToCompile.push_back(fn);
             }
+
+            buildConstructor(node, init);
 
             return true;
         }
@@ -12119,6 +13382,8 @@ struct Compiler
         uint32_t instructionCount = 0;
         // Luwu: the body has a loop that wasn't unrolled (LuwuCompileInlineFewCallSites)
         bool hasLoops = false;
+        // Luwu: the body was inlined into a caller somewhere (stubUncalledFunctions)
+        bool inlined = false;
         bool returnsOne = false;
 
         ReturnKind returnKind = ReturnKind::None;
@@ -12131,6 +13396,9 @@ struct Compiler
         uint8_t reg = 0;
         bool allocated = false;
         bool captured = false;
+        // Luwu: getLocalReg handed out the register, and the closure in closureEdges a local function statement made
+        bool read = false;
+        size_t closureEdge = kNoClosureEdge;
         uint32_t debugpc = 0;
         uint32_t allocpc = 0;
     };
@@ -12223,6 +13491,13 @@ struct Compiler
     DenseHashMap<AstStatClass*, AstExprFunction*> traitInitFn;
     DenseHashMap<AstStatClass*, AstExprFunction*> traitNeedsFn;
     DenseHashMap<AstStatClass*, AstExprFunction*> classImplementsFn;
+    // Luwu Classes (rfcs/classes): populated by ClassInitDefaultsVisitor. Each class's constructor, the function a call
+    // on the class runs (LuauClass::constructor), and the construction its body compiles (compileClassConstructor).
+    // constructorClass maps the function back to its class.
+    DenseHashMap<AstStatClass*, ClassConstructor> classConstructors;
+    DenseHashMap<AstExprFunction*, AstStatClass*> constructorClass;
+    // The class whose constructor is being compiled, whose initializers can read any local (see PrimaryInitInlineVisitor)
+    AstStatClass* constructorBeingCompiled = nullptr;
     // Luwu Traits (rfcs/classes/traits.md): the function that initializes each implementing class's trait fields
     // (compileTraitInit): its `__init`, explicit or synthesized from a primary constructor, or its `__implements`.
     // Maps the function to its class.
@@ -12407,7 +13682,14 @@ struct Compiler
     // Luwu: how many direct calls each function has in the module (CallSiteVisitor), and how deep the compiler is in
     // code it compiles more than once (RepeatedCompile)
     DenseHashMap<AstExprFunction*, unsigned> directCallSites{nullptr};
+    // Luwu: how many method calls (`x:name()`) each name has in the module, for encouragedCallSites
+    DenseHashMap<AstName, unsigned> methodCallSites{AstName()};
     unsigned repeatedCompileDepth = 0;
+
+    // Luwu: the local each function's direct call names (null when the callee isn't a plain local), and how many times
+    // each local is read, for isOnlyCallSite
+    DenseHashMap<AstExprFunction*, AstLocal*> onlyCallSiteCallees{nullptr};
+    DenseHashMap<AstLocal*, unsigned> localReads{nullptr};
 
     // Luwu: the instructions inlining has added to the function being compiled (LuwuCompileInlineBudget), and where the
     // outermost inline being compiled began
@@ -12416,6 +13698,18 @@ struct Compiler
 
     // Luwu: the module says `--!native` (LuwuCompileInlineNativeCallCost)
     bool nativeModule = false;
+
+    // Luwu: a closure compileExprFunction made in the code of the function with id `parent`. `called` is cleared when
+    // nothing reads the local function it was made for (markUnreadClosures).
+    struct ClosureEdge
+    {
+        uint32_t parent;
+        AstExprFunction* function;
+        bool called;
+    };
+
+    std::vector<ClosureEdge> closureEdges;
+    uint32_t currentFunctionId = ~0u;
     // Luwu Classes (rfcs/classes): classes whose initializers are being compiled at a construction site
     // (tryCompileNewObjectFieldParameters), innermost last
     std::vector<AstStatClass*> fieldsExpansionStack;
@@ -12489,6 +13783,7 @@ void compileOrThrow(BytecodeBuilder& bytecode, const ParseResult& parseResult, A
             compiler.traitInitFn,
             compiler.traitNeedsFn,
             compiler.classImplementsFn,
+            compiler.classConstructors,
             compiler.classPodConstDefaults,
             compiler.classMethodSelfChecks,
             compiler.classMethodOwner,
@@ -12516,6 +13811,12 @@ void compileOrThrow(BytecodeBuilder& bytecode, const ParseResult& parseResult, A
 
         for (auto [decl, fn] : compiler.classImplementsFn)
             compiler.classLexicalOwner[fn] = decl;
+
+        for (auto [decl, constructor] : compiler.classConstructors)
+        {
+            compiler.classLexicalOwner[constructor.function] = decl;
+            compiler.constructorClass[constructor.function] = decl;
+        }
 
         for (auto [name, decl] : compiler.classByName)
         {
@@ -12697,6 +13998,7 @@ void compileOrThrow(BytecodeBuilder& bytecode, const ParseResult& parseResult, A
     LUAU_ASSERT(mainf && mainf->upvals.empty());
 
     bytecode.setMainFunction(mainid);
+    compiler.stubUncalledFunctions();
     bytecode.finalize();
 }
 

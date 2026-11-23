@@ -35,6 +35,7 @@ LUAU_FASTFLAG(LuwuTraits)
 LUAU_FASTFLAG(LuwuStringExtensions)
 // Defined by the VM, which introduces `none`; without it there is nothing to mix up with `nil`.
 LUAU_FASTFLAG(LuwuNonePrimitive)
+LUAU_FASTFLAG(DebugLuwuMatchExpressions)
 
 namespace Luau
 {
@@ -248,8 +249,13 @@ static bool similar(AstExpr* lhs, AstExpr* rhs)
     CASE(AstExprDo) return false;
     // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): each evaluation builds a new table
     CASE(AstExprTableComprehension) return false;
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): patterns can bind names and arms run code
+    CASE(AstExprMatchPattern) return false;
+    CASE(AstExprMatch) return false;
     // Luwu Push and Pop Operators (rfcs/push-pop-operators.md): each pop takes a different element
     CASE(AstExprPop) return false;
+    // Luwu try expressions: `try` runs its expression to catch what it raises, so two are never the same check
+    CASE(AstExprTry) return false;
     else
     {
         LUAU_ASSERT(!"Unknown expression type");
@@ -1085,25 +1091,6 @@ private:
     {
         visit(static_cast<AstExpr*>(node));
 
-        // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a type test's hidden local and the test it gives
-        // are parts of the statement around it, not statements
-        if (node->fromTypeTest)
-        {
-            for (AstStat* stmt : node->body->body)
-            {
-                if (AstStatLocal* hidden = stmt->as<AstStatLocal>())
-                {
-                    for (AstExpr* value : hidden->values)
-                        value->visit(this);
-                }
-                else if (AstStatGive* give = stmt->as<AstStatGive>())
-                    give->value->visit(this);
-            }
-
-            stack.back().lastLine = std::max(stack.back().lastLine, node->location.end.line);
-            return false;
-        }
-
         Location outer = stack.back().start;
 
         for (AstStat* stmt : node->body->body)
@@ -1151,6 +1138,13 @@ private:
 class LintLocalHygiene : AstVisitor
 {
 public:
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a `case` arm's name is declared by a clause the arm
+    // makes, which this lint checks like any other local
+    bool visitsPatternClauses() const override
+    {
+        return true;
+    }
+
     LUAU_NOINLINE static void process(LintContext& context)
     {
         LintLocalHygiene pass;
@@ -1197,6 +1191,9 @@ private:
     DenseHashMap<AstName, AstLocal*> fieldLocals;
     DenseHashMap<AstName, Global> globals;
     DenseHashMap<AstName, AstStatClass*> classes;
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `none` in a pattern, which is the primitive whatever a
+    // local named `none` holds
+    std::vector<AstExprGlobal*> nonePatterns;
 
     LintLocalHygiene()
         : locals(NULL)
@@ -1210,6 +1207,7 @@ private:
     void report()
     {
         reportUnusedLoopVariables();
+        reportNonePatterns();
 
         for (auto& l : locals)
         {
@@ -1243,6 +1241,31 @@ private:
                     l.first->name.value
                 );
         }
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `x is none` in a module that declares a local named
+    // `none`. The pattern checks for the primitive like `x is string` does, which a reader could take for the local.
+    void reportNonePatterns()
+    {
+        AstLocal* declared = nullptr;
+        for (auto& l : locals)
+        {
+            bool earlier = !declared || l.first->location.begin < declared->location.begin;
+            if (l.first->name == "none" && earlier)
+                declared = l.first;
+        }
+
+        if (!declared)
+            return;
+
+        for (AstExprGlobal* none : nonePatterns)
+            emitWarning(
+                *context,
+                LintWarning::Code_LocalShadow,
+                none->location,
+                "'none' in a pattern always checks against the 'none' primitive, not the local declared at line %d",
+                declared->location.begin.line + 1
+            );
     }
 
     // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `case limit` where `limit` is a local, or a global this
@@ -1521,6 +1544,18 @@ private:
         else
             l.used = true;
 
+        return true;
+    }
+
+    bool visit(AstExprMatchPattern* node) override
+    {
+        for (const AstPatternAlternative& alternative : node->alternatives)
+        {
+            bool isValue = alternative.kind == AstPatternAlternative::Value && alternative.operand;
+            AstExprGlobal* global = isValue ? alternative.operand->as<AstExprGlobal>() : nullptr;
+            if (global && global->name == "none")
+                nonePatterns.push_back(global);
+        }
         return true;
     }
 
@@ -4086,7 +4121,7 @@ private:
                         *context,
                         LintWarning::Code_TableOperations,
                         args[1]->location,
-                        "If this is `nil`, `table.remove` will remove the last element of the array.\nConsider using `table.drop` instead. If order is not important, use a key/value table for better performance."
+                        "If this is `nil`, `table.remove` will remove the last element of the array.\nConsider using `table.discard` instead. If order is not important, use a key/value table for better performance."
                     );
                 }
             }
@@ -4699,6 +4734,13 @@ private:
 class LintNameShadow : AstVisitor
 {
 public:
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a `case` arm's name is declared by a clause the arm
+    // makes, which this lint checks like any other local
+    bool visitsPatternClauses() const override
+    {
+        return true;
+    }
+
     struct Enabled
     {
         bool keyword = false;
@@ -5904,6 +5946,25 @@ private:
         statementStarts.pop_back();
         return false;
     }
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a match expression's arm starts its line like a
+    // statement, so a `do` in `else do` is indented against the arm's keyword
+    bool visit(AstExprMatch* node) override
+    {
+        if (node->subject.declaration)
+            node->subject.declaration->visit(this);
+        else
+            node->subject.value->visit(this);
+
+        for (const AstMatchArm& arm : node->arms)
+        {
+            statementStarts.push_back(arm.keywordLocation.begin);
+            arm.visitCondition(this);
+            if (arm.value)
+                arm.value->visit(this);
+            statementStarts.pop_back();
+        }
+        return false;
+    }
 
     bool visit(AstExprDo* node) override
     {
@@ -6014,6 +6075,174 @@ private:
                 lastBegin.line + 1,
                 doLine + 1
             );
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a match statement laid out so its lines read as
+    // belonging to something else. Its arms line up at the `match`'s indent or past it, each arm's block is indented past
+    // its arm, and its `end`s line up with what they close. Indented arms close with an `end` at their indent and another
+    // at the `match`'s.
+    bool visit(AstStatMatch* node) override
+    {
+        if (enabled.misleadingIndentation)
+            checkMatchIndentation(node);
+        return true;
+    }
+
+    static const char* armKeyword(const AstMatchArm& arm)
+    {
+        switch (arm.kind)
+        {
+        case AstMatchArm::Case:
+            return "case";
+        case AstMatchArm::When:
+            return "when";
+        case AstMatchArm::Else:
+            return "else";
+        }
+        return "case";
+    }
+
+    // Where an `end` balancing the last arm would go, one line up: the arms' indent on the last arm's last line, as wide as
+    // `end`
+    static Location balancingEndAbove(const AstMatchArm& arm, unsigned int armsColumn)
+    {
+        unsigned int line = arm.keywordLocation.end.line;
+        if (arm.body && arm.body->body.size > 0)
+            line = arm.body->body.data[arm.body->body.size - 1]->location.end.line;
+        return Location(Position(line, armsColumn), Position(line, armsColumn + 3));
+    }
+
+    void checkMatchIndentation(AstStatMatch* node)
+    {
+        if (node->arms.size == 0)
+            return;
+
+        Position matchBegin = node->location.begin;
+        unsigned int matchColumn = startLineColumn(matchBegin);
+        const AstMatchArm& first = node->arms.data[0];
+        // arms written on the `match`'s line have no indent to compare
+        if (first.keywordLocation.begin.line == matchBegin.line)
+            return;
+
+        unsigned int armsColumn = first.keywordLocation.begin.column;
+        bool armsAligned = checkMatchArms(node, matchColumn, armsColumn);
+        if (!armsAligned || !node->hasEnd)
+            return;
+
+        Position endEnd = node->location.end;
+        Location endKeyword(Position(endEnd.line, endEnd.column - 3), endEnd);
+        unsigned int endColumn = endKeyword.begin.column;
+        bool armsIndented = armsColumn > matchColumn;
+
+        if (node->armsEndLocation)
+        {
+            if (node->armsEndLocation->begin.column != armsColumn)
+                emitWarning(
+                    *context,
+                    LintWarning::Code_MisleadingIndentation,
+                    *node->armsEndLocation,
+                    "This 'end' closes the arms of the 'match' on line %d; line it up with the arms",
+                    matchBegin.line + 1
+                );
+        }
+        else if (armsIndented && endColumn == matchColumn)
+        {
+            emitWarning(
+                *context,
+                LintWarning::Code_MisleadingIndentation,
+                balancingEndAbove(node->arms.data[node->arms.size - 1], armsColumn),
+                "Consider putting an extra 'end' under here to visually balance the last case when indented or unindent all cases to "
+                "align with the 'match' keyword on line %d",
+                matchBegin.line + 1
+            );
+        }
+        else if (armsIndented && endColumn == armsColumn)
+        {
+            emitWarning(
+                *context,
+                LintWarning::Code_MisleadingIndentation,
+                endKeyword,
+                "This 'end' closes the 'match' on line %d; add another 'end' below it at the 'match''s indent, or unindent this one",
+                matchBegin.line + 1
+            );
+        }
+        else if (endColumn != matchColumn)
+        {
+            emitWarning(
+                *context,
+                LintWarning::Code_MisleadingIndentation,
+                endKeyword,
+                "This 'end' closes the 'match' on line %d; line it up with the 'match'",
+                matchBegin.line + 1
+            );
+        }
+    }
+
+    // Reports arms left of the `match` or out of line with the first arm, and the first line of each arm's block that isn't
+    // indented past its arm. Returns whether every arm lines up.
+    bool checkMatchArms(AstStatMatch* node, unsigned int matchColumn, unsigned int armsColumn)
+    {
+        unsigned int matchLine = node->location.begin.line;
+        bool aligned = true;
+        for (const AstMatchArm& arm : node->arms)
+        {
+            Position armBegin = arm.keywordLocation.begin;
+            if (armBegin.column < matchColumn)
+            {
+                aligned = false;
+                emitWarning(
+                    *context,
+                    LintWarning::Code_MisleadingIndentation,
+                    arm.keywordLocation,
+                    "This '%s' is left of the 'match' on line %d; indent it to the 'match''s column or one level past it",
+                    armKeyword(arm),
+                    matchLine + 1
+                );
+            }
+            else if (armBegin.column != armsColumn)
+            {
+                aligned = false;
+                emitWarning(
+                    *context,
+                    LintWarning::Code_MisleadingIndentation,
+                    arm.keywordLocation,
+                    "This '%s' isn't lined up with the first arm of the 'match' on line %d; indent it like that arm",
+                    armKeyword(arm),
+                    matchLine + 1
+                );
+            }
+
+            checkMatchArmBody(arm);
+        }
+        return aligned;
+    }
+
+    void checkMatchArmBody(const AstMatchArm& arm)
+    {
+        if (!arm.body)
+            return;
+
+        Position armBegin = arm.keywordLocation.begin;
+        for (AstStat* stat : arm.body->body)
+        {
+            Position begin = stat->location.begin;
+            if (begin.line == armBegin.line || begin.column > armBegin.column)
+                continue;
+
+            Location line = stat->location;
+            if (line.end.line != line.begin.line)
+                line.end = line.begin;
+            emitWarning(
+                *context,
+                LintWarning::Code_MisleadingIndentation,
+                line,
+                "This line is in the '%s' on line %d, but is indented like the arms; indent it past that '%s'",
+                armKeyword(arm),
+                armBegin.line + 1,
+                armKeyword(arm)
+            );
+            return;
+        }
     }
 
     // `return`'s values may start on the next line, as everywhere in Lua. In a `do` expression the `return` is often meant
@@ -6654,6 +6883,9 @@ public:
             context.root->visit(&collector);
         }
 
+        DefinitionCollector definitions{&pass};
+        context.root->visit(&definitions);
+
         context.root->visit(&pass);
         pass.reportFieldMethodCalls(context.root);
     }
@@ -6665,6 +6897,52 @@ private:
     LintContext* context;
     // The names of the classes declared in this file. Empty when class hints are off.
     std::unordered_set<std::string> classes;
+    // The functions a call can be resolved to in this file, for the hint about calls whose values are all passed on:
+    // local functions, the classes declared here, and the class each method's `self` belongs to
+    DenseHashMap<AstLocal*, AstExprFunction*> localFunctions{nullptr};
+    std::unordered_map<std::string, AstStatClass*> declaredClasses;
+    DenseHashMap<AstLocal*, AstStatClass*> selfClasses{nullptr};
+
+    struct DefinitionCollector : AstVisitor
+    {
+        LintOptimizationHint* pass;
+
+        explicit DefinitionCollector(LintOptimizationHint* pass)
+            : pass(pass)
+        {
+        }
+
+        bool visit(AstStatLocalFunction* node) override
+        {
+            pass->localFunctions[node->name] = node->func;
+            return true;
+        }
+
+        bool visit(AstStatLocal* node) override
+        {
+            for (size_t i = 0; i < node->vars.size && i < node->values.size; ++i)
+            {
+                if (AstExprFunction* func = node->values.data[i]->as<AstExprFunction>())
+                    pass->localFunctions[node->vars.data[i]] = func;
+            }
+            return true;
+        }
+
+        bool visit(AstStatClass* node) override
+        {
+            if (!FFlag::LuwuClasses)
+                return true;
+
+            pass->declaredClasses[node->name->name.value] = node;
+            for (const AstClassMember& member : node->members)
+            {
+                const AstClassMethod* method = member.get_if<AstClassMethod>();
+                if (AstLocal* self = method && method->function ? selfOf(method->function) : nullptr)
+                    pass->selfClasses[self] = node;
+            }
+            return true;
+        }
+    };
 
     struct ClassCollector : AstVisitor
     {
@@ -6998,7 +7276,315 @@ private:
     {
         checkFloorDivision(node);
         checkFenv(node);
+        if (node->args.size > 0)
+            checkAllValuesPassedOn(node->args.data[node->args.size - 1], AllValuesUse::Argument);
         return true;
+    }
+
+    bool visit(AstStatReturn* node) override
+    {
+        if (node->list.size > 0)
+            checkAllValuesPassedOn(node->list.data[node->list.size - 1], AllValuesUse::Return);
+        return true;
+    }
+
+    bool visit(AstExprTable* node) override
+    {
+        if (node->items.size > 0 && node->items.data[node->items.size - 1].kind == AstExprTable::Item::Kind::List)
+            checkAllValuesPassedOn(node->items.data[node->items.size - 1].value, AllValuesUse::TableItem);
+        return true;
+    }
+
+    // Where every value of a call is passed on: the compiler only inlines such a call when it knows the call gives one
+    enum class AllValuesUse
+    {
+        Return,
+        Argument,
+        TableItem,
+    };
+
+    // Below this many calls deep, a function returning another call's value is checked through that call too
+    static constexpr int kReturnedCallDepth = 4;
+
+    // A class method named `name`: a static function, or one taking `self` when `takesSelf`
+    static AstExprFunction* findClassFunction(AstStatClass* cls, AstName name, bool takesSelf)
+    {
+        for (const AstClassMember& member : cls->members)
+        {
+            const AstClassMethod* method = member.get_if<AstClassMethod>();
+            if (method && method->function && method->functionName == name && (selfOf(method->function) != nullptr) == takesSelf)
+                return method->function;
+        }
+        return nullptr;
+    }
+
+    // A method's `self`, written `function m(self)` or `function T:m()`, or null for a static function
+    static AstLocal* selfOf(AstExprFunction* func)
+    {
+        if (func->self)
+            return func->self;
+
+        bool selfFirst = func->args.size > 0 && func->args.data[0]->name == "self";
+        return selfFirst ? func->args.data[0] : nullptr;
+    }
+
+    // The function a call always runs, when the compiler can know it: a local function, a static function of a class in
+    // this file (`Self.f` too) and a method called on a method's `self`
+    AstExprFunction* calleeFunction(AstExprCall* call)
+    {
+        AstExpr* callee = unwrapGroup(call->func);
+        if (AstExprLocal* local = callee->as<AstExprLocal>())
+        {
+            AstExprFunction** func = localFunctions.find(local->local);
+            return func && !call->self ? *func : nullptr;
+        }
+
+        AstExprIndexName* index = callee->as<AstExprIndexName>();
+        if (!index)
+            return nullptr;
+
+        AstExpr* object = unwrapGroup(index->expr);
+        if (call->self)
+        {
+            AstExprLocal* receiver = object->as<AstExprLocal>();
+            AstStatClass** cls = receiver ? selfClasses.find(receiver->local) : nullptr;
+            return cls ? findClassFunction(*cls, index->index, /* takesSelf= */ true) : nullptr;
+        }
+
+        AstExprGlobal* global = object->as<AstExprGlobal>();
+        auto cls = global ? declaredClasses.find(global->name.value) : declaredClasses.end();
+        return cls != declaredClasses.end() ? findClassFunction(cls->second, index->index, /* takesSelf= */ false) : nullptr;
+    }
+
+    // Does the compiler know this value is one value? It does for anything but a call or `...`, and for a call it can
+    // resolve to a function that only returns one value. A global or library call typed to give one value counts as
+    // known, since the compiler knows the builtins.
+    bool compilerKnowsOneValue(AstExpr* value, int depth)
+    {
+        AstExprCall* call = value->as<AstExprCall>();
+        if (!call)
+            return !value->is<AstExprVarargs>();
+
+        AstExpr* callee = unwrapGroup(call->func);
+        if (AstExprGlobal* global = callee->as<AstExprGlobal>())
+            return declaredClasses.count(global->name.value) > 0 || typedToGiveOneValue(call);
+
+        AstExprIndexName* index = callee->as<AstExprIndexName>();
+        AstExprGlobal* library = index ? unwrapGroup(index->expr)->as<AstExprGlobal>() : nullptr;
+        bool libraryCall = !call->self && library && !declaredClasses.count(library->name.value);
+        if (libraryCall)
+            return typedToGiveOneValue(call);
+
+        AstExprFunction* func = depth < kReturnedCallDepth ? calleeFunction(call) : nullptr;
+        return func && compilerKnowsReturnsOne(func, depth + 1);
+    }
+
+    // The compiler's rule for a body that never runs off its end (its `alwaysTerminates`), without its constant folding
+    static bool alwaysLeaves(AstStat* node)
+    {
+        if (AstStatBlock* block = node->as<AstStatBlock>())
+        {
+            for (AstStat* stat : block->body)
+            {
+                if (alwaysLeaves(stat))
+                    return true;
+            }
+            return false;
+        }
+
+        // Luwu Do Expressions (rfcs/control-flow/do-expressions.md): `give` leaves its block like `return`
+        if (node->is<AstStatReturn>() || node->is<AstStatBreak>() || node->is<AstStatContinue>() || node->is<AstStatGive>())
+            return true;
+
+        if (AstStatIf* stat = node->as<AstStatIf>())
+            return stat->elsebody && alwaysLeaves(stat->thenbody) && alwaysLeaves(stat->elsebody);
+
+        // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): every arm leaves, and some arm always matches
+        if (AstStatMatch* stat = node->as<AstStatMatch>())
+        {
+            if (!matchesEveryValue(stat->arms))
+                return false;
+
+            for (const AstMatchArm& arm : stat->arms)
+            {
+                if (!alwaysLeaves(arm.body))
+                    return false;
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    // Roughly the compiler's inlining cost of a body: its statements and expressions, a loop's body three times. Nested
+    // functions aren't counted.
+    struct InlineCostCounter : AstVisitor
+    {
+        size_t cost = 0;
+        size_t loopDepth = 0;
+
+        size_t weight() const
+        {
+            size_t result = 1;
+            for (size_t i = 0; i < loopDepth; ++i)
+                result *= 3;
+            return result;
+        }
+
+        bool visit(AstExprFunction*) override
+        {
+            return false;
+        }
+
+        bool visit(AstExpr*) override
+        {
+            cost += weight();
+            return true;
+        }
+
+        bool visit(AstStat*) override
+        {
+            cost += weight();
+            return true;
+        }
+
+        bool visit(AstStatWhile* node) override
+        {
+            return visitLoop(node->condition, node->body);
+        }
+
+        bool visit(AstStatRepeat* node) override
+        {
+            return visitLoop(node->condition, node->body);
+        }
+
+        bool visit(AstStatFor* node) override
+        {
+            return visitLoop(nullptr, node->body);
+        }
+
+        bool visit(AstStatForIn* node) override
+        {
+            return visitLoop(nullptr, node->body);
+        }
+
+        bool visitLoop(AstExpr* condition, AstStat* body)
+        {
+            cost += weight();
+            ++loopDepth;
+            if (condition)
+                condition->visit(this);
+            body->visit(this);
+            --loopDepth;
+            return false;
+        }
+    };
+
+    // Past this rough cost (InlineCostCounter) the compiler won't inline a function however few calls it has, so
+    // parentheses wouldn't help
+    static constexpr size_t kInlineCostLimit = 75;
+
+    static bool cheapEnoughToInline(AstExprFunction* func)
+    {
+        InlineCostCounter counter;
+        func->body->visit(&counter);
+        return counter.cost <= kInlineCostLimit;
+    }
+
+    // The compiler's rule: the function never runs off its end, and every `return` in it has one value it knows is one
+    // value
+    bool compilerKnowsReturnsOne(AstExprFunction* func, int depth)
+    {
+        if (!alwaysLeaves(func->body))
+            return false;
+
+        struct ReturnFinder : AstVisitor
+        {
+            LintOptimizationHint* pass = nullptr;
+            int depth = 0;
+            bool returnsOne = true;
+
+            bool visit(AstExpr*) override
+            {
+                return false;
+            }
+
+            bool visit(AstStatReturn* node) override
+            {
+                returnsOne = returnsOne && node->list.size == 1 && pass->compilerKnowsOneValue(node->list.data[0], depth);
+                return false;
+            }
+        };
+
+        ReturnFinder finder;
+        finder.pass = this;
+        finder.depth = depth;
+        func->body->visit(&finder);
+        return finder.returnsOne;
+    }
+
+    bool typedToGiveOneValue(AstExprCall* call)
+    {
+        std::optional<TypeId> calleeType = context->getType(call->func);
+        const FunctionType* function = calleeType ? get<FunctionType>(follow(*calleeType)) : nullptr;
+        if (!function)
+            return false;
+
+        auto [values, tail] = flatten(function->retTypes);
+        return values.size() == 1 && !tail;
+    }
+
+    // `return f(x)`, `g(f(x))` and `{ f(x) }` pass on every value `f` gives, so the compiler can't inline `f` there
+    // unless it knows `f` gives one. When `f` is typed to give one value and the compiler can't tell, parentheses keep
+    // one value and let it inline.
+    void checkAllValuesPassedOn(AstExpr* value, AllValuesUse use)
+    {
+        AstExprCall* call = value->as<AstExprCall>();
+        bool hintApplies = context->asksForSpeed && call && context->warningEnabled(LintWarning::Code_OptimizationHint);
+        if (!hintApplies)
+            return;
+
+        // A function calling itself is never inlined there, and a big one isn't inlined anywhere
+        AstExprFunction* func = calleeFunction(call);
+        bool inlinable = func && !func->location.encloses(call->location) && cheapEnoughToInline(func);
+        bool needsParentheses = inlinable && typedToGiveOneValue(call) && !compilerKnowsReturnsOne(func, 0);
+        if (!needsParentheses)
+            return;
+
+        std::string callee = toString(call->func);
+        switch (use)
+        {
+        case AllValuesUse::Return:
+            emitWarning(
+                *context,
+                LintWarning::Code_OptimizationHint,
+                call->location,
+                "Wrap this call in parentheses so it gets inlined by the compiler: 'return (%s(...))' proves the call "
+                "evaluates to exactly one value at runtime",
+                callee.c_str()
+            );
+            break;
+        case AllValuesUse::Argument:
+            emitWarning(
+                *context,
+                LintWarning::Code_OptimizationHint,
+                call->location,
+                "Wrap this call in parentheses or pass another argument after it so it gets inlined by the compiler: "
+                "'(%s(...))' proves the call evaluates to exactly one value at runtime",
+                callee.c_str()
+            );
+            break;
+        case AllValuesUse::TableItem:
+            emitWarning(
+                *context,
+                LintWarning::Code_OptimizationHint,
+                call->location,
+                "Wrap this call in parentheses so it gets inlined by the compiler: '(%s(...))' proves the call evaluates to "
+                "exactly one value at runtime",
+                callee.c_str()
+            );
+            break;
+        }
     }
 
     // `self.pos:add(...)` several times in one function: a field can't be proven in place, so none of the calls are
@@ -9317,7 +9903,7 @@ public:
 private:
     LintContext* context;
 
-    // The library `node` reads a member of: a global library (`table.drop`), or `string` for a method on a string. A
+    // The library `node` reads a member of: a global library (`table.discard`), or `string` for a method on a string. A
     // local named `table` is the reader's own, so it doesn't count.
     std::optional<std::string> libraryOf(AstExprIndexName* node)
     {
@@ -10038,6 +10624,88 @@ private:
                 );
         }
 
+        return true;
+    }
+};
+
+// Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): `x is "meow"` or `x is not LIMIT`, a pattern with one
+// value that reads better as `x == "meow"` or `x ~= LIMIT`. A union of values (`x is "Meow" | "meow"`) saves repeating `x`
+// and isn't reported, and neither is a `case` arm.
+class LintIsComparison : AstVisitor
+{
+public:
+    LUAU_NOINLINE static void process(LintContext& context)
+    {
+        LintIsComparison pass;
+        pass.context = &context;
+
+        context.root->visit(&pass);
+    }
+
+private:
+    LintContext* context;
+
+    // Every value of the type is a primitive or a singleton, so a name holding one can't be a class
+    static bool holdsPlainValues(TypeId ty)
+    {
+        ty = follow(ty);
+        if (get<PrimitiveType>(ty) || get<SingletonType>(ty))
+            return true;
+
+        const UnionType* options = get<UnionType>(ty);
+        if (!options)
+            return false;
+
+        for (TypeId option : options)
+        {
+            if (!holdsPlainValues(option))
+                return false;
+        }
+        return true;
+    }
+
+    // `nil` or `none`, which a pattern checks for like a type (`x is None`)
+    static bool isNothing(TypeId ty)
+    {
+        const PrimitiveType* primitive = get<PrimitiveType>(follow(ty));
+        return primitive && (primitive->type == PrimitiveType::NilType || primitive->type == PrimitiveType::NoneType);
+    }
+
+    // A literal other than `nil` and `none`, or a name holding other plain values, with nothing destructured from it. Type
+    // checks (`x is string`) are never comparisons.
+    bool comparesOneValue(const AstPatternAlternative& alternative)
+    {
+        AstExpr* operand = alternative.operand;
+        if (!operand || alternative.location != operand->location)
+            return false;
+
+        if (alternative.kind == AstPatternAlternative::Value)
+            return operand->is<AstExprConstantString>() || operand->is<AstExprConstantNumber>() || operand->is<AstExprConstantBool>();
+
+        std::optional<TypeId> type = alternative.kind == AstPatternAlternative::Class ? context->getType(operand) : std::nullopt;
+        return type && !isNothing(*type) && holdsPlainValues(*type);
+    }
+
+    // The operand as the user wrote it: a string keeps its quotes, which the printer turns into single quotes
+    static std::string operandText(AstExpr* operand)
+    {
+        const AstExprConstantString* string = operand->as<AstExprConstantString>();
+        if (!string || string->quoteStyle != AstExprConstantString::QuoteStyle::QuotedSimple)
+            return toString(operand);
+        return "\"" + std::string(string->value.data, string->value.size) + "\"";
+    }
+
+    bool visit(AstExprMatchPattern* node) override
+    {
+        bool comparison = node->value && !node->implements && node->alternatives.size == 1 && comparesOneValue(node->alternatives.data[0]);
+        if (comparison)
+        {
+            std::string value = toString(node->value);
+            std::string operand = operandText(node->alternatives.data[0].operand);
+            emitWarning(
+                *context, LintWarning::Code_IsComparison, node->location, "Did you mean '%s %s %s'?", value.c_str(), node->negated ? "~=" : "==", operand.c_str()
+            );
+        }
         return true;
     }
 };
@@ -11046,6 +11714,7 @@ static LintWarning::Code lintGroupOf(LintWarning::Code code)
     case LintWarning::Code_InlineOrLeave:
     case LintWarning::Code_LuaGuard:
     case LintWarning::Code_ConfusingGuard:
+    case LintWarning::Code_IsComparison:
         return LintWarning::Code_Style;
     case LintWarning::Code_DuplicateKey:
     case LintWarning::Code_DuplicateProperty:
@@ -11564,6 +12233,9 @@ std::vector<LintWarning> lint(
     if (FFlag::LuwuDoExpr && context.warningEnabled(LintWarning::Code_OrReturnComma))
         LintOrReturnComma::process(context);
 
+    if (FFlag::DebugLuwuMatchExpressions && context.warningEnabled(LintWarning::Code_IsComparison))
+        LintIsComparison::process(context);
+
     // UnflippedGuard also checks plain `if` guards, so it runs without do expressions
     LintDoExpressions::Enabled doExpressions;
     doExpressions.returnOnNextLine = FFlag::LuwuDoExpr && context.warningEnabled(LintWarning::Code_ReturnOnNextLine);
@@ -11646,7 +12318,10 @@ std::vector<LintWarning> lint(
     }
 
     if (context.anyWarningEnabled(
-            {LintWarning::Code_MethodsNotInlined, LintWarning::Code_FloorDivision, LintWarning::Code_FenvDeoptimization}
+            {LintWarning::Code_OptimizationHint,
+             LintWarning::Code_MethodsNotInlined,
+             LintWarning::Code_FloorDivision,
+             LintWarning::Code_FenvDeoptimization}
         ))
     {
         LintOptimizationHint::process(context, hotcomments);

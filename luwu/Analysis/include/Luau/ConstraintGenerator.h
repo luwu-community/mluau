@@ -172,6 +172,8 @@ struct ConstraintGenerator
     {
         // `error(...)` as the body's last statement: reaching it is a bug, not an error the function raises
         AstExprCall* unreachableError = nullptr;
+        // the function's `! E` hint: its body's errors are checked against it instead of joining it
+        std::optional<TypeId> declared;
         std::vector<TypeId> types;
     };
     std::vector<RaisedErrors> raisedErrors;
@@ -659,7 +661,19 @@ private:
      * @param fn the function expression to check.
      */
     void checkFunctionBody(const ScopePtr& scope, AstExprFunction* fn);
-    void recordRaisedError(AstExprCall* call, const std::vector<TypeId>& args);
+    void recordRaisedError(
+        const ScopePtr& scope,
+        AstExprCall* call,
+        const std::vector<TypeId>& args,
+        std::optional<TypePackId> argTail
+    );
+    TypeId raisedErrorType(
+        const ScopePtr& scope,
+        AstExprCall* call,
+        const std::vector<TypeId>& args,
+        std::optional<TypePackId> argTail
+    );
+    std::optional<TypeId> annotatedHintFor(AstExprCall* call, size_t index);
     void weakenUnknownMembers(AstTypeUnion* annotation, std::vector<TypeId>& members);
     std::optional<FunctionType::TruthyRefinement> resolveTruthyRefinement(const ScopePtr& signatureScope, AstExprFunction* fn);
 

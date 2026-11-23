@@ -10,8 +10,8 @@ LUAU_FASTFLAG(LuwuTraits)
 LUAU_FASTFLAG(LuauUdtfTypeIsSubtypeOf)
 LUAU_FASTFLAG(LuwuBufferIsFrozen)
 LUAU_FASTFLAG(LuwuBufferBatched)
-LUAU_FASTFLAG(LuwuBufferMemcmp)
-LUAU_FASTFLAG(LuwuTableDrop)
+LUAU_FASTFLAG(DebugLuwuBufferComparison)
+LUAU_FASTFLAG(LuwuTableDiscard)
 LUAU_FASTFLAG(DebugLuwuBuiltinClasses)
 LUAU_FASTFLAG(DebugLuwuBundles)
 LUAU_FASTFLAG(LuwuDeclareStatements)
@@ -216,7 +216,7 @@ declare table: {
     sort: <V>(t: {V}, comp: ((V, V) -> boolean)?) -> (),
     create: <V>(count: number, value: V?) -> {V},
     find: <V>(haystack: {V}, needle: V, init: number?) -> number?,
-    drop: <V>(t: {V}, value: V, count: number?) -> number,
+    discard: <V>(t: {V}, value: V, count: number?) -> number,
 
     unpack: <V>(list: {V}, i: number?, j: number?) -> ...V,
     pack: <V>(...V) -> { n: number, [number]: V },
@@ -316,9 +316,10 @@ static constexpr const char* kBuiltinDefinitionBufferSrcBatched = R"BUILTIN_SRC(
     packf64: @checked (b: buffer, offset: number, ...number) -> (),
 )BUILTIN_SRC";
 
-// Luwu buffer.memcmp (rfcs/buffer-memcmp.md):
-static constexpr const char* kBuiltinDefinitionBufferSrcMemcmp = R"BUILTIN_SRC(
-    memcmp: @checked (b1: buffer, b2: buffer, offset1: number?, offset2: number?, count: number?) -> number,
+// Luwu buffer.order buffer.equals (rfcs/buffer-comparison.md):
+static constexpr const char* kBuiltinDefinitionBufferSrcComparison = R"BUILTIN_SRC(
+    order: @checked (b1: buffer, b2: buffer, offset1: number?, offset2: number?, count: number?) -> "less" | "same" | "greater",
+    equals: @checked (b1: buffer, b2: buffer, offset1: number?, offset2: number?, count: number?) -> boolean,
 )BUILTIN_SRC";
 
 static constexpr const char* kBuiltinDefinitionBufferSrcClose = R"BUILTIN_SRC(
@@ -514,7 +515,8 @@ class type Vec<T>
     public function push(self, value: T, ...: T)
     public function extend(self, items: {T})
     public function pop(self): T?
-    public function at(self, position: number): T?
+    public function at(self, position: number): T
+    public function get(self, position: number): T?
     public function set(self, position: number, value: T)
     public function insert(self, position: number, value: T)
     public function remove(self, position: number): T
@@ -534,7 +536,8 @@ class type VecDeque<T>
     public function popback(self): T?
     public function front(self): T?
     public function back(self): T?
-    public function at(self, position: number): T?
+    public function at(self, position: number): T
+    public function get(self, position: number): T?
     public function set(self, position: number, value: T)
     public function clear(self)
     public function __len(self): number
@@ -602,12 +605,12 @@ std::string getBuiltinDefinitionSource()
     result += kBuiltinDefinitionCoroutineSrc;
 
     std::string tableSrc = kBuiltinDefinitionTableSrc;
-    if (!FFlag::LuwuTableDrop)
+    if (!FFlag::LuwuTableDiscard)
     {
-        std::string dropEntry = "    drop: <V>(t: {V}, value: V, count: number?) -> number,\n";
-        size_t dropPos = tableSrc.find(dropEntry);
-        if (dropPos != std::string::npos)
-            tableSrc.erase(dropPos, dropEntry.size());
+        std::string discardEntry = "    discard: <V>(t: {V}, value: V, count: number?) -> number,\n";
+        size_t discardPos = tableSrc.find(discardEntry);
+        if (discardPos != std::string::npos)
+            tableSrc.erase(discardPos, discardEntry.size());
     }
     result += tableSrc;
 
@@ -620,8 +623,8 @@ std::string getBuiltinDefinitionSource()
         result += kBuiltinDefinitionBufferSrcIsFrozen;
     if (FFlag::LuwuBufferBatched)
         result += kBuiltinDefinitionBufferSrcBatched;
-    if (FFlag::LuwuBufferMemcmp)
-        result += kBuiltinDefinitionBufferSrcMemcmp;
+    if (FFlag::DebugLuwuBufferComparison)
+        result += kBuiltinDefinitionBufferSrcComparison;
     result += kBuiltinDefinitionBufferSrcClose;
 
     result += kBuiltinDefinitionVectorSrc;

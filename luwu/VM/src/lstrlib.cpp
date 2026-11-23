@@ -3,8 +3,11 @@
 #include "lualib.h"
 
 #include "lstring.h"
+#include "lnumutils.h"
 
 #include <ctype.h>
+#include <limits.h>
+#include <math.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -965,6 +968,16 @@ static void addInt64Format(char form[MAX_FORMAT], char formatIndicator, size_t f
     form[formatItemSize + 3] = 0;
 }
 
+// Luwu: string.format writes a plain `%.Nf` (luai_fixed2str) or `%d` (luai_int2str) itself. Upstream calls snprintf for
+// every number, which is most of the cost: about 145 ns of a 200 ns `string.format("%.2f", x)`.
+
+// The precision N of a format item that is exactly `%.Nf`, or -1
+static int plainFixedPrecision(const char* form, size_t formatItemSize)
+{
+    bool plain = formatItemSize == 3 && form[1] == '.' && isdigit(uchar(form[2]));
+    return plain ? form[2] - '0' : -1;
+}
+
 static int str_format(lua_State* L)
 {
     int top = lua_gettop(L);
@@ -1009,6 +1022,12 @@ static int str_format(lua_State* L)
             case 'i':
             {
                 long long value = lua_isinteger64(L, arg) ? luaL_checkinteger64(L, arg) : (int64_t)luaL_checknumber(L, arg);
+                if (formatItemSize == 1)
+                {
+                    char* end = luai_int2str(buff, value);
+                    luaL_addlstring(&b, buff, end - buff);
+                    continue; // skip the 'luaL_addlstring' at the end
+                }
                 addInt64Format(form, formatIndicator, formatItemSize);
                 snprintf(buff, sizeof(buff), form, value);
                 break;
@@ -1032,9 +1051,23 @@ static int str_format(lua_State* L)
                 snprintf(buff, sizeof(buff), form, v);
                 break;
             }
+            case 'f':
+            {
+                double value = luaL_checknumber(L, arg);
+                int precision = plainFixedPrecision(form, formatItemSize);
+                char* end = nullptr;
+                if (precision >= 0)
+                    end = luai_fixed2str(buff, value, precision);
+                if (end)
+                {
+                    luaL_addlstring(&b, buff, end - buff);
+                    continue; // skip the 'luaL_addlstring' at the end
+                }
+                snprintf(buff, sizeof(buff), form, value);
+                break;
+            }
             case 'e':
             case 'E':
-            case 'f':
             case 'g':
             case 'G':
             {
@@ -1079,6 +1112,24 @@ static int str_format(lua_State* L)
     return 1;
 }
 
+// Luwu String Extensions (rfcs/string-extensions.md): reads the optional count `split` and `replace` take. Returns
+// false for no limit: nil, or a count no string can reach, like `math.huge`.
+static bool optlimit(lua_State* L, int arg, double minimum, const char* belowMinimum, int* limit)
+{
+    if (lua_isnoneornil(L, arg))
+        return false;
+
+    double count = luaL_checknumber(L, arg);
+    luaL_argcheck(L, count == count, arg, "can't be NaN");
+    luaL_argcheck(L, count >= minimum, arg, belowMinimum);
+
+    if (count >= double(INT_MAX))
+        return false;
+
+    *limit = int(count);
+    return true;
+}
+
 static int str_split(lua_State* L)
 {
     size_t haystackLen;
@@ -1088,9 +1139,8 @@ static int str_split(lua_State* L)
 
     // Luwu String Extensions (rfcs/string-extensions.md): an optional maximum number of pieces. The last piece holds the
     // rest of the string.
-    bool limited = FFlag::LuwuStringExtensions && !lua_isnoneornil(L, 3);
-    int maxPieces = limited ? luaL_checkinteger(L, 3) : 0;
-    luaL_argcheck(L, !limited || maxPieces >= 1, 3, "must be at least 1");
+    int maxPieces = 0;
+    bool limited = FFlag::LuwuStringExtensions && optlimit(L, 3, 1, "must be at least 1", &maxPieces);
     bool stoppedEarly = false;
 
     const char* begin = haystack;
@@ -1330,9 +1380,8 @@ static int str_replace(lua_State* L)
     const char* replacement = luaL_checklstring(L, 3, &newLength);
     luaL_argcheck(L, oldLength > 0, 2, "can't be an empty string");
 
-    bool limited = !lua_isnoneornil(L, 4);
-    int maxReplacements = limited ? luaL_checkinteger(L, 4) : 0;
-    luaL_argcheck(L, !limited || maxReplacements >= 0, 4, "can't be negative");
+    int maxReplacements = 0;
+    bool limited = optlimit(L, 4, 0, "can't be negative", &maxReplacements);
 
     const char* end = s + length;
     const char* match = lmemfind(s, length, old, oldLength);

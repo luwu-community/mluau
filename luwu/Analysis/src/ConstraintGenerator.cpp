@@ -3,6 +3,7 @@
 
 #include "Luau/ApplyTypeFunction.h"
 #include "Luau/Ast.h"
+#include "Luau/AstQuery.h"
 #include "Luau/AstUtils.h"
 #include "Luau/BuiltinDefinitions.h"
 #include "Luau/BuiltinTypeFunctions.h"
@@ -80,6 +81,12 @@ static bool isTraitRecord(const ClassDeclRecord* record)
 // Luwu Traits (rfcs/classes/traits.md): finds a `Self` in the annotations it visits
 struct NamesSelf : AstVisitor
 {
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a pattern is checked as what it means in plain code
+    bool visitsPatternChecks() const override
+    {
+        return true;
+    }
+
     bool found = false;
 
     bool visit(AstType* ty) override
@@ -618,6 +625,12 @@ bool hasFreeType(TypeId ty)
 
 struct GlobalNameCollector : public AstVisitor
 {
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a pattern is checked as what it means in plain code
+    bool visitsPatternChecks() const override
+    {
+        return true;
+    }
+
     DenseHashSet<AstName> names;
 
     GlobalNameCollector()
@@ -638,6 +651,12 @@ struct GlobalNameCollector : public AstVisitor
 // with its result.
 struct TypeFunctionEnvGlobalBinder : AstVisitor
 {
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a pattern is checked as what it means in plain code
+    bool visitsPatternChecks() const override
+    {
+        return true;
+    }
+
     NotNull<Scope> environmentScope;
     NotNull<const DataFlowGraph> dfg;
     // The type function whose body is being visited, and whether the visit is inside one of its `for ... in` headers.
@@ -6488,6 +6507,9 @@ InferencePack ConstraintGenerator::checkExprCall(
 
     // Each argument the call could refine gets a discriminant the solver binds once it knows the function.
     // Luwu user-defined refinements: and, with DebugLuwuUserDefinedRefinements on, one for when the call is falsy.
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a pattern's test gets one too. `x is LIMIT` failing
+    // says nothing about `x`'s type.
+    bool refinesWhenFalsy = FFlag::DebugLuwuUserDefinedRefinements || call->fromPattern;
     auto addArgument = [&](AstExpr* arg)
     {
         exprArgs.push_back(arg);
@@ -6501,7 +6523,7 @@ InferencePack ConstraintGenerator::checkExprCall(
         }
 
         TypeId discriminantTy = arena->addType(BlockedType{});
-        TypeId negativeDiscriminantTy = FFlag::DebugLuwuUserDefinedRefinements ? arena->addType(BlockedType{}) : nullptr;
+        TypeId negativeDiscriminantTy = refinesWhenFalsy ? arena->addType(BlockedType{}) : nullptr;
         returnRefinements.push_back(refinementArena.implicitProposition(key, discriminantTy, negativeDiscriminantTy));
         discriminantTypes.emplace_back(discriminantTy);
         negativeDiscriminantTypes.emplace_back(negativeDiscriminantTy ? std::optional<TypeId>{negativeDiscriminantTy} : std::nullopt);
@@ -6560,6 +6582,11 @@ InferencePack ConstraintGenerator::checkExprCall(
             {
                 expectedType = expectedTypesForCall[i];
             }
+
+            // Luwu try expressions: `error(v)` in a function with an annotated hint expects the hint, so `error("NaN")`
+            // is the singleton and `error("` completes the hint's strings
+            if (std::optional<TypeId> hint = annotatedHintFor(call, i))
+                expectedType = hint;
 
             // Example: `table.insert<V>(t: {V}, value: V)`. `expectedType` for `value` is just
             // the bare generic `V` here, since it was computed before any argument was checked.
@@ -6653,7 +6680,7 @@ InferencePack ConstraintGenerator::checkExprCall(
 
     Checkpoint argEndCheckpoint = checkpoint(this);
 
-    recordRaisedError(call, args);
+    recordRaisedError(scope, call, args, argTail);
 
     // Luwu: upstream refines `x` in `class.isinstance(x, C)` here, matching the call by its spelling (a global's
     // `.isinstance`). Luwu does it in MagicClassInstanceCheck::refine, by the callee's type, so an alias (`const is =
@@ -6799,7 +6826,7 @@ InferencePack ConstraintGenerator::checkExprCall(
         &module->astOverloadResolvedTypes,
         FFlag::LuwuGenericNominals ? expectedType : std::nullopt,
     };
-    if (FFlag::DebugLuwuUserDefinedRefinements)
+    if (refinesWhenFalsy)
         callConstraintData.negativeDiscriminantTypes = std::move(negativeDiscriminantTypes);
 
     NotNull<Constraint> callConstraint = addConstraint(scope, call->func->location, std::move(callConstraintData));
@@ -6883,6 +6910,9 @@ Inference ConstraintGenerator::check(const ScopePtr& scope, AstExpr* expr, std::
         result = check(scope, doExpr, expectedType);
     else if (auto match = expr->as<AstExprMatch>())
         result = check(scope, match, expectedType);
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a pattern is checked as what it means in plain code
+    else if (auto pattern = expr->as<AstExprMatchPattern>())
+        result = check(scope, pattern->checked);
     else if (auto comprehension = expr->as<AstExprTableComprehension>())
         result = check(scope, comprehension, expectedType);
     else if (auto typeAssert = expr->as<AstExprTypeAssertion>())
@@ -9003,24 +9033,16 @@ void ConstraintGenerator::weakenUnknownMembers(AstTypeUnion* annotation, std::ve
     }
 }
 
-// Luwu try expressions: the call in `error(...)`, if `stat` is one
-static AstExprCall* errorCallOf(AstStat* stat)
-{
-    AstStatExpr* expr = stat ? stat->as<AstStatExpr>() : nullptr;
-    AstExprCall* call = expr ? expr->expr->as<AstExprCall>() : nullptr;
-    AstExprGlobal* callee = call ? call->func->as<AstExprGlobal>() : nullptr;
-    if (!callee || callee->name != "error")
-        return nullptr;
-    return call;
-}
-
 void ConstraintGenerator::checkFunctionBody(const ScopePtr& scope, AstExprFunction* fn)
 {
     if (FFlag::DebugLuwuTryExpressions)
     {
         RaisedErrors raised;
-        if (fn->body->body.size > 0)
-            raised.unreachableError = errorCallOf(fn->body->body.data[fn->body->body.size - 1]);
+        raised.unreachableError = finalErrorCall(fn);
+        TypeId* signature = module->astTypes.find(fn);
+        const FunctionType* function = signature ? get<FunctionType>(follow(*signature)) : nullptr;
+        if (function && fn->errorHint)
+            raised.declared = function->errorHint;
         raisedErrors.push_back(std::move(raised));
     }
 
@@ -9032,7 +9054,8 @@ void ConstraintGenerator::checkFunctionBody(const ScopePtr& scope, AstExprFuncti
     if (!FFlag::DebugLuwuTryExpressions)
         return;
 
-    // Luwu try expressions: inferred hints join the declared one, which never limits them
+    // Luwu try expressions: a function without a `! E` annotation gets a hint inferred from its body, joined with the one
+    // its return alias declares
     std::vector<TypeId> raised = std::move(raisedErrors.back().types);
     raisedErrors.pop_back();
 
@@ -9043,7 +9066,8 @@ void ConstraintGenerator::checkFunctionBody(const ScopePtr& scope, AstExprFuncti
 
     if (function->errorHint)
         raised.insert(raised.begin(), *function->errorHint);
-    // One member per type, so a declared hint the body also raises isn't listed twice
+    // One member per type, so a hint the body also raises isn't listed twice, and `error("a")` and `error("b")` give
+    // `string` once
     TypeIds unique;
     for (TypeId ty : raised)
     {
@@ -9064,11 +9088,50 @@ void ConstraintGenerator::checkFunctionBody(const ScopePtr& scope, AstExprFuncti
         function->errorHint = arena->addType(UnionType{std::move(raised)});
 }
 
-// Luwu try expressions: `error(v)` raises v's type, and `assert(...)` raises a string. Each joins the error hint of the
-// function the call is in.
-void ConstraintGenerator::recordRaisedError(AstExprCall* call, const std::vector<TypeId>& args)
+// Luwu try expressions: what `error(v)` raises in a function without an annotated hint. A string literal raises `string`,
+// widened like a local's initializer. A call as the only argument (`error(message())`) is in `argTail`, and raises its
+// first value.
+TypeId ConstraintGenerator::raisedErrorType(
+    const ScopePtr& scope,
+    AstExprCall* call,
+    const std::vector<TypeId>& args,
+    std::optional<TypePackId> argTail
+)
 {
-    if (raisedErrors.empty() || call == raisedErrors.back().unreachableError)
+    if (call->args.size == 0)
+        return builtinTypes->nilType;
+
+    bool stringLiteral = call->args.data[0]->is<AstExprConstantString>();
+    if (stringLiteral)
+        return builtinTypes->stringType;
+
+    if (!args.empty())
+        return args[0];
+    if (argTail)
+        return flattenPack(scope, call->args.data[0]->location, InferencePack{*argTail}).ty;
+    return builtinTypes->nilType;
+}
+
+// Luwu try expressions: the annotated hint of the function `call` is in, when `call` is `error(...)` and argument `index`
+// is what it raises
+std::optional<TypeId> ConstraintGenerator::annotatedHintFor(AstExprCall* call, size_t index)
+{
+    if (index != 0 || raisedErrors.empty() || call == raisedErrors.back().unreachableError || !isErrorCall(call))
+        return std::nullopt;
+    return raisedErrors.back().declared;
+}
+
+// Luwu try expressions: `error(v)` raises v's type, and `assert(...)` raises a string. Each joins the inferred hint of the
+// function the call is in, when that function's hint isn't annotated.
+void ConstraintGenerator::recordRaisedError(
+    const ScopePtr& scope,
+    AstExprCall* call,
+    const std::vector<TypeId>& args,
+    std::optional<TypePackId> argTail
+)
+{
+    // an annotated hint is the function's whole hint
+    if (raisedErrors.empty() || raisedErrors.back().declared || call == raisedErrors.back().unreachableError)
         return;
 
     AstExprGlobal* callee = call->func->as<AstExprGlobal>();
@@ -9076,7 +9139,7 @@ void ConstraintGenerator::recordRaisedError(AstExprCall* call, const std::vector
         return;
 
     if (callee->name == "error")
-        raisedErrors.back().types.push_back(args.empty() ? builtinTypes->nilType : args[0]);
+        raisedErrors.back().types.push_back(raisedErrorType(scope, call, args, argTail));
     else if (callee->name == "assert")
         raisedErrors.back().types.push_back(builtinTypes->stringType);
 }
@@ -9889,6 +9952,12 @@ TypeId ConstraintGenerator::makeIntersect(const ScopePtr& scope, Location locati
 
 struct GlobalPrepopulator : AstVisitor
 {
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): a pattern is checked as what it means in plain code
+    bool visitsPatternChecks() const override
+    {
+        return true;
+    }
+
     const NotNull<Scope> globalScope;
     const NotNull<TypeArena> arena;
     const NotNull<const DataFlowGraph> dfg;

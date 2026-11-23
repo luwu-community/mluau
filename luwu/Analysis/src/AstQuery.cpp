@@ -530,6 +530,30 @@ struct FindExprOrLocal : public AstVisitor
         return true;
     }
 
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the names a pattern binds are declared where they're
+    // written in it
+    bool visit(AstExprMatchPattern* pattern) override
+    {
+        visit(static_cast<AstExpr*>(pattern));
+        for (const AstPatternAlternative& alternative : pattern->alternatives)
+        {
+            if (alternative.fields)
+                visitPatternLocals(*alternative.fields);
+            if (alternative.rest)
+                visitLocal(alternative.rest);
+        }
+        return true;
+    }
+
+    void visitPatternLocals(const AstDestructurePattern& pattern)
+    {
+        for (const AstDestructureField& field : pattern.fields)
+        {
+            visitLocal(field.target.local);
+            visitPatternLocals(field.target);
+        }
+    }
+
     bool visit(AstStatLocal* al) override
     {
         bool matchedVar = false;
@@ -540,8 +564,6 @@ struct FindExprOrLocal : public AstVisitor
 
         // Luwu Destructuring (rfcs/destructuring.md): a binding of a pattern is declared by a statement whose value reads
         // its key, at the same location as a shorthand binding (`.{name}`). The binding is what's pointed at there.
-        // A type test's pattern on a local (`x is Point(px)`) reads `x` itself, so its first binding holds the pattern
-        // (`destructure`) instead of following a hidden local.
         bool declaresBinding = al->isDesugaredField() || al->destructure;
         if (declaresBinding && matchedVar)
             return false;
@@ -747,6 +769,24 @@ std::optional<DocumentationSymbol> getDocumentationSymbolAtPosition(const Source
     }
 
     return std::nullopt;
+}
+
+bool isErrorCall(const AstExprCall* call)
+{
+    const AstExprGlobal* callee = call->func->as<AstExprGlobal>();
+    return callee && callee->name == "error";
+}
+
+AstExprCall* finalErrorCall(const AstExprFunction* fn)
+{
+    if (fn->body->body.size == 0)
+        return nullptr;
+
+    AstStatExpr* expr = fn->body->body.data[fn->body->body.size - 1]->as<AstStatExpr>();
+    AstExprCall* call = expr ? expr->expr->as<AstExprCall>() : nullptr;
+    if (!call || !isErrorCall(call))
+        return nullptr;
+    return call;
 }
 
 } // namespace Luau

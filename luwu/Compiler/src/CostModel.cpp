@@ -10,6 +10,8 @@
 
 #include <limits.h>
 
+LUAU_FASTFLAG(LuwuStringFormatFastcall)
+
 namespace Luau
 {
 namespace Compile
@@ -98,6 +100,12 @@ struct Cost
 
 struct CostVisitor : AstVisitor
 {
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the clauses a pattern makes are compiled like any other
+    bool visitsPatternClauses() const override
+    {
+        return true;
+    }
+
     const DenseHashMap<AstExprCall*, int>& builtins;
     const DenseHashMap<AstExpr*, Constant>& constants;
 
@@ -214,7 +222,9 @@ struct CostVisitor : AstVisitor
         else if (AstExprInterpString* expr = node->as<AstExprInterpString>())
         {
             // Baseline cost of string.format
-            Cost cost = 3;
+            // Luwu: with the string.format fastcall, an interpolated string costs what a builtin call does. One FASTCALL
+            // runs in place of upstream's NAMECALL and CALL.
+            Cost cost = FFlag::LuwuStringFormatFastcall ? 2 : 3;
 
             for (AstExpr* innerExpression : expr->expressions)
                 cost += model(innerExpression);
@@ -254,6 +264,14 @@ struct CostVisitor : AstVisitor
                 cost += model(arm.value);
             }
 
+            return cost;
+        }
+        else if (AstExprMatchPattern* expr = node->as<AstExprMatchPattern>())
+        {
+            // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the value, then a test per alternative
+            Cost cost = expr->value ? model(expr->value) : Cost();
+            for (const AstPatternAlternative& alternative : expr->alternatives)
+                cost += (alternative.operand ? model(alternative.operand) : Cost()) + 1;
             return cost;
         }
         else if (AstExprPop* expr = node->as<AstExprPop>())

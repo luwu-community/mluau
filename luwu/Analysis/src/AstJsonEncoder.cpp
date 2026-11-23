@@ -560,6 +560,8 @@ struct AstJsonEncoder : public AstVisitor
             write("declaration", clause.declaration);
         else
             write("expr", clause.expr);
+        if (clause.fromPattern)
+            write("fromPattern", clause.fromPattern);
         popComma(c);
         writeRaw("}");
     }
@@ -601,12 +603,70 @@ struct AstJsonEncoder : public AstVisitor
             write("clauses", arm.clauses);
         if (arm.catchAll)
             write("catchAll", arm.catchAll);
+        if (arm.binding)
+            write("binding", arm.binding);
         if (arm.value)
             write("value", arm.value);
         if (arm.body)
             write("body", arm.body);
         popComma(c);
         writeRaw("}");
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
+    void write(const AstPatternAlternative& alternative)
+    {
+        writeRaw("{");
+        bool c = pushComma();
+        writeType("AstPatternAlternative");
+        switch (alternative.kind)
+        {
+        case AstPatternAlternative::Value:
+            write("kind", std::string_view("value"));
+            break;
+        case AstPatternAlternative::Tag:
+            write("kind", std::string_view("tag"));
+            write("tag", alternative.tag);
+            break;
+        case AstPatternAlternative::Class:
+            write("kind", std::string_view("class"));
+            break;
+        case AstPatternAlternative::Trait:
+            write("kind", std::string_view("trait"));
+            break;
+        case AstPatternAlternative::Bundle:
+            write("kind", std::string_view("bundle"));
+            if (alternative.openEnded)
+                write("openEnded", alternative.openEnded);
+            if (alternative.rest)
+                write("rest", alternative.rest);
+            break;
+        }
+        write("location", alternative.location);
+        if (alternative.operand)
+            write("operand", alternative.operand);
+        popComma(c);
+        writeRaw("}");
+    }
+
+    // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): the pattern as written, never `checked`
+    void write(class AstExprMatchPattern* node)
+    {
+        writeNode(
+            node,
+            "AstExprMatchPattern",
+            [&]()
+            {
+                if (node->value)
+                    PROP(value);
+                if (node->subject)
+                    write("subject", node->subject);
+                PROP(keywordLocation);
+                PROP(negated);
+                PROP(implements);
+                PROP(alternatives);
+            }
+        );
     }
 
     // Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md)
@@ -1109,6 +1169,135 @@ struct AstJsonEncoder : public AstVisitor
         );
     }
 
+    // Luwu Classes (rfcs/classes)
+    void write(AstClassMemberVisibility visibility)
+    {
+        writeString(toString(visibility));
+    }
+
+    // Luwu Classes (rfcs/classes)
+    void write(const AstClassPrimaryConstructorParamQualifiers& qualifiers)
+    {
+        writeRaw("{");
+        bool c = pushComma();
+        writeType("AstClassPrimaryConstructorParamQualifiers");
+        write("visibility", qualifiers.visibility);
+        write("isConst", qualifiers.isConst);
+        popComma(c);
+        writeRaw("}");
+    }
+
+    // Luwu Classes (rfcs/classes)
+    void write(struct AstClassPrimaryConstructor* node)
+    {
+        writeRaw("{");
+        bool c = pushComma();
+        writeType("AstClassPrimaryConstructor");
+        write("visibility", node->visibility);
+        write("args", node->args);
+        write("argsDefaults", node->argsDefaults);
+        write("argsQualifiers", node->argsQualifiers);
+        write("argLocation", node->argLocation);
+        popComma(c);
+        writeRaw("}");
+    }
+
+    // Luwu Traits (rfcs/classes/traits.md)
+    void write(const AstClassTraitRef& ref)
+    {
+        writeRaw("{");
+        bool c = pushComma();
+        writeType("AstClassTraitRef");
+        write("trait", ref.trait);
+        write("typeArguments", ref.typeArguments);
+        write("hasArgs", ref.hasArgs);
+        write("args", ref.args);
+        write("location", ref.location);
+        popComma(c);
+        writeRaw("}");
+    }
+
+    // Luwu Classes (rfcs/classes)
+    void write(const AstClassProperty& prop)
+    {
+        writeRaw("{");
+        bool c = pushComma();
+        writeType("AstClassProperty");
+        write("visibility", prop.visibility);
+        write("name", prop.name);
+        write("nameLocation", prop.nameLocation);
+        if (prop.ty)
+            write("luauType", prop.ty);
+        write("isConst", prop.isConst);
+        if (prop.defaultValue)
+            write("defaultValue", prop.defaultValue);
+        write("attributes", prop.attributes);
+        if (prop.expectLocation)
+            write("expect", true);
+        if (prop.finalLocation)
+            write("final", true);
+        popComma(c);
+        writeRaw("}");
+    }
+
+    // Luwu Classes (rfcs/classes)
+    void write(const AstClassMethod& method)
+    {
+        writeRaw("{");
+        bool c = pushComma();
+        writeType("AstClassMethod");
+        write("visibility", method.visibility);
+        write("name", method.functionName);
+        write("nameLocation", method.nameLocation);
+        write("function", method.function);
+        if (method.expectLocation)
+            write("expect", true);
+        if (method.isOptional)
+            write("optional", true);
+        if (method.finalLocation)
+            write("final", true);
+        if (method.qualifiedTrait)
+            write("qualifiedTrait", method.qualifiedTrait);
+        popComma(c);
+        writeRaw("}");
+    }
+
+    // Luwu Classes (rfcs/classes)
+    void write(const AstClassMember& member)
+    {
+        if (const AstClassProperty* prop = member.get_if<AstClassProperty>())
+            write(*prop);
+        else if (const AstClassMethod* method = member.get_if<AstClassMethod>())
+            write(*method);
+        else
+            LUAU_ASSERT(!"Unknown AstClassMember");
+    }
+
+    // Luwu Classes (rfcs/classes); Luwu Traits (rfcs/classes/traits.md)
+    void write(class AstStatClass* node)
+    {
+        writeNode(
+            node,
+            "AstStatClass",
+            [&]()
+            {
+                write("name", node->name);
+                PROP(exported);
+                PROP(generics);
+                PROP(genericPacks);
+                if (node->primaryConstructor)
+                    write("primaryConstructor", node->primaryConstructor);
+                PROP(members);
+                PROP(hasEnd);
+                write("attributes", node->attributes);
+                if (node->isTrait)
+                    write("isTrait", true);
+                PROP(implements);
+                PROP(needs);
+            }
+        );
+    }
+
     void write(class AstStatDeclareFunction* node)
     {
         writeNode(
@@ -1490,6 +1679,12 @@ struct AstJsonEncoder : public AstVisitor
         return false;
     }
 
+    bool visit(class AstExprMatchPattern* node) override
+    {
+        write(node);
+        return false;
+    }
+
     bool visit(class AstExprTableComprehension* node) override
     {
         write(node);
@@ -1713,6 +1908,13 @@ struct AstJsonEncoder : public AstVisitor
     }
 
     bool visit(class AstStatDeclareGlobal* node) override
+    {
+        write(node);
+        return false;
+    }
+
+    // Luwu Classes (rfcs/classes)
+    bool visit(class AstStatClass* node) override
     {
         write(node);
         return false;
