@@ -84,7 +84,7 @@ struct LintWarning
         Code_SelfAssignment = 53,          // Luwu: `x = x`, which does nothing
         Code_DeadStore = 54,               // Luwu: a computed value overwritten before anything reads it
         // Luwu: more parts of OptimizationHint
-        Code_MethodsNotInlined = 55,       // code that keeps the compiler from proving a class, so its methods aren't inlined
+        Code_MethodsNotInlined = 55,       // code that keeps the compiler from inlining a call: an unproven class, all of a call's values passed on
         Code_FloorDivision = 56,           // `math.floor(a / b)`, which is `a // b`
         Code_FenvDeoptimization = 57,      // `getfenv`/`setfenv`, which deoptimize the whole module
         Code_DiscardedValues = 58,         // Luwu: a call giving several values where only its first is kept (an if-else branch)
@@ -117,9 +117,10 @@ struct LintWarning
         Code_UnflippedGuard = 81,          // Luwu: `x == nil or return` followed by code using `x`, which is always nil there
         Code_LuaStringHelper = 82,         // Luwu: `s:sub(1, #p) == p` and the like, which `s:startswith(p)` and friends do
         Code_StringOperations = 83,        // Luwu: a string library call that `""` makes pointless or wrong (`s:startswith("")`)
-        Code_UncaughtErrors = 84,          // Luwu: a call to a function with error hints outside a `try`. Off by default.
-        Code_ConfusingGuard = 85,          // Luwu: `x and return`, a long or chained guard statement, or one returning several values
-        Code_IsComparison = 86,            // Luwu: `x is "meow"`, a pattern with one value that reads better as `x == "meow"`
+        Code_ConfusingGuard = 84,          // Luwu: `x and return`, a long or chained guard statement, or one returning several values
+        Code_IsComparison = 85,            // Luwu: `x is "meow"`, a pattern with one value that reads better as `x == "meow"`
+        Code_UncaughtErrors = 86,          // Luwu: a call to a function with error hints outside a `try`. Off by default.
+        Code_ErrorStrings = 87,            // Luwu: `error("unreachable")` or `error("TODO")`, which `unreachable()` and `todo()` raise as variants
 
         Code__Count
     };
@@ -253,9 +254,10 @@ inline constexpr const char* kWarningNames[] = {
     "UnflippedGuard",
     "LuaStringHelper",
     "StringOperations",
-    "UncaughtErrors",
     "ConfusingGuard",
     "IsComparison",
+    "UncaughtErrors",
+    "ErrorStrings",
 };
 // clang-format on
 

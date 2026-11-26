@@ -74,6 +74,18 @@ struct MagicClassName final : MagicFunction
 
 // Luwu Classes (rfcs/classes): narrows `class.of`'s declared `class?` to the class of an object type, `class<Trait>` for
 // an object known by a trait, and a union of them for a union. Exposed for the same reason as MagicClassFields.
+// Luwu Integers (rfcs/integers.md): `x:cast(integer.u32)` gives a `u32`
+struct MagicIntegerCast final : MagicFunction
+{
+    std::optional<WithPredicate<TypePackId>> handleOldSolver(
+        struct TypeChecker&,
+        const std::shared_ptr<struct Scope>&,
+        const class AstExprCall&,
+        WithPredicate<TypePackId>
+    ) override;
+    bool infer(const MagicFunctionCallContext& context) override;
+};
+
 struct MagicClassOf final : MagicFunction
 {
     std::optional<WithPredicate<TypePackId>> handleOldSolver(
@@ -179,6 +191,9 @@ bool resultLibraryEnabled();
 // Luwu class reflection (rfcs/classes): whether `class.member`, `class.ClassMember` and `class.fields` listing
 // ClassMembers are declared
 bool classReflectionEnabled();
+// Luwu structured runtime errors: the declarations of `Error` and its variant classes, a builtin module of their own.
+// Analysis has them with the result library.
+std::string getErrorDefinitionSource();
 // Luwu collections: whether Analysis has the `collections` library: the flags the VM opens it with
 // (luaL_openlibs), and LuwuDeclareStatements, which parses its declarations
 bool collectionsLibraryEnabled();
@@ -241,6 +256,11 @@ std::optional<TypeId> readBundlePosition(NotNull<BuiltinTypes> builtinTypes, Not
 bool bundleLibraryEnabled();
 // Luwu bundles: the `bundle` library's declarations, a definition file of its own (see registerBuiltinGlobals)
 std::string getBundleDefinitionSource();
+// Luwu Integers (rfcs/integers.md): whether Analysis has the `integer` library: the flags the VM opens it with
+// (luaL_openlibs), and the result library, which `integer.tonumber` gives
+bool integerLibraryEnabled();
+// Luwu Integers (rfcs/integers.md): the `integer` library's declarations, a definition file of its own
+std::string getIntegerDefinitionSource();
 std::string getTypeFunctionDefinitionSource();
 
 void addGlobalBinding(GlobalTypes& globals, const std::string& name, TypeId ty, const std::string& packageName);

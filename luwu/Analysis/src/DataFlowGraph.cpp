@@ -15,14 +15,11 @@
 LUAU_FASTFLAG(DebugLuauFreezeArena)
 LUAU_FASTFLAG(LuauSolverV2)
 LUAU_FASTFLAG(LuwuClasses)
-LUAU_FASTFLAGVARIABLE(LuauDoNotOverwriteAstDefs)
-LUAU_FASTFLAGVARIABLE(LuauAvoidTrivialPhis)
 LUAU_FASTFLAG(LuwuDefaultArguments)
 
 namespace Luau
 {
 
-bool doesCallError(const AstExprCall* call); // TypeInfer.cpp
 
 struct PushScope
 {
@@ -124,6 +121,11 @@ std::optional<Symbol> DataFlowGraph::getSymbolFromDef(const Def* def) const
     return std::nullopt;
 }
 
+bool DataFlowGraph::callNeverReturns(const AstExprCall* call) const
+{
+    return Luau::callNeverReturns(call, neverReturningCalls);
+}
+
 std::optional<DefId> DfgScope::lookup(Symbol symbol) const
 {
     for (const DfgScope* current = this; current; current = current->parent)
@@ -175,13 +177,15 @@ DataFlowGraph DataFlowGraphBuilder::build(
     AstStatBlock* block,
     NotNull<DefArena> defArena,
     NotNull<RefinementKeyArena> keyArena,
-    NotNull<struct InternalErrorReporter> handle
+    NotNull<struct InternalErrorReporter> handle,
+    const NeverReturningCalls* neverReturningCalls
 )
 {
     LUAU_TIMETRACE_SCOPE("DataFlowGraphBuilder::build", "Typechecking");
 
     DataFlowGraphBuilder builder(defArena, keyArena);
     builder.handle = handle;
+    builder.graph.neverReturningCalls = neverReturningCalls;
 
     DfgScope* moduleScope = builder.scopes.emplace_back(new DfgScope{nullptr, DfgScope::ScopeType::Linear}).get();
     PushScope ps{builder.scopeStack, moduleScope};
@@ -239,47 +243,28 @@ void DataFlowGraphBuilder::join(DfgScope* p, DfgScope* a, DfgScope* b)
 
 void DataFlowGraphBuilder::joinBindings(DfgScope* p, const DfgScope& a, const DfgScope& b)
 {
-    if (FFlag::LuauAvoidTrivialPhis)
+    auto join = [&](auto sym, auto def1, auto def2)
     {
-        auto join = [&](auto sym, auto def1, auto def2)
-        {
-            // Refinements are keyed on `DefId`s, meaning that allocating
-            // a trivial phi node like this *breaks* refinements.
-            if (def1 == def2)
-                p->bindings[sym] = def1;
-            else
-                p->bindings[sym] = defArena->phi(NotNull{def1}, NotNull{def2});
-        };
+        // Refinements are keyed on `DefId`s, meaning that allocating
+        // a trivial phi node like this *breaks* refinements.
+        if (def1 == def2)
+            p->bindings[sym] = def1;
+        else
+            p->bindings[sym] = defArena->phi(NotNull{def1}, NotNull{def2});
+    };
 
-        for (const auto& [sym, def1] : a.bindings)
-        {
-            if (auto def2 = b.bindings.find(sym))
-                join(sym, def1, *def2);
-            else if (auto def2 = p->lookup(sym))
-                join(sym, def1, *def2);
-        }
-
-        for (const auto& [sym, def1] : b.bindings)
-        {
-            if (auto def2 = p->lookup(sym))
-                join(sym, def1, *def2);
-        }
+    for (const auto& [sym, def1] : a.bindings)
+    {
+        if (auto def2 = b.bindings.find(sym))
+            join(sym, def1, *def2);
+        else if (auto def2 = p->lookup(sym))
+            join(sym, def1, *def2);
     }
-    else
-    {
-        for (const auto& [sym, def1] : a.bindings)
-        {
-            if (auto def2 = b.bindings.find(sym))
-                p->bindings[sym] = defArena->phi(NotNull{def1}, NotNull{*def2});
-            else if (auto def2 = p->lookup(sym))
-                p->bindings[sym] = defArena->phi(NotNull{def1}, NotNull{*def2});
-        }
 
-        for (const auto& [sym, def1] : b.bindings)
-        {
-            if (auto def2 = p->lookup(sym))
-                p->bindings[sym] = defArena->phi(NotNull{def1}, NotNull{*def2});
-        }
+    for (const auto& [sym, def1] : b.bindings)
+    {
+        if (auto def2 = p->lookup(sym))
+            join(sym, def1, *def2);
     }
 }
 
@@ -702,7 +687,7 @@ ControlFlow DataFlowGraphBuilder::visit(AstStatReturn* r)
 ControlFlow DataFlowGraphBuilder::visit(AstStatExpr* e)
 {
     visitExpr(e->expr);
-    if (auto call = e->expr->as<AstExprCall>(); call && doesCallError(call))
+    if (auto call = e->expr->as<AstExprCall>(); call && graph.callNeverReturns(call))
         return ControlFlow::Throws;
     else
         return ControlFlow::None;
@@ -1078,6 +1063,9 @@ void DataFlowGraphBuilder::visitClassShape(AstStatClass* d)
             overloaded{
                 [&](const AstClassProperty& prop)
                 {
+                    // Luwu Traits (rfcs/classes/traits.md): the trait of `Animal.species = value`, read by the class statement
+                    if (prop.qualifiedTrait)
+                        visitExpr(prop.qualifiedTrait);
                     if (prop.ty)
                         visitType(prop.ty);
                     if (prop.defaultValue)
@@ -1227,19 +1215,10 @@ DataFlowResult DataFlowGraphBuilder::visitExpr(AstExpr* e)
 
     auto [def, key] = go();
 
-    if (FFlag::LuauDoNotOverwriteAstDefs)
-    {
-        if (!graph.astDefs.contains(e))
-        {
-            graph.astDefs[e] = def;
-            LUAU_ASSERT(!graph.astRefinementKeys.contains(e));
-            if (key)
-                graph.astRefinementKeys[e] = key;
-        }
-    }
-    else
+    if (!graph.astDefs.contains(e))
     {
         graph.astDefs[e] = def;
+        LUAU_ASSERT(!graph.astRefinementKeys.contains(e));
         if (key)
             graph.astRefinementKeys[e] = key;
     }
@@ -1309,19 +1288,10 @@ DataFlowResult DataFlowGraphBuilder::visitExpr(AstExprCall* c)
 
         auto [def, key] = *result;
 
-        if (FFlag::LuauDoNotOverwriteAstDefs)
-        {
-            if (!graph.astDefs.contains(firstArg))
-            {
-                graph.astDefs[firstArg] = def;
-                LUAU_ASSERT(!graph.astRefinementKeys.contains(firstArg));
-                if (key)
-                    graph.astRefinementKeys[firstArg] = key;
-            }
-        }
-        else
+        if (!graph.astDefs.contains(firstArg))
         {
             graph.astDefs[firstArg] = def;
+            LUAU_ASSERT(!graph.astRefinementKeys.contains(firstArg));
             if (key)
                 graph.astRefinementKeys[firstArg] = key;
         }
@@ -1784,15 +1754,8 @@ void DataFlowGraphBuilder::visitLValue(AstExpr* e, DefId incomingDef)
             handle->ice("Unknown AstExpr in DataFlowGraphBuilder::visitLValue");
     };
 
-    if (FFlag::LuauDoNotOverwriteAstDefs)
-    {
-        if (!graph.astDefs.contains(e))
-            graph.astDefs[e] = go();
-    }
-    else
-    {
+    if (!graph.astDefs.contains(e))
         graph.astDefs[e] = go();
-    }
 }
 
 DefId DataFlowGraphBuilder::visitLValue(AstExprLocal* l, DefId incomingDef)
@@ -1823,6 +1786,14 @@ DefId DataFlowGraphBuilder::visitLValue(AstExprGlobal* g, DefId incomingDef)
 
 DefId DataFlowGraphBuilder::visitLValue(AstExprIndexName* i, DefId incomingDef)
 {
+    // Luwu Traits (rfcs/classes/traits.md): `obj:Trait.name = value` writes the trait's scoped field, which nothing refines
+    if (i->qualifiedTrait)
+    {
+        visitExpr(i->expr);
+        visitExpr(i->qualifiedTrait);
+        return defArena->freshCell(Symbol{}, i->location);
+    }
+
     DefId parentDef = visitExpr(i->expr).def;
 
     DfgScope* scope = currentScope();

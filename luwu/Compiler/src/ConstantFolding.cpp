@@ -9,7 +9,6 @@
 #include <vector>
 #include <math.h>
 
-LUAU_FASTFLAG(LuauIntegerType2)
 
 namespace Luau
 {
@@ -48,9 +47,7 @@ static bool constantsEqual(const Constant& la, const Constant& ra)
         return ra.type == Constant::Type_Table && la.valueTable == ra.valueTable;
 
     case Constant::Type_Integer:
-        if (FFlag::LuauIntegerType2)
-            return ra.type == Constant::Type_Integer && la.valueInteger64 == ra.valueInteger64;
-        [[fallthrough]];
+        return ra.type == Constant::Type_Integer && la.valueInteger64 == ra.valueInteger64 && la.mode == ra.mode;
 
     default:
         LUAU_ASSERT(!"Unexpected constant type in comparison");
@@ -75,6 +72,19 @@ static void foldUnary(Constant& result, AstExprUnary::Op op, const Constant& arg
         {
             result.type = Constant::Type_Number;
             result.valueNumber = -arg.valueNumber;
+        }
+        else if (arg.type == Constant::Type_Integer)
+        {
+            // Luwu Integers (rfcs/integers.md): negating the smallest 64-bit value grows a dynamic integer onto the heap,
+            // and negating an unsigned one raises, so only the runtime can do them
+            IntegerMode mode = IntegerMode(arg.mode);
+            bool growsOntoHeap = mode == IntegerMode_Dynamic && arg.valueInteger64 == INT64_MIN;
+            if (!growsOntoHeap && !isUnsignedIntegerMode(mode))
+            {
+                result.type = Constant::Type_Integer;
+                result.valueInteger64 = wrapIntegerToMode(int64_t(~uint64_t(arg.valueInteger64) + 1), mode);
+                result.mode = arg.mode;
+            }
         }
         else if (arg.type == Constant::Type_Vectorf)
         {
@@ -649,19 +659,50 @@ struct TableMutationTracker : AstVisitor
         }
     }
 
-    void markEscapedTableIndex(AstExpr* expr, bool isLvalue)
+    // The index of an index expression escapes on its own (visit(AstExprIndexExpr*))
+    void markEscapedTableIndex(AstExpr* expr)
     {
         if (AstExprIndexName* idx = expr->as<AstExprIndexName>())
-        {
             markEscaped(idx->expr);
-        }
         else if (AstExprIndexExpr* idx = expr->as<AstExprIndexExpr>())
-        {
             markEscaped(idx->expr);
+    }
 
-            if (isLvalue)
-                markEscaped(idx->index);
+    // Luwu: from upstream's LuauCompileTableFoldFix (0.742). An operand of an operator with a metamethod escapes: `__add` or
+    // `__concat` can change the table. Comparisons don't take operands with different metamethods, and `and` and `or` have
+    // none.
+    void markEscapedBinaryOp(AstExpr* lhs, AstExpr* rhs, AstExprBinary::Op op)
+    {
+        switch (op)
+        {
+        case AstExprBinary::CompareLt:
+        case AstExprBinary::CompareLe:
+        case AstExprBinary::CompareGt:
+        case AstExprBinary::CompareGe:
+        case AstExprBinary::CompareEq:
+        case AstExprBinary::CompareNe:
+        case AstExprBinary::And:
+        case AstExprBinary::Or:
+            return;
+        default:
+            break;
         }
+
+        markEscaped(lhs);
+        markEscaped(rhs);
+    }
+
+    bool visit(AstExprBinary* node) override
+    {
+        markEscapedBinaryOp(node->left, node->right, node->op);
+        return true;
+    }
+
+    // Luwu: from upstream's LuauCompileTableFoldFix (0.742), a table used as a key escapes: `__index` or `__newindex` can change it
+    bool visit(AstExprIndexExpr* node) override
+    {
+        markEscaped(node->index);
+        return true;
     }
 
     bool visit(AstExprCall* node) override
@@ -672,7 +713,7 @@ struct TableMutationTracker : AstVisitor
 
         // Table indexed in a self call escapes through 'self'
         if (node->self)
-            markEscapedTableIndex(node->func, false);
+            markEscapedTableIndex(node->func);
 
         return true;
     }
@@ -708,7 +749,7 @@ struct TableMutationTracker : AstVisitor
 
         // LHS index expressions mutate the table being indexed
         for (AstExpr* lhs : node->vars)
-            markEscapedTableIndex(lhs, true);
+            markEscapedTableIndex(lhs);
 
         return true;
     }
@@ -716,14 +757,15 @@ struct TableMutationTracker : AstVisitor
     bool visit(AstStatCompoundAssign* node) override
     {
         // LHS index expressions mutate the table
-        markEscapedTableIndex(node->var, true);
+        markEscapedTableIndex(node->var);
+        markEscapedBinaryOp(node->var, node->value, node->op);
         return true;
     }
 
     bool visit(AstStatFunction* node) override
     {
         // Adding a method on a table mutates it
-        markEscapedTableIndex(node->name, true);
+        markEscapedTableIndex(node->name);
         return true;
     }
 
@@ -829,8 +871,11 @@ struct ConstantVisitor : AstVisitor
         }
         else if (AstExprConstantInteger* expr = node->as<AstExprConstantInteger>())
         {
-            result.type = Constant::Type_Integer;
-            result.valueInteger64 = expr->value;
+            if (expr->parseResult != ConstantNumberParseResult::HeapInteger) {
+                result.type = Constant::Type_Integer;
+                result.valueInteger64 = expr->value;
+                result.mode = expr->mode;
+            }
         }
         else if (AstExprConstantString* expr = node->as<AstExprConstantString>())
         {

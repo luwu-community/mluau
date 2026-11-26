@@ -74,11 +74,11 @@
 //   Luwu Traits (rfcs/classes/traits.md): the shape flags varint in LBC_CONSTANT_CLASS_SHAPE (LBC_CLASSSHAPE_TRAIT,
 //   LBC_CLASSSHAPE_IMPLEMENTS), the EXPECTED, OPTIONAL and FINAL member flags, NEWCLASSMEMBER's IMPLEMENTS form and
 //   LBF_CLASS_OF.
-//   Luwu Destructuring: GETPOSITIONAL, and LBC_CLASSMEMBER_POSITIONAL with its position in LBC_CONSTANT_CLASS_SHAPE.
 //   Luwu try expressions: LBF_OPTION_SOME to LBF_RESULT_ERR.
 //   Luwu try expressions: WRAPRESULT, RESULTGET, and each function's protected ranges after its inlining cost: a varint count,
 //   then per range the varints start pc, end pc (exclusive) and handler pc, and a byte for the target register.
 //   Luwu bundles: LBF_BUNDLE_PACK and LBF_BUNDLE_UNPACK.
+//   Luwu Destructuring: GETPOSITIONAL, and LBC_CLASSMEMBER_POSITIONAL with its position in LBC_CONSTANT_CLASS_SHAPE.
 //   Luwu string.format fastcall: LBF_STRING_FORMAT, including after the format string of an interpolated string.
 
 // # Bytecode type information history
@@ -473,6 +473,11 @@ enum LuauOpcode
     // listed trait values, and C+N..C+2N-1 how many trait arguments each entry passes, as numbers.
     // Luwu Traits (rfcs/classes/traits.md): B is LBC_NEWCLASSMEMBER_QUALIFIED for a qualified implementation, `function
     // Json.name`: C holds the function, C+1 the trait, and AUX names it. Emitted before the IMPLEMENTS form, which checks it.
+    // Luwu Traits (rfcs/classes/traits.md): B is LBC_NEWCLASSMEMBER_QUALIFIEDFIELD for a class's value of a trait's scoped
+    // field, `Animal.species = value`: C holds its object slot, C+1 the trait. B is LBC_NEWCLASSMEMBER_QUALIFIEDSHARED or
+    // LBC_NEWCLASSMEMBER_QUALIFIEDSTATIC for one on the class: C holds the value.
+    // Luwu Traits (rfcs/classes/traits.md): B is LBC_NEWCLASSMEMBER_FIELD for a field on the class value (`shared x = 1`):
+    // C holds its value and AUX names it.
     // Luwu Traits (rfcs/classes/traits.md): B is LBC_NEWCLASSMEMBER_TRAITCOPY for the class's own copy of a trait's
     // function, which the compiler made because the trait is declared in the same file. C holds the copy, C+1 the trait,
     // and AUX names the trait's function as a constant string. Emitted before the IMPLEMENTS form, which uses the copy
@@ -501,7 +506,8 @@ enum LuauOpcode
     // A: register holding the value to check
     // B: register holding the class, or LBC_SELFCLASS_OWNER to take the class from the executing closure's
     //    Proto::ownerclass instead (see LBC_SELFCLASS_OWNER). A register always holds a class (the VM asserts it).
-    // C: 1 at an inline site of a `:` call, 0 everywhere else; only affects the error message
+    // C: 1 at an inline site of a `:` call, 0 everywhere else; only affects the error message. Luwu Traits
+    //    (rfcs/classes/traits.md): LBC_SELFCLASS_CLASSMETHOD in a class method's prologue, where A holds the class itself.
     // AUX: string constant index of the method's name, for the error message
     LOP_CHECKSELFCLASS,
 
@@ -584,11 +590,12 @@ enum LuauOpcode
     // INITTRAITS: Luwu Traits (rfcs/classes/traits.md): starts initializing the fields an object gets from its class's
     // traits, which construction does after allocating the object and before the class's own fields. Emitted at the
     // top of a class's `__init`, in a class's synthesized `__implements`, and after NEWOBJECT's ALLOC form, as a loop:
-    // `INITTRAITS A; CALL F, N + 2, 1; JUMPBACK` to the INITTRAITS. Each run lays out the CALL's frame for the class's
+    // `INITTRAITS A; CALL F, N + 2, 2; JUMPBACK` to the INITTRAITS. Each run lays out the CALL's frame for the class's
     // copy of the next trait's `__traitinit`, in dependency order: the function in F, the object in F + 1, and that
-    // trait's `implements` arguments from F + 2, padded with nil to N values. Once every initializer has run, it puts
-    // back the overridden constant fields (LuauClass::overriddenconsts) and jumps past the loop. The initializers are
-    // ordinary calls, so they may yield.
+    // trait's `implements` arguments from F + 2, padded with nil to N values. After those come the class's values of
+    // per-object scoped fields: the next run stores the result such a call leaves in F. Once every initializer has run,
+    // it puts back the overridden constant fields (LuauClass::overriddenconsts) and jumps past the loop. The
+    // initializers are ordinary calls, so they may yield.
     // A: how many initializers have run, 0 at first; A + 1 holds the object, and A + 2 onwards the N `implements`
     //    arguments (every entry's, in list order, one value each)
     // D: jump offset (-32768..32767) past the loop, taken once every initializer has run
@@ -653,6 +660,20 @@ enum LuauOpcode
     // C: position - 1 (0..255)
     LOP_GETPOSITIONAL,
 
+    // GETTABLEBUNDLE: Luwu bundles: `t[.(a, b)]` without building the bundle. A table answers from its hash part, and
+    // only a miss in a table with `__index`, or a value that isn't a table, gets a new bundle and an ordinary lookup.
+    // A: target register
+    // B: register holding the table
+    // C: first of AUX registers holding the bundle's values
+    // AUX: how many values (1 to the largest fixed-size bundle)
+    LOP_GETTABLEBUNDLE,
+
+    // SETTABLEBUNDLE: Luwu bundles: `t[.(a, b)] = v`, building the bundle only to insert a new key or for a table that
+    // isn't plain
+    // A: source register
+    // B, C and AUX: as in GETTABLEBUNDLE
+    LOP_SETTABLEBUNDLE,
+
     // JUMPXTYPE: Luwu Pattern Matching (rfcs/control-flow/pattern-matching.md): jumps when R(A)'s type is the one `type()`
     // names in AUX, as `x is string` checks, without calling `type()`
     // A: value register
@@ -672,6 +693,14 @@ enum LuauOpcode
     //   the jump is taken when R(A) doesn't match.
     LOP_JUMPXMATCH,
 
+    // SETQUALIFIED: Luwu Traits (rfcs/classes/traits.md): writes a trait's scoped field, for `obj:Trait.name = value` (the
+    // object's value) and `Class:Trait.name = value` (a `scoped shared` or `scoped static` field) (luaR_setqualified)
+    // A: source register
+    // B: register holding the object or class
+    // C: register holding the trait
+    // AUX: the field's name as a constant string
+    LOP_SETQUALIFIED,
+
     // PUSH: Luwu Push and Pop Operators (rfcs/push-pop-operators.md): `A <+ values`. Calls A's `__push` once with every
     // non-nil value when it has one; otherwise A must be a table, and each non-nil value is stored raw at its length + 1,
     // like table.insert.
@@ -686,20 +715,6 @@ enum LuauOpcode
     // A: target register
     // B: register holding the container
     LOP_POP,
-
-    // GETTABLEBUNDLE: Luwu bundles: `t[.(a, b)]` without building the bundle. A table answers from its hash part, and
-    // only a miss in a table with `__index`, or a value that isn't a table, gets a new bundle and an ordinary lookup.
-    // A: target register
-    // B: register holding the table
-    // C: first of AUX registers holding the bundle's values
-    // AUX: how many values (1 to the largest fixed-size bundle)
-    LOP_GETTABLEBUNDLE,
-
-    // SETTABLEBUNDLE: Luwu bundles: `t[.(a, b)] = v`, building the bundle only to insert a new key or for a table that
-    // isn't plain
-    // A: source register
-    // B, C and AUX: as in GETTABLEBUNDLE
-    LOP_SETTABLEBUNDLE,
 
     // Enum entry for number of opcodes, not a valid opcode by itself!
     LOP__COUNT
@@ -809,6 +824,7 @@ enum LuauBytecodeTag
     LBC_CONSTANT_INTEGER,
     LBC_CONSTANT_CLASS_SHAPE,
     LBC_CONSTANT_VECTORD,
+    LBC_CONSTANT_INTEGER_HEAP,
 
     /** WARNING: This must always be last. */
     LBC_CONSTANT__COUNT
@@ -836,8 +852,9 @@ enum LuwuBytecodeTag
 #define LBC_LEGACY_LAST_TYPE LBC_TYPE_SYMNONE
 
 // Luwu Classes (rfcs/classes): per-member attribute bits serialized as part of
-// LBC_CONSTANT_CLASS_SHAPE. The single source of truth for these bits; both the compiler
-// (Compiler/src/Compiler.cpp) and the VM (VM/src/lclass.h/.cpp) use these directly.
+// LBC_CONSTANT_CLASS_SHAPE, as a varint. The single source of truth for these bits; both the compiler
+// (Compiler/src/Compiler.cpp) and the VM (VM/src/lclass.h/.cpp) use these directly. The VM keeps them in
+// 16 bits; native code only tests bits in the low byte.
 #define LBC_CLASSMEMBER_PRIVATE (1 << 0)
 #define LBC_CLASSMEMBER_CONST (1 << 1)
 // Set on properties that get a value when constructed: a default value expression (see AstClassProperty::defaultValue),
@@ -852,7 +869,7 @@ enum LuwuBytecodeTag
 // straight into each new instance, instead of being produced by the synthesized `__defaults` closure.
 // Implies LBC_CLASSMEMBER_HASDEFAULT.
 #define LBC_CLASSMEMBER_CONSTDEFAULT (1 << 3)
-// Luwu Traits (rfcs/classes/traits.md): set on a trait's function declared `function Self.name`, which implementing
+// Luwu Traits (rfcs/classes/traits.md): set on a trait's `scoped` function, which implementing
 // classes don't get as a member: they read it through the trait (luaR_getqualified). Shares its bit with
 // LBC_CLASSMEMBER_CONSTDEFAULT, which only fields carry.
 #define LBC_CLASSMEMBER_SCOPED (1 << 3)
@@ -880,6 +897,32 @@ enum LuwuBytecodeTag
 // reassign its `const` fields. Construction never reads `__init` by name, so it is unaffected. Lives
 // here so no compiler-emitted bit can collide with it.
 #define LBC_CLASSMEMBER_INITBLOCKED (1 << 7)
+// Luwu Traits (rfcs/classes/traits.md): a field with one value on the class (`shared`, `static`) or the trait
+// (`traitonly`) rather than one in each object. It has a static slot like a function, written through the class value
+// unless it's const. Writing it through an object raises.
+#define LBC_CLASSMEMBER_CLASSFIELD (1 << 8)
+// Luwu Traits (rfcs/classes/traits.md): a member readable through the class value only (`static`, a function without
+// `self`, or anything `traitonly`). Reading it through an object raises. These members take the last static slots,
+// from LuauClass::numberofobjectmembers on, so an object's slot check leaves them out.
+#define LBC_CLASSMEMBER_STATIC (1 << 9)
+// Luwu Traits (rfcs/classes/traits.md): a trait's member that implementing classes don't get (`traitonly`, and the
+// trait's `__create` and `__implemented`)
+#define LBC_CLASSMEMBER_TRAITONLY (1 << 10)
+// Luwu Traits (rfcs/classes/traits.md): an expected member only an implementing class may provide (`expect class to
+// override`), or only a trait that needs this one (`expect trait to override`)
+#define LBC_CLASSMEMBER_EXPECTCLASS (1 << 11)
+#define LBC_CLASSMEMBER_EXPECTTRAIT (1 << 12)
+// Luwu Traits (rfcs/classes/traits.md): a trait's scoped field that each object of an implementing class has a value of
+// (`scoped species = value`), with LBC_CLASSMEMBER_SCOPED and LBC_CLASSMEMBER_CLASSFIELD. The trait's static slot holds
+// the value every object starts with when it's a constant. Otherwise the trait's `__traitinit` computes it for each
+// object. Without this bit a scoped field is one value on the class (`scoped shared`, `scoped static`).
+// On a class's object field, it marks the slot that holds the class's value of such a field (`Animal.species = value`):
+// the slot has no name, and LBC_NEWCLASSMEMBER_QUALIFIEDFIELD says which trait's field it is.
+#define LBC_CLASSMEMBER_SCOPEDOBJECTFIELD (1 << 13)
+// Luwu Traits (rfcs/classes/traits.md): set on a trait's class method, a function whose first parameter is `Self`. Like a
+// method (LBC_CLASSMEMBER_TAKESSELF), it's read through the trait as a dispatcher to the receiver's class, here the class
+// value itself.
+#define LBC_CLASSMEMBER_TAKESCLASS (1 << 14)
 
 // Luwu Traits (rfcs/classes/traits.md): operand B of LOP_NEWCLASSMEMBER for a class's `implements` list
 #define LBC_NEWCLASSMEMBER_IMPLEMENTS 1
@@ -888,9 +931,30 @@ enum LuwuBytecodeTag
 // Luwu Traits (rfcs/classes/traits.md): operand B of LOP_NEWCLASSMEMBER for a class's qualified implementation of a trait's
 // function, `function Json.name`: C holds the function, C+1 the trait, and AUX names the function as a constant string
 #define LBC_NEWCLASSMEMBER_QUALIFIED 3
+// Luwu Traits (rfcs/classes/traits.md): operand B of LOP_NEWCLASSMEMBER for the value of a field on the class value
+// (LBC_CLASSMEMBER_CLASSFIELD): C holds the value and AUX names the field
+#define LBC_NEWCLASSMEMBER_FIELD 4
 // Luwu Classes (rfcs/classes): operand B of LOP_NEWCLASSMEMBER for the class's constructor, the function a call on the
 // class runs (LuauClass::constructor). C holds the function; AUX is unused.
-#define LBC_NEWCLASSMEMBER_CONSTRUCTOR 4
+#define LBC_NEWCLASSMEMBER_CONSTRUCTOR 9
+// Luwu Traits (rfcs/classes/traits.md): operand B of LOP_NEWCLASSMEMBER for a class's value of a trait's per-object scoped
+// field, `Animal.species = value`. C holds the number of the class's object slot that holds each object's value
+// (LBC_CLASSMEMBER_SCOPEDOBJECTFIELD), C+1 the trait, and AUX names the field as a constant string. The class's
+// constructors compute the value like a field default.
+#define LBC_NEWCLASSMEMBER_QUALIFIEDFIELD 5
+// Luwu Traits (rfcs/classes/traits.md): operands B of LOP_NEWCLASSMEMBER for a class's value of a trait's scoped field on
+// the class, `shared Animal.species = value` (`scoped shared`) and `static Animal.species = value` (`scoped static`). C
+// holds the value, C+1 the trait, and AUX names the field as a constant string.
+#define LBC_NEWCLASSMEMBER_QUALIFIEDSHARED 6
+#define LBC_NEWCLASSMEMBER_QUALIFIEDSTATIC 7
+// Luwu Traits (rfcs/classes/traits.md): operand B of LOP_NEWCLASSMEMBER for a metamethod of the class or trait value itself
+// (`function __tostring(Self)`, a trait's `traitonly function __tostring(trait)`): C holds the function and AUX names it
+#define LBC_NEWCLASSMEMBER_VALUEMETAMETHOD 8
+// Luwu Traits (rfcs/classes/traits.md): whether operand B of LOP_NEWCLASSMEMBER gives a trait's member a value for the class,
+// with the trait in C+1
+#define LBC_NEWCLASSMEMBER_ISQUALIFIED(b) \
+    ((b) == LBC_NEWCLASSMEMBER_QUALIFIED || (b) == LBC_NEWCLASSMEMBER_QUALIFIEDFIELD || (b) == LBC_NEWCLASSMEMBER_QUALIFIEDSHARED || \
+     (b) == LBC_NEWCLASSMEMBER_QUALIFIEDSTATIC)
 
 // Luwu Traits (rfcs/classes/traits.md): bits of the shape flags varint of LBC_CONSTANT_CLASS_SHAPE, written after the member
 // counts.
@@ -916,6 +980,9 @@ enum LuwuBytecodeTag
 // 255 is safe as a sentinel because the compiler never allocates it: kMaxRegisterCount is 255 and
 // allocation is bounded by `top + count > kMaxRegisterCount`, so valid registers are 0..254.
 #define LBC_SELFCLASS_OWNER 255
+// Luwu Traits (rfcs/classes/traits.md): operand C of LOP_CHECKSELFCLASS in a class method's prologue (`function f(Self)`),
+// which checks that A holds the class itself rather than one of its objects
+#define LBC_SELFCLASS_CLASSMETHOD 2
 
 // Type table tags
 enum LuauBytecodeType
@@ -936,6 +1003,7 @@ enum LuauBytecodeType
     // (instance). Kept in the 12..14 gap below LBC_TYPE_ANY so existing values don't shift.
     LBC_TYPE_CLASS = 12,
     LBC_TYPE_OBJECT = 13,
+    LBC_TYPE_BIGINT = 14,
 
     LBC_TYPE_ANY = 15,
 
@@ -1091,50 +1159,10 @@ enum LuauBuiltinFunction
     LBF_MATH_ISINF,
     LBF_MATH_ISFINITE,
 
-    // integer
-    LBF_INTEGER_CREATE,
-    LBF_INTEGER_TONUMBER,
-    LBF_INTEGER_NEG,
-    LBF_INTEGER_ADD,
-    LBF_INTEGER_SUB,
-    LBF_INTEGER_MUL,
-    LBF_INTEGER_DIV,
-    LBF_INTEGER_MIN,
-    LBF_INTEGER_MAX,
-    LBF_INTEGER_REM,
-    LBF_INTEGER_IDIV,
-    LBF_INTEGER_UDIV,
-    LBF_INTEGER_UREM,
-    LBF_INTEGER_MOD,
-    LBF_INTEGER_CLAMP,
-    LBF_INTEGER_BAND,
-    LBF_INTEGER_BOR,
-    LBF_INTEGER_BNOT,
-    LBF_INTEGER_BXOR,
-    LBF_INTEGER_LT,
-    LBF_INTEGER_LE,
-    LBF_INTEGER_ULT,
-    LBF_INTEGER_ULE,
-    LBF_INTEGER_GT,
-    LBF_INTEGER_GE,
-    LBF_INTEGER_UGT,
-    LBF_INTEGER_UGE,
-    LBF_INTEGER_LSHIFT,
-    LBF_INTEGER_RSHIFT,
-    LBF_INTEGER_ARSHIFT,
-    LBF_INTEGER_LROTATE,
-    LBF_INTEGER_RROTATE,
-    LBF_INTEGER_EXTRACT,
-    LBF_INTEGER_BTEST,
-    LBF_INTEGER_COUNTRZ,
-    LBF_INTEGER_COUNTLZ,
-    LBF_INTEGER_BSWAP,
-
-    // buffer.readinteger / buffer.writeinteger (int64_t)
-    LBF_BUFFER_READINTEGER,
-    LBF_BUFFER_WRITEINTEGER,
-
-    LBF_BUFFER_ISFROZEN,
+    // Luwu Integers (rfcs/integers.md): the 39 ids after LBF_MATH_ISFINITE were upstream Luau's `integer` library and
+    // `buffer.readinteger`/`writeinteger`. Luwu's integers are a different design, so the ids stay unused (legacy
+    // bytecode that names one calls the function instead), and the ids after them keep their numbers.
+    LBF_BUFFER_ISFROZEN = LBF_MATH_ISFINITE + 40,
 
     // Luwu Classes (rfcs/classes): class.isinstance(value, class) -> boolean
     LBF_CLASS_ISINSTANCE,

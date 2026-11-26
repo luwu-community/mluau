@@ -941,6 +941,8 @@ unsafe fn load_std_libs(state: *mut ffi::lua_State, libs: StdLib) -> Result<()> 
         requiref(state, ffi::LUA_VECLIBNAME, ffi::luaopen_vector, 1)?;
     }
 
+    // With luwu-classes, `configure_luau` opens `integer` after classes, bundles and results, which it builds on
+    #[cfg(not(feature = "luwu-classes"))]
     if libs.contains(StdLib::INTEGER) {
         requiref(state, ffi::LUA_INTLIBNAME, ffi::luaopen_integer, 1)?;
     }

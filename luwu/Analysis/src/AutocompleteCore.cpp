@@ -4,6 +4,7 @@
 
 #include "Luau/Ast.h"
 #include "Luau/AstQuery.h"
+#include "Luau/ClassMemberNames.h"
 #include "Luau/AutocompleteTypes.h"
 
 #include "Luau/BuiltinDefinitions.h"
@@ -37,16 +38,8 @@ LUAU_FASTFLAG(LuwuIfLocal)
 LUAU_FASTFLAG(LuwuTableComprehensions)
 LUAU_FASTFLAG(LuwuDoExpr)
 LUAU_FASTFLAGVARIABLE(DebugLuauMagicVariableNames)
-LUAU_FASTFLAGVARIABLE(LuauAutocompleteConst)
 LUAU_FASTFLAGVARIABLE(LuauAutocompleteExport)
 LUAU_FASTFLAG(LuauExportValueSyntax)
-LUAU_FASTFLAGVARIABLE(LuauAutocompleteFunctionArglistSuggestion)
-LUAU_FASTFLAGVARIABLE(LuauAutocompleteMetatableInheritance)
-LUAU_FASTFLAGVARIABLE(LuauAutocompleteSkipErrorTypeInUnion)
-LUAU_FASTFLAGVARIABLE(LuauCheckTypeForDeprecated)
-
-static constexpr std::array<std::string_view, 12> kStatementStartingKeywords_DEPRECATED =
-    {"while", "if", "local", "repeat", "function", "do", "for", "return", "break", "continue", "type", "export"};
 
 static constexpr std::array<std::string_view, 13> kStatementStartingKeywords_CONST =
     {"while", "if", "local", "repeat", "function", "do", "for", "return", "break", "continue", "type", "export", "const"};
@@ -621,7 +614,6 @@ static TypeCorrectKind checkTypeCorrectKind(
 
 static bool isTypeDeprecated(TypeId ty)
 {
-    LUAU_ASSERT(FFlag::LuauCheckTypeForDeprecated);
     ty = follow(ty);
 
     if (const auto ftv = get<FunctionType>(ty); ftv && ftv->isDeprecatedFunction)
@@ -773,7 +765,8 @@ static void autocompleteProps(
     {
         for (const auto& [name, prop] : props)
         {
-            if (onObject && (name == "__create" || name == "__implemented"))
+            const ClassMemberName* special = onObject ? findClassMemberName(name.c_str()) : nullptr;
+            if (special && special->kind == ClassMemberNameKind::TraitHook)
                 continue;
 
             // We are walking up the class hierarchy, so if we encounter a property that we have
@@ -807,7 +800,7 @@ static void autocompleteProps(
                 result[name] = AutocompleteEntry{
                     AutocompleteEntryKind::Property,
                     type,
-                    prop.deprecated || (FFlag::LuauCheckTypeForDeprecated && isTypeDeprecated(type)),
+                    prop.deprecated || isTypeDeprecated(type),
                     isWrongIndexer(type),
                     typeCorrect,
                     containingExternType,
@@ -872,8 +865,7 @@ static void autocompleteProps(
     {
         autocompleteProps(module, typeArena, builtinTypes, rootTy, mt->table, indexType, nodes, result, seen);
 
-        const TableType* mtable =
-            FFlag::LuauAutocompleteMetatableInheritance ? getTableType(follow(mt->metatable)) : get<TableType>(follow(mt->metatable));
+        const TableType* mtable = getTableType(follow(mt->metatable));
         if (mtable)
             fillMetatableProps(mtable);
     }
@@ -897,21 +889,8 @@ static void autocompleteProps(
         auto iter = begin(u);
         auto endIter = end(u);
 
-        if (FFlag::LuauAutocompleteSkipErrorTypeInUnion)
-        {
-            while (iter != endIter && isSkippableTypeInUnion(*iter, builtinTypes))
-                ++iter;
-        }
-        else
-        {
-            while (iter != endIter)
-            {
-                if (isNil(*iter) || isWeakUnknown(*iter, builtinTypes))
-                    ++iter;
-                else
-                    break;
-            }
-        }
+        while (iter != endIter && isSkippableTypeInUnion(*iter, builtinTypes))
+            ++iter;
 
         if (iter == endIter)
             return;
@@ -937,21 +916,10 @@ static void autocompleteProps(
                     innerSeen.insert(ty);
             }
 
-            if (FFlag::LuauAutocompleteSkipErrorTypeInUnion)
+            if (isSkippableTypeInUnion(*iter, builtinTypes))
             {
-                if (isSkippableTypeInUnion(*iter, builtinTypes))
-                {
-                    ++iter;
-                    continue;
-                }
-            }
-            else
-            {
-                if (isNil(*iter) || isWeakUnknown(*iter, builtinTypes))
-                {
-                    ++iter;
-                    continue;
-                }
+                ++iter;
+                continue;
             }
 
             autocompleteProps(module, typeArena, builtinTypes, rootTy, *iter, indexType, nodes, inner, innerSeen);
@@ -1818,7 +1786,7 @@ static AutocompleteEntryMap autocompleteStatement(
                 result[n] = {
                     AutocompleteEntryKind::Binding,
                     binding.typeId,
-                    binding.deprecated || (FFlag::LuauCheckTypeForDeprecated && isTypeDeprecated(binding.typeId)),
+                    binding.deprecated || isTypeDeprecated(binding.typeId),
                     false,
                     TypeCorrectKind::None,
                     std::nullopt,
@@ -1843,17 +1811,9 @@ static AutocompleteEntryMap autocompleteStatement(
                 result.emplace(kw, AutocompleteEntry{AutocompleteEntryKind::Keyword});
         }
     }
-    else if (FFlag::LuauAutocompleteConst)
-    {
-        for (const std::string_view kw : kStatementStartingKeywords_CONST)
-        {
-            if ((kw != "break" && kw != "continue") || shouldIncludeBreakAndContinue)
-                result.emplace(kw, AutocompleteEntry{AutocompleteEntryKind::Keyword});
-        }
-    }
     else
     {
-        for (const std::string_view kw : kStatementStartingKeywords_DEPRECATED)
+        for (const std::string_view kw : kStatementStartingKeywords_CONST)
         {
             if ((kw != "break" && kw != "continue") || shouldIncludeBreakAndContinue)
                 result.emplace(kw, AutocompleteEntry{AutocompleteEntryKind::Keyword});
@@ -2036,7 +1996,7 @@ static AutocompleteContext autocompleteExpression(
                     result[n] = {
                         AutocompleteEntryKind::Binding,
                         binding.typeId,
-                        binding.deprecated || (FFlag::LuauCheckTypeForDeprecated && isTypeDeprecated(binding.typeId)),
+                        binding.deprecated || isTypeDeprecated(binding.typeId),
                         false,
                         typeCorrect,
                         std::nullopt,
@@ -2439,27 +2399,6 @@ static void autocompleteMissingTraitMembers(const ScopePtr& scope, AstStatClass*
     }
 }
 
-// Luwu Classes (rfcs/classes): the metamethods a class or trait may define, with the parameters and returns they're
-// usually written with
-static const char* const kMetamethodSignatures[][2] = {
-    {"__tostring", "(self): string"},
-    {"__eq", "(self, other): boolean"},
-    {"__lt", "(self, other): boolean"},
-    {"__le", "(self, other): boolean"},
-    {"__len", "(self): number"},
-    {"__add", "(self, other)"},
-    {"__sub", "(self, other)"},
-    {"__mul", "(self, other)"},
-    {"__div", "(self, other)"},
-    {"__idiv", "(self, other)"},
-    {"__mod", "(self, other)"},
-    {"__pow", "(self, other)"},
-    {"__unm", "(self)"},
-    {"__concat", "(self, other)"},
-    {"__call", "(self, ...)"},
-    {"__iter", "(self)"},
-};
-
 // Luwu Classes (rfcs/classes): whether a member or primary constructor parameter is written with `public` or `private`, which
 // means every one needs one
 static bool usesAccessSpecifiers(const AstStatClass* classStat)
@@ -2544,14 +2483,18 @@ static void autocompleteMissingFunctions(
         return;
 
     bool final = typing && typing->finalLocation;
-    if (!final)
+    // Luwu Classes (rfcs/classes): the metamethods a class or trait may define (ClassMemberNames.h)
+    size_t count = 0;
+    const ClassMemberName* specials = classMemberNames(&count);
+    for (size_t i = 0; i < count && !final; i++)
     {
-        for (const auto& [metamethod, signature] : kMetamethodSignatures)
-            add(metamethod, signature, nullptr, "function ");
+        if (specials[i].kind == ClassMemberNameKind::Metamethod && specials[i].signature)
+            add(specials[i].name, specials[i].signature, nullptr, "function ");
     }
 
+    const ClassMemberName* init = findClassMemberName("__init");
     if (!classStat->isTrait && !classStat->primaryConstructor)
-        add("__init", "(self)", nullptr, "function ");
+        add(init->name, init->signature, nullptr, "function ");
 
     // Luwu object notation: how a data file holds a class that implements `luwon.data`
     if (!classStat->isTrait && !final && implementsLuwonData(classStat->implements))
@@ -2561,10 +2504,12 @@ static void autocompleteMissingFunctions(
     }
 
     // Luwu Traits (rfcs/classes/traits.md): a trait's factory, and its hook for each implementing class, which is always final
+    const ClassMemberName* create = findClassMemberName("__create");
+    const ClassMemberName* implemented = findClassMemberName("__implemented");
     if (classStat->isTrait && !classStat->primaryConstructor && !final)
-        add("__create", "(...)", nullptr, "function ");
+        add(create->name, create->signature, nullptr, "function ");
     if (classStat->isTrait && (!typing || final))
-        add("__implemented", "(cls)", nullptr, "final function ");
+        add(implemented->name, implemented->signature, nullptr, "final function ");
 }
 
 // Luwu Classes (rfcs/classes): the class (or trait) and the method being named, when the cursor is after a member's
@@ -2759,53 +2704,7 @@ static std::string makeAnonymous(const ScopePtr& scope, const FunctionType& func
 {
     std::string result = "function(";
 
-    if (FFlag::LuauAutocompleteFunctionArglistSuggestion)
-    {
-        result += makeAnonymousArgList(scope, funcTy);
-    }
-    else
-    {
-        auto [args, tail] = Luau::flatten(funcTy.argTypes);
-
-        bool first = true;
-        // Skip the implicit 'self' argument if call is indexed with ':'
-        for (size_t argIdx = 0; argIdx < args.size(); ++argIdx)
-        {
-            if (!first)
-                result += ", ";
-            else
-                first = false;
-
-            std::string name;
-            if (argIdx < funcTy.argNames.size() && funcTy.argNames[argIdx])
-                name = funcTy.argNames[argIdx]->name;
-            else
-                name = "a" + std::to_string(argIdx);
-
-            if (std::optional<Name> type = tryGetTypeNameInScope(scope, args[argIdx], true))
-                result += name + ": " + *type;
-            else
-                result += name;
-        }
-
-        if (tail && (Luau::isVariadic(*tail) || Luau::get<Luau::FreeTypePack>(Luau::follow(*tail))))
-        {
-            if (!first)
-                result += ", ";
-
-            std::optional<std::string> varArgType;
-            if (const VariadicTypePack* pack = get<VariadicTypePack>(follow(*tail)))
-            {
-                if (std::optional<std::string> res = tryGetTypeNameInScope(scope, pack->ty, true))
-                    varArgType = std::move(res);
-            }
-
-            if (varArgType)
-                result += "...: " + *varArgType;
-            else
-                result += "...";
-        }
-    }
+    result += makeAnonymousArgList(scope, funcTy);
 
     result += ")";
 
@@ -2901,7 +2800,7 @@ static std::optional<AutocompleteEntry> makeAnonymousAutofilled(
     // If argLocation is absent the user has typed the "function" keyword but not yet the "(", so
     // the full expression is still the correct completion.
     const AstExprFunction* exprFunc = node->as<AstExprFunction>();
-    if (FFlag::LuauAutocompleteFunctionArglistSuggestion && exprFunc && exprFunc->argLocation.has_value())
+    if (exprFunc && exprFunc->argLocation.has_value())
         entry.insertText = makeAnonymousArgList(scope, *type);
     else
         entry.insertText = makeAnonymous(scope, *type);
@@ -3704,11 +3603,20 @@ AutocompleteResult autocomplete_(
         ret["private"] = {AutocompleteEntryKind::Keyword};
         ret["function"] = {AutocompleteEntryKind::Keyword};
 
-        // Luwu Traits (rfcs/classes/traits.md): a trait's members may be expected or final
+        // Luwu Traits (rfcs/classes/traits.md): a member's placement, and in a trait, whether it's expected or final and the
+        // placements only a trait has
+        if (FFlag::LuwuTraits)
+        {
+            ret["shared"] = {AutocompleteEntryKind::Keyword};
+            ret["static"] = {AutocompleteEntryKind::Keyword};
+        }
+
         if (classStat->isTrait)
         {
             ret["expect"] = {AutocompleteEntryKind::Keyword};
             ret["final"] = {AutocompleteEntryKind::Keyword};
+            ret["traitonly"] = {AutocompleteEntryKind::Keyword};
+            ret["scoped"] = {AutocompleteEntryKind::Keyword};
         }
 
         // Luwu Traits (rfcs/classes/traits.md): on the declaration's own line, before its first member, the next word may

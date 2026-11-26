@@ -224,6 +224,8 @@ impl Build {
             .clone()
             .include(&vm_include_dir)
             .add_files_by_ext_sorted(&vm_source_dir, "cpp")
+            // Luwu Integers: the bigint arithmetic behind `int` integers past 64 bits
+            .add_files_by_ext_sorted(&vm_source_dir.join("bigint"), "cpp")
             .out_dir(&build_dir)
             .compile(vm_lib_name);
 

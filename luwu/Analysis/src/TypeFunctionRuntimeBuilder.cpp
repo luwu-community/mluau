@@ -3,6 +3,7 @@
 #include "Luau/TypeFunctionRuntimeBuilder.h"
 
 #include "Luau/BuiltinDefinitions.h"
+#include "Luau/ClassMemberNames.h"
 #include "Luau/ConstraintSolver.h"
 #include "Luau/Common.h"
 #include "Luau/DenseHash.h"
@@ -24,7 +25,6 @@ LUAU_DYNAMIC_FASTINTVARIABLE(LuauTypeFunctionSerdeIterationLimit, 100'000);
 
 LUAU_FASTFLAG(LuauTypeFunctionStructuredErrors)
 LUAU_FASTFLAG(LuauTypeFunctionSerializeArgNames)
-LUAU_FASTFLAG(LuauTypeFunctionTableIndexerIsReadOnly)
 LUAU_FASTFLAG(LuauUdtfReuseTypeUserdatas)
 
 namespace Luau
@@ -552,7 +552,7 @@ private:
             t2->indexer = TypeFunctionTableIndexer(
                 shallowSerialize(t1->indexer->indexType),
                 shallowSerialize(t1->indexer->indexResultType),
-                FFlag::LuauTypeFunctionTableIndexerIsReadOnly ? t1->indexer->isReadOnly : false
+                t1->indexer->isReadOnly
             );
         }
     }
@@ -599,14 +599,16 @@ private:
     void serializeChildren(const ExternType* c1, TypeFunctionExternType* c2)
     {
         // Luwu Classes (rfcs/classes): a type function sees a class's or trait's members as code outside it does. Private
-        // members are left out, and so is the constructor (`__init`, a trait's `__create`): it isn't part of the type,
+        // members are left out, and so are the constructor and a trait's hooks (`__init`, `__create`): they aren't part of the type,
         // and a generic class's `__init` is generic over the class's generics, which the type it would make has lost.
         const NotNull<BuiltinTypes> builtins = state->ctx->builtins;
         const bool isUserNominal = c1->root == builtins->objectType || c1->root == builtins->classType || c1->root == builtins->traitType;
 
         for (const auto& [k, p] : c1->props())
         {
-            const bool hiddenFromOutside = p.isPrivate || k == "__init" || k == "__create";
+            const ClassMemberName* special = findClassMemberName(k.c_str());
+            const bool constructs = special && (special->kind == ClassMemberNameKind::Constructor || special->kind == ClassMemberNameKind::TraitHook);
+            const bool hiddenFromOutside = p.isPrivate || constructs;
             if (isUserNominal && hiddenFromOutside)
                 continue;
 
@@ -1404,7 +1406,7 @@ private:
             t1->indexer = TableIndexer(
                 shallowDeserialize(t2->indexer->keyType),
                 shallowDeserialize(t2->indexer->valueType),
-                FFlag::LuauTypeFunctionTableIndexerIsReadOnly ? t2->indexer->isReadOnly : false
+                t2->indexer->isReadOnly
             );
         }
     }

@@ -12,8 +12,6 @@
 #include "lstate.h"
 #include "ltm.h"
 
-LUAU_FASTFLAG(LuauCodegenInteger3)
-LUAU_FASTFLAGVARIABLE(LuauCodegenBuilinDeadRange)
 LUAU_FASTFLAG(LuwuClasses)
 LUAU_FASTFLAG(LuauCallFeedback)
 
@@ -108,10 +106,11 @@ static void translateInstLoadConstant(IrBuilder& build, int ra, int k)
         build.inst(IrCmd::STORE_INT, build.vmReg(ra), build.constInt(protok.value.b));
         build.inst(IrCmd::STORE_TAG, build.vmReg(ra), build.constTag(LUA_TBOOLEAN));
     }
-    else if (FFlag::LuauCodegenInteger3 && protok.tt == LUA_TINTEGER)
+    else if (protok.tt == LUA_TINTEGER)
     {
         build.inst(IrCmd::STORE_INT64, build.vmReg(ra), build.constInt64(protok.value.l));
         build.inst(IrCmd::STORE_TAG, build.vmReg(ra), build.constTag(LUA_TINTEGER));
+        build.inst(IrCmd::STORE_EXTRA, build.vmReg(ra), build.constInt(protok.extra[0]));
     }
     else if (protok.tt == LUA_TNUMBER)
     {
@@ -253,49 +252,6 @@ void translateInstJumpIfEqShortcut(IrBuilder& build, const Instruction* pc, int 
             IrCmd::CMP_SPLIT_TVALUE,
             build.constTag(LUA_TNUMBER),
             build.constTag(LUA_TNUMBER),
-            va,
-            vb,
-            build.cond(not_ ? IrCondition::NotEqual : IrCondition::Equal)
-        );
-
-        build.inst(IrCmd::STORE_INT, build.vmReg(rr), result);
-        build.inst(IrCmd::STORE_TAG, build.vmReg(rr), build.constTag(LUA_TBOOLEAN));
-        build.inst(IrCmd::JUMP, next);
-
-        // If we don't need a fallback, we are done
-        if (fallback.kind == IrOpKind::None)
-            return;
-
-        // Otherwise, start the fallback block
-        // Note that if the number fast-path is not taken at all code that would have been in the fallback is actually the main path
-        build.beginBlock(fallback);
-    }
-    else if (FFlag::LuauCodegenInteger3 && isExpectedOrUnknownBytecodeType(bcTypes.a, LBC_TYPE_INTEGER) &&
-             isExpectedOrUnknownBytecodeType(bcTypes.b, LBC_TYPE_INTEGER))
-    {
-        IrOp ta = build.inst(IrCmd::LOAD_TAG, build.vmReg(ra));
-        build.inst(
-            IrCmd::CHECK_TAG,
-            ta,
-            build.constTag(LUA_TINTEGER),
-            bcTypes.a == LBC_TYPE_INTEGER ? build.vmExit(pcpos) : getInitializedFallback(build, fallback, pcpos)
-        );
-
-        IrOp tb = build.inst(IrCmd::LOAD_TAG, build.vmReg(rb));
-        build.inst(
-            IrCmd::CHECK_TAG,
-            tb,
-            build.constTag(LUA_TINTEGER),
-            bcTypes.b == LBC_TYPE_INTEGER ? build.vmExit(pcpos) : getInitializedFallback(build, fallback, pcpos)
-        );
-
-        IrOp va = build.inst(IrCmd::LOAD_INT64, build.vmReg(ra));
-        IrOp vb = build.inst(IrCmd::LOAD_INT64, build.vmReg(rb));
-
-        IrOp result = build.inst(
-            IrCmd::CMP_SPLIT_TVALUE,
-            build.constTag(LUA_TINTEGER),
-            build.constTag(LUA_TINTEGER),
             va,
             vb,
             build.cond(not_ ? IrCondition::NotEqual : IrCondition::Equal)
@@ -1228,7 +1184,7 @@ IrOp translateFastCallN(IrBuilder& build, const Instruction* pc, int pcpos, bool
 
         if (protok.tt == LUA_TNUMBER)
             builtinArgs = build.constDouble(protok.value.n);
-        else if (FFlag::LuauCodegenInteger3 && protok.tt == LUA_TINTEGER)
+        else if (protok.tt == LUA_TINTEGER)
             builtinArgs = build.constInt64(protok.value.l);
     }
 
@@ -1238,6 +1194,15 @@ IrOp translateFastCallN(IrBuilder& build, const Instruction* pc, int pcpos, bool
 
     // In unsafe environment, instead of retrying fastcall at 'pcpos' we side-exit directly to fallback sequence
     build.checkSafeEnv(pcpos + getOpLength(opcode));
+
+    // Luwu String Extensions (rfcs/string-extensions.md): a method call like `obj:startswith(x)` tries the builtin
+    // first, and its receiver is often a table or an object with a method of that name. A receiver of another type goes
+    // straight to the method call instead of calling into the builtin or exiting to the VM.
+    // A method call has a NAMECALL right before its CALL. A false match only adds the check.
+    bool methodCall = skip >= 2 && LUAU_INSN_OP(pc[skip - 1]) == LOP_NAMECALL;
+    int receiverTag = methodCall ? builtinFirstArgumentTag(bfid) : -1;
+    if (receiverTag >= 0)
+        build.loadAndCheckTag(build.vmReg(arg), uint8_t(receiverTag), fallback);
 
     BuiltinImplResult br = translateBuiltin(
         build, LuauBuiltinFunction(bfid), ra, arg, builtinArgs, builtinArg3, nparams, nresults, fallback, pcpos + getOpLength(opcode)
@@ -1250,9 +1215,10 @@ IrOp translateFastCallN(IrBuilder& build, const Instruction* pc, int pcpos, bool
         if (nresults == LUA_MULTRET)
             build.inst(IrCmd::ADJUST_STACK_TO_REG, build.vmReg(ra), build.constInt(br.actualResultCount));
         else
-            build.inst(IrCmd::MARK_DEAD, build.vmReg(ra + (FFlag::LuauCodegenBuilinDeadRange ? br.actualResultCount : 1)), build.constInt(-1));
+            build.inst(IrCmd::MARK_DEAD, build.vmReg(ra + br.actualResultCount), build.constInt(-1));
 
-        if (br.type != BuiltinImplType::UsesFallback)
+        bool fallbackUsed = br.type == BuiltinImplType::UsesFallback || receiverTag >= 0;
+        if (!fallbackUsed)
         {
             // We ended up not using the fallback block, kill it
             build.function.blockOp(fallback).kind = IrBlockKind::Dead;
@@ -3099,12 +3065,15 @@ void translateInstCheckSelfClass(IrBuilder& build, const Instruction* pc, int pc
     // the success path as straight-line code with no basic blocks at all.
     IrOp fail = build.vmExit(pcpos);
 
+    // Luwu Traits (rfcs/classes/traits.md): a class method's `Self` is the class itself
+    bool classMethod = LUAU_INSN_C(*pc) == LBC_SELFCLASS_CLASSMETHOD;
+
     // note the LOAD_TAG: CHECK_TAG's operand has to be an SSA value, not a raw VmReg. Liveness
     // (visitVmRegDefsUses) has no case for CHECK_TAG, so a register operand reaches its default
     // branch and trips CODEGEN_ASSERT(op.kind != IrOpKind::VmReg); the register use is meant to be
     // recorded by the LOAD_TAG feeding it. This is exactly what IrBuilder::loadAndCheckTag does.
     IrOp selfTag = build.inst(IrCmd::LOAD_TAG, build.vmReg(selfReg));
-    build.inst(IrCmd::CHECK_TAG, selfTag, build.constTag(LUA_TOBJECT), fail);
+    build.inst(IrCmd::CHECK_TAG, selfTag, build.constTag(classMethod ? LUA_TCLASS : LUA_TOBJECT), fail);
 
     IrOp selfPtr = build.inst(IrCmd::LOAD_POINTER, build.vmReg(selfReg));
 
@@ -3113,6 +3082,20 @@ void translateInstCheckSelfClass(IrBuilder& build, const Instruction* pc, int pc
     // passes a register.
     IrOp classPtr = classReg == LBC_SELFCLASS_OWNER ? build.inst(IrCmd::LOAD_OWNER_CLASS)
                                                     : build.inst(IrCmd::LOAD_POINTER, build.vmReg(classReg));
+
+    // the comparison branches, so a mismatch goes through a block that leaves for the interpreter
+    if (classMethod)
+    {
+        IrOp next = build.block(IrBlockKind::Internal);
+        IrOp mismatch = build.fallbackBlock(pcpos);
+        build.inst(IrCmd::JUMP_EQ_POINTER, selfPtr, classPtr, next, mismatch);
+
+        build.beginBlock(mismatch);
+        build.inst(IrCmd::JUMP, fail);
+
+        build.beginBlock(next);
+        return;
+    }
 
     build.inst(IrCmd::CHECK_OBJECT_CLASS, selfPtr, classPtr, fail);
 }

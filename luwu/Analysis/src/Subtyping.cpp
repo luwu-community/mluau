@@ -4,6 +4,7 @@
 
 #include "Luau/Common.h"
 #include "Luau/Error.h"
+#include "Luau/IntegerModes.h"
 #include "Luau/Normalize.h"
 #include "Luau/RecursionCounter.h"
 #include "Luau/Scope.h"
@@ -24,13 +25,9 @@ LUAU_FASTFLAGVARIABLE(DebugLuauSubtypingCheckPathValidity)
 LUAU_FASTINTVARIABLE(LuauSubtypingReasoningLimit, 100)
 LUAU_FASTFLAGVARIABLE(LuauSubtypingMissingPropertiesAsNil)
 LUAU_FASTINTVARIABLE(LuauSubtypingIterationLimit, 20000)
-LUAU_FASTFLAG(LuauPropertyModifierMismatchErrors)
-LUAU_FASTFLAGVARIABLE(LuauSubtypeUnionsTogether)
 LUAU_FASTFLAGVARIABLE(LuauDropUnionSubtypeReasoning)
-LUAU_FASTFLAGVARIABLE(LuauDontBindOptionalGenericToNil)
 LUAU_FASTFLAGVARIABLE(LuauImproveUniqueTableWidthSubtyping)
 LUAU_FASTFLAGVARIABLE(LuauSubtypingSkipUnreadReasoning)
-LUAU_FASTFLAG(LuauBidirectionalInferenceSimplifyTables)
 LUAU_FASTFLAG(LuauIndexerModifierMismatchErrors)
 LUAU_FASTFLAG(LuwuGenericNominals)
 
@@ -902,7 +899,7 @@ SubtypingResult Subtyping::isCovariantWith(SubtypingEnvironment& env, TypeId sub
             result.isCacheable = false;
         }
     }
-    else if (auto p = get2<UnionType, UnionType>(subTy, superTy); FFlag::LuauSubtypeUnionsTogether && p)
+    else if (auto p = get2<UnionType, UnionType>(subTy, superTy))
     {
         result = isCovariantWith(env, p.first, p.second, scope);
         if (!result.isSubtype && !result.normalizationTooComplex)
@@ -957,8 +954,7 @@ SubtypingResult Subtyping::isCovariantWith(SubtypingEnvironment& env, TypeId sub
         result = isCovariantWith(env, p, scope);
     else if (auto p = get2<TableType, TableType>(subTy, superTy))
     {
-        const bool forceCovariantTest =
-            FFlag::LuauBidirectionalInferenceSimplifyTables ? false : uniqueTypes != nullptr && uniqueTypes->contains(subTy);
+        const bool forceCovariantTest = false;
         result = isCovariantWith(env, p.first, p.second, forceCovariantTest, scope);
         if (result.isSubtype && !p.first->indexer && p.second->indexer && p.first->state != TableState::Sealed)
         {
@@ -1644,15 +1640,12 @@ SubtypingResult Subtyping::isCovariantWith(SubtypingEnvironment& env, TypeId sub
 
     SubtypingResult result{false};
 
-    if (FFlag::LuauDontBindOptionalGenericToNil)
+    // First pass: If the union already includes subTy, stop.  Do not
+    // attempt to bind any generics.
+    for (TypeId ty : superUnion)
     {
-        // First pass: If the union already includes subTy, stop.  Do not
-        // attempt to bind any generics.
-        for (TypeId ty : superUnion)
-        {
-            if (follow(ty) == subTy)
-                return {true};
-        }
+        if (follow(ty) == subTy)
+            return {true};
     }
 
     size_t index = 0;
@@ -1691,7 +1684,6 @@ SubtypingResult Subtyping::isCovariantWith(SubtypingEnvironment& env, TypeId sub
 LUAU_NOINLINE
 SubtypingResult Subtyping::isCovariantWith(SubtypingEnvironment& env, const UnionType* subUnion, const UnionType* superUnion, NotNull<Scope> scope)
 {
-    LUAU_ASSERT(FFlag::LuauSubtypeUnionsTogether);
     // A | B | C <: D | E | F
     //
     // ... when all of A, B and C are subtypes of D | E | F. However, we can
@@ -1930,6 +1922,12 @@ SubtypingResult Subtyping::isCovariantWith(SubtypingEnvironment& env, const Type
         // number <: ¬boolean
         // number </: ¬number
         result = {p.first->type != p.second->type};
+
+        // Luwu Integers (rfcs/integers.md): u8 <: ¬i8, when the modes are known and share none
+        std::optional<IntegerModeSet> subModes = integerModesOf(subTy);
+        std::optional<IntegerModeSet> negatedModes = integerModesOf(negatedTy);
+        if (subModes && negatedModes)
+            result = {(*subModes & *negatedModes) == 0};
     }
     else if (auto p = get2<SingletonType, PrimitiveType>(subTy, negatedTy))
     {
@@ -1981,7 +1979,24 @@ SubtypingResult Subtyping::isCovariantWith(
     NotNull<Scope> scope
 )
 {
-    return {subPrim->type == superPrim->type};
+    if (subPrim->type != superPrim->type)
+        return {false};
+
+    // Luwu Integers (rfcs/integers.md): `u8` is an `integer<"u8">` and an `integer`, but not an `i8`. A generic mode is
+    // one mode everywhere it's written, so `<T>(integer<T>, integer<T>)` can't take a `u8` and an `i64`: a known mode is
+    // bound in both directions. Plain `integer`'s mode isn't known, so it only widens `T`.
+    if (subPrim->type == PrimitiveType::Integer && superPrim->mode)
+    {
+        TypeId subMode = subPrim->mode ? *subPrim->mode : builtinTypes->everyIntegerModeName;
+        SubtypingResult result = isCovariantWith(env, subMode, *superPrim->mode, scope);
+
+        bool bindsGenericMode = subPrim->mode && !integerModesNamedBy(*superPrim->mode);
+        if (bindsGenericMode)
+            result.andAlso(isCovariantWith(env, *superPrim->mode, subMode, scope));
+        return result;
+    }
+
+    return {true};
 }
 
 SubtypingResult Subtyping::isCovariantWith(
@@ -2019,8 +2034,7 @@ SubtypingResult Subtyping::isCovariantWith(
 {
     SubtypingResult result{true};
 
-    // Either this flag is off or `forceCovariantTest` is false.
-    LUAU_ASSERT(!FFlag::LuauBidirectionalInferenceSimplifyTables || !forceCovariantTest);
+    LUAU_ASSERT(!forceCovariantTest);
 
     if (subTable->props.empty() && !subTable->indexer && subTable->state == TableState::Sealed && superTable->indexer)
     {
@@ -2357,7 +2371,8 @@ SubtypingResult Subtyping::isCovariantWith(
         // Luwu bundles: a bundle can't be changed, so its positions are covariant: `.("torch", number)` is an
         // `.(ItemId, number)`
         const ExternType* declared = subExternType->genericTemplate ? get<ExternType>(follow(*subExternType->genericTemplate)) : nullptr;
-        bool covariant = declared && declared->printsAsBundle;
+        // Luwu Integers (rfcs/integers.md): so is an `integer.Mode`'s mode, so a `Mode<"u8">` is an `integer.Mode`
+        bool covariant = declared && (declared->printsAsBundle || isIntegerModeClass(declared));
 
         for (size_t i = 0; i < subExternType->instantiatedTypeParams.size(); ++i)
         {
@@ -2697,17 +2712,11 @@ SubtypingResult Subtyping::isCovariantWith(
         {
             if (subProp.isReadOnly())
             {
-                if (FFlag::LuauPropertyModifierMismatchErrors)
-                    res.andAlso(SubtypingResult{false}.withBothComponent(TypePath::Property::read(name)).withAccessModifierViolation());
-                else
-                    res.andAlso(SubtypingResult{false}.withBothComponent(TypePath::Property::read(name)));
+                res.andAlso(SubtypingResult{false}.withBothComponent(TypePath::Property::read(name)).withAccessModifierViolation());
             }
             else if (subProp.isWriteOnly())
             {
-                if (FFlag::LuauPropertyModifierMismatchErrors)
-                    res.andAlso(SubtypingResult{false}.withBothComponent(TypePath::Property::write(name)).withAccessModifierViolation());
-                else
-                    res.andAlso(SubtypingResult{false}.withBothComponent(TypePath::Property::write(name)));
+                res.andAlso(SubtypingResult{false}.withBothComponent(TypePath::Property::write(name)).withAccessModifierViolation());
             }
         }
     }
@@ -2733,6 +2742,8 @@ SubtypingResult Subtyping::isCovariantWith(
     result.andAlso(isCovariantWith(env, subNorm->nils, superNorm->nils, scope));
     result.andAlso(isCovariantWith(env, subNorm->nones, superNorm->nones, scope));
     result.andAlso(isCovariantWith(env, subNorm->numbers, superNorm->numbers, scope));
+    // Luwu Integers (rfcs/integers.md): upstream leaves integers out here, which makes `integer | string` a `string`
+    result.andAlso(isCovariantWith(env, subNorm->integers, superNorm->integers, scope));
     result.andAlso(isCovariantWith(env, subNorm->strings, superNorm->strings, scope));
     result.andAlso(isCovariantWith(env, subNorm->strings, superNorm->tables, scope));
     result.andAlso(isCovariantWith(env, subNorm->threads, superNorm->threads, scope));

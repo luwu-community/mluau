@@ -1,6 +1,7 @@
 // This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 // This code is based on Lua 5.x implementation licensed under MIT License; see lua_LICENSE.txt for details
 #include "lclass.h"
+#include "linteger.h"
 #include "lfunc.h"
 #include "lvm.h"
 
@@ -140,8 +141,8 @@ void luaV_gettablefor(lua_State* L, const TValue* t, TValue* key, StkId val, con
             const TValue* offsettval = luaH_get(inst->lclass->memberstooffset, key);
 
             // Objects throw if you try to access a member that is not
-            // present.
-            if (ttisnil(offsettval))
+            // present. Luwu Traits (rfcs/classes/traits.md): a member only the class value reads is missing too.
+            if (ttisnil(offsettval) || uint32_t(nvalue(offsettval)) >= inst->lclass->numberofobjectmembers)
                 luaG_missingmembererror(L, t, key);
 
             const uint32_t offset = uint32_t(nvalue(offsettval));
@@ -152,7 +153,7 @@ void luaV_gettablefor(lua_State* L, const TValue* t, TValue* key, StkId val, con
         else if (LUAU_UNLIKELY(FFlag::LuwuClasses && ttisclass(t)))
         {
             LuauClass* lco = classvalue(t);
-            const TValue* res = luaH_get(lco->memberstooffset, key);
+            const TValue* res = luaR_classvalueoffset(lco, key);
 
             // Class objects throw if you try to access a member that is not
             // present.
@@ -329,7 +330,7 @@ void luaV_settable(lua_State* L, const TValue* t, TValue* key, StkId val)
             if (!ttisnil(oldval) || (tm = fasttm(L, h->metatable, TM_NEWINDEX)) == NULL)
             {
                 if (h->readonly)
-                    luaG_readonlyerror(L);
+                    luaG_readonlyerror(L, t);
 
                 // luaH_set would work but would repeat the lookup so we use luaH_setslot that can reuse oldval if it's safe
                 TValue* newval = luaH_setslot(L, h, oldval, key);
@@ -351,10 +352,12 @@ void luaV_settable(lua_State* L, const TValue* t, TValue* key, StkId val)
                 luaR_bundleassignerror(L, key);
 
             const TValue* offset = luaH_get(inst->lclass->memberstooffset, key);
-            if (ttisnil(offset))
+            if (ttisnil(offset) || uint32_t(nvalue(offset)) >= inst->lclass->numberofobjectmembers)
                 luaG_missingmembererror(L, t, key);
             const uint32_t offsetnum = uint32_t(nvalue(offset));
             LUAU_ASSERT(offsetnum < inst->lclass->numberofallmembers);
+            if (offsetnum >= inst->lclass->numberofinstancemembers && (inst->lclass->memberflags[offsetnum] & LBC_CLASSMEMBER_CLASSFIELD))
+                luaR_sharedfieldwriteerror(L, inst, key);
             if (offsetnum >= inst->lclass->numberofinstancemembers)
                 luaG_indexerror(L, t, key);
             if (LUAU_UNLIKELY((inst->lclass->hasprivatemembers || inst->lclass->hasconstmembers)))
@@ -370,6 +373,22 @@ void luaV_settable(lua_State* L, const TValue* t, TValue* key, StkId val)
             setobj2class(L, &luaR_members(inst)[offsetnum], val);
             luaC_barrier(L, inst, val);
             return;
+        }
+        else if (LUAU_UNLIKELY(FFlag::LuwuClasses && ttisclass(t)))
+        {
+            // Luwu Traits (rfcs/classes/traits.md): `Cat.species = v` writes a field on the class value. Writing any other
+            // member, or a name the class doesn't have, raises as it always has.
+            LuauClass* lco = classvalue(t);
+            const TValue* offset = luaR_classvalueoffset(lco, key);
+            bool classfield = !ttisnil(offset) && (lco->memberflags[uint32_t(nvalue(offset))] & LBC_CLASSMEMBER_CLASSFIELD);
+            if (classfield)
+            {
+                Closure* cl = isLua(L->ci) ? clvalue(L->ci->func) : nullptr;
+                luaR_setclassfield(L, lco, key, cl, uint32_t(nvalue(offset)), val);
+                return;
+            }
+
+            luaG_indexerror(L, t, key);
         }
         else if (ttisnil(tm = luaT_gettmbyobj(L, t, TM_NEWINDEX)))
             luaG_indexerror(L, t, key);
@@ -459,10 +478,18 @@ int luaV_strcmp(const TString* ls, const TString* rs)
 
 int luaV_lessthan(lua_State* L, const TValue* l, const TValue* r)
 {
+    // Luwu Integers (rfcs/integers.md): an inline integer and a bigint have different tags but compare by value, and
+    // an integer compared to anything but an integer of its mode raises Error.InvalidComparison
     if (LUAU_UNLIKELY(ttype(l) != ttype(r)))
+    {
+        if (ttisinteger(l) || ttisinteger(r))
+            return luaZ_lessthan(L, l, r);
         luaG_ordererror(L, l, r, TM_LT);
+    }
     else if (LUAU_LIKELY(ttisnumber(l)))
         return luai_numlt(nvalue(l), nvalue(r));
+    else if (ttisinteger(l))
+        return luaZ_lessthan(L, l, r);
     else if (ttisstring(l))
         return luaV_strcmp(tsvalue(l), tsvalue(r)) < 0;
     else
@@ -473,9 +500,16 @@ int luaV_lessequal(lua_State* L, const TValue* l, const TValue* r)
 {
     int res;
     if (ttype(l) != ttype(r))
+    {
+        // Luwu Integers (rfcs/integers.md): see luaV_lessthan
+        if (ttisinteger(l) || ttisinteger(r))
+            return luaZ_lessequal(L, l, r);
         luaG_ordererror(L, l, r, TM_LE);
+    }
     else if (ttisnumber(l))
         return luai_numle(nvalue(l), nvalue(r));
+    else if (ttisinteger(l))
+        return luaZ_lessequal(L, l, r);
     else if (ttisstring(l))
         return luaV_strcmp(tsvalue(l), tsvalue(r)) <= 0;
     else if ((res = call_orderTM(L, l, r, TM_LE)) != -1) // first try `le'
@@ -497,7 +531,8 @@ int luaV_equalval(lua_State* L, const TValue* t1, const TValue* t2)
     case LUA_TNUMBER:
         return luai_numeq(nvalue(t1), nvalue(t2));
     case LUA_TINTEGER:
-        return luai_inteq(lvalue(t1), lvalue(t2));
+    case LUA_THEAPINTEGER:
+        return luaZ_equal(t1, t2);
     case LUA_TVECTOR:
         return luai_veceq(vvalue(t1), vvalue(t2));
     case LUA_TBOOLEAN:
@@ -715,6 +750,13 @@ void luaV_doarithimpl(lua_State* L, StkId ra, const TValue* rb, const TValue* rc
                 break;
             }
         }
+    }
+
+    // Luwu Integers (rfcs/integers.md): integers of one mode give an integer; luaZ_arith raises for different modes
+    if (ttisinteger(rb) && ttisinteger(rc))
+    {
+        luaZ_arith(L, ra, rb, rc, op);
+        return;
     }
 
     if ((b = luaV_tonumber(rb, &tempb)) != NULL && (c = luaV_tonumber(rc, &tempc)) != NULL)

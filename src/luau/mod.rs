@@ -10,15 +10,12 @@ pub use require::{NavigateError, Require, TextRequirer};
 
 pub static ENABLED_FFLAGS: &[&str] = &[
     "LuauIntegerType2",
-    "LuauIntegerFastcalls",
-    "LuauIntegerLibrary",
     "LuwuExternallyManagedBuffers",
     "LuwuExternalString",
     #[cfg(feature = "luwu-classes")]
     "LuwuClasses",
     #[cfg(feature = "none-primitive")]
     "LuwuNonePrimitive",
-    "LuauAutoStack", // lets mluau avoid calls to lua_checkstack (avoids ffi calls)
     "LuwuFatCClosure",
     "LuwuManagedReferences2",
     "LuwuPcallMulti",
@@ -27,7 +24,7 @@ pub static ENABLED_FFLAGS: &[&str] = &[
     "LuwuStringFormatFastcall",
     // the @[inline(reason)] attribute: parsed, and honored by the compiler
     "DebugLuwuEncourageInline",
-    "LuwuBufferBatched",
+    "DebugLuwuBufferBatched",
     "DebugLuwuBufferComparison",
     // destructuring; positional patterns `.(a, b)` compile to LOP_GETPOSITIONAL only with it on
     "LuwuDestructuring",
@@ -39,13 +36,14 @@ pub static ENABLED_FFLAGS: &[&str] = &[
     "DebugLuwuBundles",
     // `try` expressions, which give a `collections.result`
     #[cfg(feature = "luwu-classes")]
-    "DebugLuwuTryExpressions"
+    "DebugLuwuTryExpressions",
+    // integer literals (`7int`, `255u8`), the `integer` library and the `Error` variants it raises; it needs LuwuClasses
+    #[cfg(feature = "luwu-classes")]
+    "DebugLuwuIntegers"
 ];
 
 pub static RESTRICTED_FFLAGS: &[&str] = &[
     "LuauIntegerType2",
-    "LuauIntegerFastcalls",
-    "LuauIntegerLibrary",
     "LuwuExternallyManagedBuffers",
     "LuwuExternalString",
     // luwu-classes
@@ -53,7 +51,6 @@ pub static RESTRICTED_FFLAGS: &[&str] = &[
     // none primitive
     "LuwuNonePrimitive",
     // internally needed
-    "LuauAutoStack",
     "LuwuFatCClosure",
     "LuwuManagedReferences2",
     "LuwuPcallMulti"
@@ -174,6 +171,17 @@ impl Lua {
             let state = lua.state();
             protect_lua!(state, 0, 0, |state| {
                 ffi::luaopen_result(state);
+            })?;
+        }
+
+        // The `integer` library (DebugLuwuIntegers, enabled above). `integer.Mode` is a builtin class, and
+        // `integer.suffixes` is a bundle when the bundle library is open, so it opens after bundles and results.
+        #[cfg(feature = "luwu-classes")]
+        {
+            let lua = self.lock();
+            let state = lua.state();
+            protect_lua!(state, 0, 0, |state| {
+                ffi::luaL_requiref(state, ffi::LUA_INTLIBNAME, ffi::luaopen_integer, 1)
             })?;
         }
 

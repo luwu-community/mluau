@@ -1,6 +1,7 @@
 // This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 // This code is based on Lua 5.x implementation licensed under MIT License; see lua_LICENSE.txt for details
 #include "lclass.h"
+#include "linteger.h"
 #include "lvm.h"
 
 #include "lstate.h"
@@ -19,7 +20,6 @@
 #include <stdio.h>
 #include <string.h>
 
-LUAU_FASTFLAGVARIABLE(LuauUdataDirectAccess6)
 LUAU_FASTFLAG(LuauCallFeedback)
 
 template<typename T>
@@ -852,43 +852,66 @@ static int loadsafe(
                 if (hasPrimaryInit)
                     luaR_newpositionalmembers(L, lco, numPositional);
 
-                // Members are written properties-first, so index idx here is exactly the member's runtime
-                // offset.
+                // A reserved `__init` goes before the members only the class value can read (LBC_CLASSMEMBER_STATIC),
+                // which the compiler writes last, so those stay at the end.
+                uint32_t memberOffset = 0;
+                bool initPlaced = hasCustomInit;
+
+                auto placeReservedInit = [&]()
+                {
+                    lco->offsettomember[memberOffset] = initName;
+                    lco->memberflags[memberOffset] = 0;
+                    TValue* val = luaH_setstr(L, lco->memberstooffset, initName);
+                    setnvalue(val, memberOffset);
+                    memberOffset++;
+                    initPlaced = true;
+                };
+
+                // Members are written properties-first, so each member's runtime offset is its index here, past a
+                // reserved `__init`.
                 for (uint32_t idx = 0; idx < numMembers; idx++)
                 {
                     uint32_t mid = readVarInt(data, size, offset);
                     TValue* memberName = &p->k[mid];
                     LUAU_ASSERT(ttisstring(memberName));
-                    lco->offsettomember[idx] = tsvalue(memberName);
-                    lco->memberflags[idx] = uint8_t(readVarInt(data, size, offset));
+                    uint16_t flags = uint16_t(readVarInt(data, size, offset));
 
-                    if (idx < numProperties && (lco->memberflags[idx] & LBC_CLASSMEMBER_CONSTDEFAULT))
+                    if (!initPlaced && (flags & LBC_CLASSMEMBER_STATIC))
+                        placeReservedInit();
+
+                    // Luwu Traits (rfcs/classes/traits.md): the class's slot for its value of a trait's per-object scoped
+                    // field has no name, so no read by name reaches it (LBC_NEWCLASSMEMBER_QUALIFIEDFIELD)
+                    bool unnamed = idx < numProperties && (flags & LBC_CLASSMEMBER_SCOPEDOBJECTFIELD);
+
+                    lco->offsettomember[memberOffset] = unnamed ? NULL : tsvalue(memberName);
+                    lco->memberflags[memberOffset] = flags;
+
+                    if (idx < numProperties && (flags & LBC_CLASSMEMBER_CONSTDEFAULT))
                     {
                         uint32_t did = readVarInt(data, size, offset);
                         LUAU_ASSERT(lco->memberdefaults && idx < numProperties);
                         // a constant field default; its own constant is written before the shape, so it's
                         // already loaded
-                        setobj(L, &lco->memberdefaults[idx], &p->k[did]);
+                        setobj(L, &lco->memberdefaults[memberOffset], &p->k[did]);
                     }
 
-                    if (idx < numProperties && (lco->memberflags[idx] & LBC_CLASSMEMBER_POSITIONAL))
+                    if (idx < numProperties && (flags & LBC_CLASSMEMBER_POSITIONAL))
                     {
                         uint32_t position = readVarInt(data, size, offset);
                         LUAU_ASSERT(int(position) < lco->numberofpositional);
-                        lco->positionalmembers[position] = idx;
+                        lco->positionalmembers[position] = memberOffset;
                     }
 
-                    TValue* val = luaH_setstr(L, lco->memberstooffset, tsvalue(memberName));
-                    setnvalue(val, idx);
+                    // Luwu Traits (rfcs/classes/traits.md): a static member may share an object field's name; the fields come
+                    // first, so the field is in the map by now
+                    bool isStatic = (flags & LBC_CLASSMEMBER_STATIC) != 0;
+                    if (!unnamed)
+                        luaR_mapmembername(L, lco->memberstooffset, &lco->staticshadows, tsvalue(memberName), memberOffset, isStatic, numProperties);
+                    memberOffset++;
                 }
 
-                if (!hasCustomInit)
-                {
-                    lco->offsettomember[numMembers] = initName;
-                    lco->memberflags[numMembers] = 0;
-                    TValue* val = luaH_setstr(L, lco->memberstooffset, initName);
-                    setnvalue(val, numMembers);
-                }
+                if (!initPlaced)
+                    placeReservedInit();
 
                 luaR_sealclassshape(L, lco);
                 setclassvalue(L, &p->k[j], lco);
@@ -897,9 +920,29 @@ static int loadsafe(
 
             case LBC_CONSTANT_INTEGER:
             {
-                bool isNegative = read<uint8_t>(data, size, offset);
+                uint8_t signAndMode = read<uint8_t>(data, size, offset);
+                bool isNegative = signAndMode & 1;
+                uint8_t mode = signAndMode >> 1;
+                LUAU_ASSERT(mode <= IntegerMode_U64);
                 uint64_t magnitude = readVarInt64(data, size, offset);
-                setlvalue(&p->k[j], isNegative ? (int64_t)(~magnitude + 1) : (int64_t)magnitude);
+                int64_t val = isNegative ? (int64_t)(~magnitude + 1) : (int64_t)magnitude;
+                setintegersmi(&p->k[j], val, (IntegerMode)mode);
+                break;
+            }
+
+            case LBC_CONSTANT_INTEGER_HEAP:
+            {
+                // Luwu Integers (rfcs/integers.md): only a dynamically-sized integer can be a bigint, so the mode byte is
+                // always IntegerMode_Dynamic
+                if (read<uint8_t>(data, size, offset) != IntegerMode_Dynamic)
+                    LUAU_ASSERT(!"A bigint constant must be dynamically-sized");
+
+                uint32_t sid = readVarInt(data, size, offset);
+                if (sid == 0 || sid > strings.count)
+                    LUAU_ASSERT(!"String ID is out of bounds");
+
+                if (!luaZ_fromdecimal(L, &p->k[j], getstr(strings.data[sid - 1])))
+                    LUAU_ASSERT(!"A bigint constant must be written in decimal");
                 break;
             }
 
@@ -908,46 +951,43 @@ static int loadsafe(
             }
         }
 
-        if (FFlag::LuauUdataDirectAccess6)
+        for (Instruction* instruction = p->code; instruction < p->code + p->sizecode;)
         {
-            for (Instruction* instruction = p->code; instruction < p->code + p->sizecode;)
+            int targetOp = -1;
+
+            switch (LUAU_INSN_OP(*instruction))
             {
-                int targetOp = -1;
+            case LOP_GETTABLEKS:
+                targetOp = LOP_GETUDATAKS;
+                break;
 
-                switch (LUAU_INSN_OP(*instruction))
-                {
-                case LOP_GETTABLEKS:
-                    targetOp = LOP_GETUDATAKS;
-                    break;
+            case LOP_SETTABLEKS:
+                targetOp = LOP_SETUDATAKS;
+                break;
 
-                case LOP_SETTABLEKS:
-                    targetOp = LOP_SETUDATAKS;
-                    break;
-
-                case LOP_NAMECALL:
-                    targetOp = LOP_NAMECALLUDATA;
-                    break;
-                }
-
-                if (targetOp != -1)
-                {
-                    LUAU_ASSERT(instruction[1] < uint32_t(sizek));
-
-                    // We take over the upper 16 bits of AUX - so no constants with big indices.
-                    if (instruction[1] < 0x10000)
-                    {
-                        TValue* k = &p->k[instruction[1]];
-                        TString* s = tsvalue(k);
-
-                        luaS_updateatom(L, s);
-
-                        if (s->atom >= 0)
-                            *instruction = (*instruction & 0xffffff00) | targetOp;
-                    }
-                }
-
-                instruction += Luau::getOpLength(LuauOpcode(LUAU_INSN_OP(*instruction)));
+            case LOP_NAMECALL:
+                targetOp = LOP_NAMECALLUDATA;
+                break;
             }
+
+            if (targetOp != -1)
+            {
+                LUAU_ASSERT(instruction[1] < uint32_t(sizek));
+
+                // We take over the upper 16 bits of AUX - so no constants with big indices.
+                if (instruction[1] < 0x10000)
+                {
+                    TValue* k = &p->k[instruction[1]];
+                    TString* s = tsvalue(k);
+
+                    luaS_updateatom(L, s);
+
+                    if (s->atom >= 0)
+                        *instruction = (*instruction & 0xffffff00) | targetOp;
+                }
+            }
+
+            instruction += Luau::getOpLength(LuauOpcode(LUAU_INSN_OP(*instruction)));
         }
 
         const int sizep = readVarInt(data, size, offset);

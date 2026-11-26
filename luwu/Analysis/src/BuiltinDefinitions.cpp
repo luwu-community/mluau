@@ -11,6 +11,7 @@
 #include "Luau/DenseHash.h"
 #include "Luau/Error.h"
 #include "Luau/Frontend.h"
+#include "Luau/IntegerModes.h"
 #include "Luau/Module.h"
 #include "Luau/NotNull.h"
 #include "Luau/Simplify.h"
@@ -37,7 +38,7 @@
 LUAU_FASTFLAG(LuwuClasses)
 LUAU_FASTFLAG(LuwuStringExtensions)
 LUAU_FASTFLAG(LuauAllowGlobalDeclarationToBeCalledClass)
-LUAU_FASTFLAG(LuwuBufferBatched)
+LUAU_FASTFLAG(DebugLuwuBufferBatched)
 
 namespace Luau
 {
@@ -447,6 +448,86 @@ void makeNoneMetatable(NotNull<BuiltinTypes> builtinTypes)
     persist(*none->metatable);
 }
 
+// Luwu Integers (rfcs/integers.md): an integer's methods are the `integer` library's functions with the integer first,
+// which the VM gives integers through their type's metatable (lintegerlib.cpp). Each is generic over the receiver's mode:
+// `x:sadd(y)` takes and gives integers of `x`'s mode. `tonumber`'s result and `cast`'s `integer.Mode` are classes the
+// definitions declare, which this shared arena can't name, so they're `unknown` here. MagicIntegerCast gives `cast` the
+// mode it's passed.
+void makeIntegerMetatable(NotNull<BuiltinTypes> builtinTypes)
+{
+    PrimitiveType* integer = getMutable<PrimitiveType>(builtinTypes->integerType);
+    LUAU_ASSERT(integer);
+
+    // Every GlobalTypes (the checker's and autocomplete's) calls this on the same shared `integer`
+    if (integer->metatable)
+        return;
+
+    NotNull<TypeArena> arena{builtinTypes->arena.get()};
+    TypeId integerTy = builtinTypes->integerType;
+    TypeId optionalInteger = makeOption(builtinTypes, *arena, integerTy);
+
+    // The integers in the methods' signatures, which get the methods too once the metatable exists: a call's result is one
+    std::vector<TypeId> signatureIntegers;
+    auto integerOf = [&](TypeId mode)
+    {
+        PrimitiveType modeInteger{PrimitiveType::Integer};
+        modeInteger.mode = mode;
+        TypeId result = arena->addType(std::move(modeInteger));
+        signatureIntegers.push_back(result);
+        return result;
+    };
+
+    // `<T>(self: integer<T>, params...) -> result`, where `sameMode` stands for `integer<T>` in the parameters and result
+    const TypeId sameMode = nullptr;
+    auto method = [&](std::vector<TypeId> params, TypeId result, bool variadic = false)
+    {
+        TypeId mode = arena->addType(GenericType{"T", Polarity::Mixed});
+        TypeId self = integerOf(mode);
+        auto inMode = [&](TypeId ty)
+        {
+            return ty == sameMode ? self : ty;
+        };
+
+        std::vector<TypeId> args{self};
+        for (TypeId param : params)
+            args.push_back(inMode(param));
+        std::optional<TypePackId> rest = variadic ? std::optional{arena->addTypePack(VariadicTypePack{self})} : std::nullopt;
+
+        FunctionType fn{{mode}, {}, arena->addTypePack(TypePack{std::move(args), rest}), arena->addTypePack({inMode(result)})};
+        fn.hasSelf = true;
+        return arena->addType(std::move(fn));
+    };
+
+    TableType methods{{}, std::nullopt, TypeLevel{}, TableState::Sealed};
+    for (const char* name : {"abs", "signum", "sqrt", "log2", "log10", "bnot", "countlz", "countrz", "popcount", "bswap"})
+        methods.props[name] = {method({}, sameMode)};
+    for (const char* name : {"sadd", "ssub", "smul", "cadd", "csub", "cmul", "cdiv"})
+        methods.props[name] = {method({sameMode}, sameMode)};
+    for (const char* name : {"pow", "spow", "cpow", "lshift", "rshift", "lrotate", "rrotate"})
+        methods.props[name] = {method({integerTy}, sameMode)};
+    for (const char* name : {"band", "bor", "bxor"})
+        methods.props[name] = {method({}, sameMode, /* variadic */ true)};
+    methods.props["btest"] = {method({}, builtinTypes->booleanType, /* variadic */ true)};
+    methods.props["clamp"] = {method({sameMode, sameMode}, sameMode)};
+    methods.props["extract"] = {method({integerTy, optionalInteger}, sameMode)};
+    methods.props["replace"] = {method({sameMode, integerTy, optionalInteger}, sameMode)};
+    methods.props["tonumber"] = {method({}, builtinTypes->unknownType)};
+
+    TypeId cast = makeFunction(*arena, integerTy, {builtinTypes->unknownType}, {integerTy});
+    attachMagicFunction(cast, std::make_shared<MagicIntegerCast>());
+    methods.props["cast"] = {cast};
+
+    TableType metatable{{}, std::nullopt, TypeLevel{}, TableState::Sealed};
+    metatable.props["__index"] = {arena->addType(std::move(methods))};
+    integer->metatable = arena->addType(std::move(metatable));
+    persist(*integer->metatable);
+
+    // Every mode's type has the same methods
+    for (TypeId modeType : builtinTypes->integerModeTypes)
+        getMutable<PrimitiveType>(modeType)->metatable = integer->metatable;
+    for (TypeId signatureInteger : signatureIntegers)
+        getMutable<PrimitiveType>(signatureInteger)->metatable = integer->metatable;
+}
 
 void makeVectorMetatable(NotNull<BuiltinTypes> builtinTypes)
 {
@@ -733,6 +814,13 @@ static const std::pair<const char*, const char*> kCollectionsTypeofNames[] = {
     {"vecdeque", "VecDeque"},
 };
 
+// Luwu builtin classes: what `typeof` gives an object of each global result class (luaopen_result)
+static const std::pair<const char*, const char*> kResultTypeofNames[] = {
+    {"some", "Some"},
+    {"ok", "Ok"},
+    {"err", "Err"},
+};
+
 bool isBuiltinClassTypeofName(const std::string& name)
 {
     if (name == "bundle")
@@ -742,10 +830,15 @@ bool isBuiltinClassTypeofName(const std::string& name)
         if (name == typeofName)
             return collectionsLibraryEnabled();
     }
+    for (const auto& [typeofName, className] : kResultTypeofNames)
+    {
+        if (name == typeofName)
+            return resultLibraryEnabled();
+    }
     return false;
 }
 
-// Luwu builtin classes: the class type of the `collections` class whose objects `typeof` names `name`
+// Luwu builtin classes: the class type of the `collections` or result class whose objects `typeof` names `name`
 static std::optional<TypeId> collectionsTypeofType(const Scope* globalScope, const std::string& name)
 {
     for (const auto& [typeofName, className] : kCollectionsTypeofNames)
@@ -753,6 +846,13 @@ static std::optional<TypeId> collectionsTypeofType(const Scope* globalScope, con
         if (name != typeofName)
             continue;
         if (std::optional<TypeFun> declared = globalScope->lookupImportedType("collections", className))
+            return follow(declared->type);
+    }
+    for (const auto& [typeofName, className] : kResultTypeofNames)
+    {
+        if (name != typeofName)
+            continue;
+        if (std::optional<TypeFun> declared = globalScope->lookupType(className))
             return follow(declared->type);
     }
     return std::nullopt;
@@ -1218,7 +1318,7 @@ void registerBuiltinGlobals(Frontend& frontend, GlobalTypes& globals, bool typeC
 
     // Luwu Batched Buffer Read/Write (rfcs/buffer-batched.md): every `unpack*` shares one magic, since the batch
     // size is read off the call site rather than off the element type being unpacked
-    if (FFlag::LuwuBufferBatched)
+    if (FFlag::DebugLuwuBufferBatched)
     {
         if (TableType* btv = getMutable<TableType>(getGlobalBinding(globals, "buffer")))
         {
@@ -1321,6 +1421,13 @@ void registerBuiltinGlobals(Frontend& frontend, GlobalTypes& globals, bool typeC
     }
     if (collectionsLibraryEnabled())
         registerBuiltinModule(frontend, globals, "collections", getCollectionsDefinitionSource(), typeCheckForAutocomplete);
+    // Luwu structured runtime errors: `Error.NotIndexable` and the other variants are types too
+    if (resultLibraryEnabled())
+        registerBuiltinModule(frontend, globals, "Error", getErrorDefinitionSource(), typeCheckForAutocomplete);
+
+    // Luwu Integers (rfcs/integers.md): `integer.Mode` is a type too
+    if (integerLibraryEnabled())
+        registerBuiltinModule(frontend, globals, "integer", getIntegerDefinitionSource(), typeCheckForAutocomplete);
 
     // Global scope cannot be the parent of the type checking environment because it can be changed by the embedder
     globals.globalTypeFunctionScope->exportedTypeBindings = globals.globalScope->exportedTypeBindings;
@@ -3181,6 +3288,35 @@ static std::optional<TypeId> classOfObjectType(NotNull<BuiltinTypes> builtinType
         return std::nullopt;
 
     return klass->ty;
+}
+
+std::optional<WithPredicate<TypePackId>> MagicIntegerCast::handleOldSolver(
+    struct TypeChecker&,
+    const std::shared_ptr<struct Scope>&,
+    const class AstExprCall&,
+    WithPredicate<TypePackId>
+)
+{
+    return std::nullopt;
+}
+
+bool MagicIntegerCast::infer(const MagicFunctionCallContext& context)
+{
+    const auto& [argTypes, argTail] = flatten(context.arguments);
+    const size_t modeArgument = 1;
+    if (argTypes.size() <= modeArgument)
+        return false;
+
+    const ExternType* mode = get<ExternType>(follow(argTypes[modeArgument]));
+    if (!mode || !isIntegerModeClass(mode))
+        return false;
+
+    std::optional<TypeId> result = integerTypeWithMode(context.solver->builtinTypes, *context.solver->arena, argTypes[modeArgument]);
+    if (!result)
+        return false;
+
+    asMutable(context.result)->ty.emplace<BoundTypePack>(context.solver->arena->addTypePack({*result}));
+    return true;
 }
 
 std::optional<WithPredicate<TypePackId>> MagicClassOf::handleOldSolver(

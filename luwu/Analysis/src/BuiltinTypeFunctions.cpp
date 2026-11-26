@@ -5,6 +5,7 @@
 #include "Luau/Common.h"
 #include "Luau/ConstraintSolver.h"
 #include "Luau/Instantiation.h"
+#include "Luau/IntegerModes.h"
 #include "Luau/OverloadResolver.h"
 #include "Luau/Scope.h"
 #include "Luau/Simplify.h"
@@ -20,11 +21,10 @@
 LUAU_DYNAMIC_FASTINT(LuauTypeFamilyApplicationCartesianProductLimit)
 LUAU_DYNAMIC_FASTINTVARIABLE(LuauStepRefineRecursionLimit, 64)
 
-LUAU_FASTFLAGVARIABLE(LuauConcatDoesntAlwaysReturnString)
 LUAU_FASTFLAG(LuwuClasses)
+LUAU_FASTFLAG(DebugLuwuIntegers)
 LUAU_FASTFLAG(LuauRemovePrimitiveTypeConstraintAndSubtypingUnifier)
 LUAU_FASTFLAG(DebugLuwuTryExpressions)
-LUAU_FASTFLAG(LuauRemoveExtraSubtypingInstances)
 
 namespace Luau
 {
@@ -163,14 +163,13 @@ static std::optional<TypePackId> solveFunctionCall(NotNull<TypeFunctionContext> 
 
     if (!unifier.genericSubstitutions.empty() || !unifier.genericPackSubstitutions.empty())
     {
-        Subtyping subtyping_DEPRECATED{ctx->builtins, ctx->arena, ctx->normalizer, ctx->typeFunctionRuntime, ctx->ice};
         auto newRetTp = getApproximateReturnTypeForFunctionCall(*selected.overload).value_or(ctx->builtins->errorTypePack);
 
         std::optional<TypePackId> subst = instantiate2(
             ctx->arena,
             std::move(unifier.genericSubstitutions),
             std::move(unifier.genericPackSubstitutions),
-            FFlag::LuauRemoveExtraSubtypingInstances ? ctx->subtyping : NotNull{&subtyping_DEPRECATED},
+            ctx->subtyping,
             ctx->scope,
             newRetTp
         );
@@ -353,6 +352,10 @@ TypeFunctionReductionResult<TypeId> unmTypeFunction(
     if (normTy->isExactlyNumber())
         return {ctx->builtins->numberType, Reduction::MaybeOk, {}, {}};
 
+    // Luwu Integers (rfcs/integers.md): negating an integer gives one of its mode. Upstream's integers have no operators.
+    if (FFlag::DebugLuwuIntegers && isInteger(collapseIntegerUnion(ctx->builtins, *ctx->arena, operandTy)))
+        return {operandTy, Reduction::MaybeOk, {}, {}};
+
     if (auto result = tryDistributeTypeFunctionApp(unmTypeFunction, instance, typeParams, packParams, ctx))
         return *result;
 
@@ -533,6 +536,14 @@ TypeFunctionReductionResult<TypeId> numericBinopTypeFunction(
     // if we're adding two `number` types, the result is `number`.
     if (normLhsTy->isExactlyNumber() && normRhsTy->isExactlyNumber())
         return {ctx->builtins->numberType, Reduction::MaybeOk, {}, {}};
+
+    // Luwu Integers (rfcs/integers.md): arithmetic on integers of one mode gives that mode. Upstream's integers have no
+    // operators. Two modes, an integer and a number, and `^` raise at runtime: TypeChecker2 reports those, so they give the
+    // integer operand's type here.
+    TypeId lhsInteger = collapseIntegerUnion(ctx->builtins, *ctx->arena, lhsTy);
+    TypeId rhsInteger = collapseIntegerUnion(ctx->builtins, *ctx->arena, rhsTy);
+    if (FFlag::DebugLuwuIntegers && isIntegerArithmetic(lhsInteger, rhsInteger))
+        return {integerArithmeticResult(ctx->builtins, *ctx->arena, lhsInteger, rhsInteger), Reduction::MaybeOk, {}, {}};
 
     if (auto result = tryDistributeTypeFunctionApp(numericBinopTypeFunction, instance, typeParams, packParams, ctx, metamethod))
         return *result;
@@ -760,29 +771,17 @@ TypeFunctionReductionResult<TypeId> concatTypeFunction(
     else
         inferredArgs = {rhsTy, lhsTy};
 
-    if (FFlag::LuauConcatDoesntAlwaysReturnString)
-    {
-        std::optional<TypePackId> retPack = solveFunctionCall(
-            ctx, ctx->constraint ? ctx->constraint->location : Location{}, *mmType, ctx->arena->addTypePack(std::move(inferredArgs))
-        );
-        if (!retPack)
-            return {std::nullopt, Reduction::Erroneous, {}, {}};
+    std::optional<TypePackId> retPack = solveFunctionCall(
+        ctx, ctx->constraint ? ctx->constraint->location : Location{}, *mmType, ctx->arena->addTypePack(std::move(inferredArgs))
+    );
+    if (!retPack)
+        return {std::nullopt, Reduction::Erroneous, {}, {}};
 
-        TypePack extracted = extendTypePack(*ctx->arena, ctx->builtins, *retPack, 1);
-        if (extracted.head.empty())
-            return {std::nullopt, Reduction::Erroneous, {}, {}};
+    TypePack extracted = extendTypePack(*ctx->arena, ctx->builtins, *retPack, 1);
+    if (extracted.head.empty())
+        return {std::nullopt, Reduction::Erroneous, {}, {}};
 
-        return {extracted.head.front(), Reduction::MaybeOk, {}, {}};
-    }
-    else
-    {
-        if (!solveFunctionCall(
-                ctx, ctx->constraint ? ctx->constraint->location : Location{}, *mmType, ctx->arena->addTypePack(std::move(inferredArgs))
-            ))
-            return {std::nullopt, Reduction::Erroneous, {}, {}};
-
-        return {ctx->builtins->stringType, Reduction::MaybeOk, {}, {}};
-    }
+    return {extracted.head.front(), Reduction::MaybeOk, {}, {}};
 }
 
 namespace
@@ -950,6 +949,15 @@ static TypeFunctionReductionResult<TypeId> comparisonTypeFunction(
 
     // If both types are exactly `number`, we can reduce now.
     if (normLhsTy->isExactlyNumber() && normRhsTy->isExactlyNumber())
+        return {ctx->builtins->booleanType, Reduction::MaybeOk, {}, {}};
+
+    // Luwu Integers (rfcs/integers.md): integers of one mode are ordered. Upstream's integers have no operators. TypeChecker2
+    // reports comparing two modes, or an integer and a number.
+    bool integerComparison = isIntegerArithmetic(
+        collapseIntegerUnion(ctx->builtins, *ctx->arena, lhsTy),
+        collapseIntegerUnion(ctx->builtins, *ctx->arena, rhsTy)
+    );
+    if (FFlag::DebugLuwuIntegers && integerComparison)
         return {ctx->builtins->booleanType, Reduction::MaybeOk, {}, {}};
 
     if (auto result = tryDistributeTypeFunctionApp(comparisonTypeFunction, instance, typeParams, packParams, ctx, metamethod))
@@ -2691,6 +2699,31 @@ static TypeFunctionReductionResult<TypeId> objectTypeHelper(TypeId targetTy, Not
     return {std::nullopt, Reduction::Erroneous, {}, {}};
 }
 
+// Luwu Integers (rfcs/integers.md): `integer<T>` for a mode that wasn't known when the annotation was read, like
+// `integer<integer.Mode<"u8">>`
+static TypeFunctionReductionResult<TypeId> integerTypeFunction(
+    TypeId instance,
+    const std::vector<TypeId>& typeParams,
+    const std::vector<TypePackId>& packParams,
+    NotNull<TypeFunctionContext> ctx
+)
+{
+    if (typeParams.size() != 1 || !packParams.empty())
+    {
+        ctx->ice->ice("integer type function: encountered a type function instance without the required argument structure");
+        LUAU_ASSERT(false);
+    }
+
+    TypeId modeTy = follow(typeParams[0]);
+    if (isPending(modeTy, ctx->solver))
+        return {std::nullopt, Reduction::MaybeOk, {modeTy}, {}};
+
+    if (std::optional<TypeId> integerTy = integerTypeWithMode(ctx->builtins, *ctx->arena, modeTy))
+        return {*integerTy, Reduction::MaybeOk, {}, {}};
+
+    return {std::nullopt, Reduction::Erroneous, {}, {}};
+}
+
 TypeFunctionReductionResult<TypeId> objectTypeFunction(
     TypeId instance,
     const std::vector<TypeId>& typeParams,
@@ -2942,6 +2975,59 @@ static std::optional<bool> uninhabited(TypeId ty, NotNull<TypeFunctionContext> c
     return ctx->normalizer->isInhabited(norm.get()) == NormalizationResult::False;
 }
 
+const ExternType* traitOfValue(TypeId traitValue)
+{
+    const ExternType* value = get<ExternType>(follow(traitValue));
+    const Obj* object = value && value->relation ? get_if<Obj>(&*value->relation) : nullptr;
+    const ExternType* trait = object ? get<ExternType>(follow(object->ty)) : nullptr;
+    return trait && trait->traitInfo ? trait : nullptr;
+}
+
+std::optional<TypeId> scopedMemberOf(TypeId traitValue, const std::string& name)
+{
+    const ExternType* trait = traitOfValue(traitValue);
+    if (!trait)
+        return std::nullopt;
+
+    auto scoped = trait->traitInfo->scopedMembers.find(name);
+    if (scoped == trait->traitInfo->scopedMembers.end())
+        return std::nullopt;
+
+    return scoped->second;
+}
+
+// Luwu Traits (rfcs/classes/traits.md): `qualified<V, "name">`, the trait's scoped member `name`, or `V.name` for one of
+// its other members
+static TypeFunctionReductionResult<TypeId> qualifiedTypeFunction(
+    TypeId instance,
+    const std::vector<TypeId>& typeParams,
+    const std::vector<TypePackId>& packParams,
+    NotNull<TypeFunctionContext> ctx
+)
+{
+    const SingletonType* nameSingleton = typeParams.size() == 2 ? get<SingletonType>(follow(typeParams[1])) : nullptr;
+    const StringSingleton* name = nameSingleton ? get<StringSingleton>(nameSingleton) : nullptr;
+    if (!name || !packParams.empty())
+    {
+        ctx->ice->ice("qualified type function: encountered a type function instance without the required argument structure");
+        LUAU_ASSERT(false);
+    }
+
+    TypeId traitValue = follow(typeParams[0]);
+    if (isPending(traitValue, ctx->solver))
+        return {std::nullopt, Reduction::MaybeOk, {traitValue}, {}};
+
+    if (std::optional<TypeId> scoped = scopedMemberOf(traitValue, name->value))
+        return {*scoped, Reduction::MaybeOk, {}, {}};
+
+    const ExternType* value = get<ExternType>(traitValue);
+    const Property* prop = value && traitOfValue(traitValue) ? lookupExternTypeProp(value, name->value) : nullptr;
+    if (prop && prop->readTy)
+        return {*prop->readTy, Reduction::MaybeOk, {}, {}};
+
+    return {ctx->builtins->unknownType, Reduction::MaybeOk, {}, {}};
+}
+
 TypeFunctionReductionResult<TypeId> unlessneverTypeFunction(
     TypeId instance,
     const std::vector<TypeId>& typeParams,
@@ -2985,9 +3071,10 @@ TypeFunctionReductionResult<TypeId> unlessneverTypeFunction(
 }
 
 // Luwu try expressions: the error hints of each function `fnTy` can be (an overload set's, a union's), or nullopt while
-// `fnTy` is still pending
-static std::optional<std::vector<TypeId>> errorHintsOf(TypeId fnTy, NotNull<TypeFunctionContext> ctx)
+// `fnTy` is still pending. `closed` says whether every one of them has a closed hint (FunctionType::errorHintClosed).
+static std::optional<std::vector<TypeId>> errorHintsOf(TypeId fnTy, NotNull<TypeFunctionContext> ctx, bool& closed)
 {
+    closed = true;
     std::vector<TypeId> parts;
     if (const IntersectionType* overloads = get<IntersectionType>(fnTy))
         parts.assign(overloads->parts.begin(), overloads->parts.end());
@@ -3004,8 +3091,26 @@ static std::optional<std::vector<TypeId>> errorHintsOf(TypeId fnTy, NotNull<Type
             return std::nullopt;
 
         const FunctionType* function = get<FunctionType>(part);
-        if (function && function->errorHint)
-            hints.push_back(*function->errorHint);
+        bool partClosed = function && function->errorHint && function->errorHintClosed;
+        closed = closed && partClosed;
+        if (!function || !function->errorHint)
+            continue;
+
+        // the `never` that closes a hint isn't an error it raises
+        TypeId hint = follow(*function->errorHint);
+        const UnionType* members = get<UnionType>(hint);
+        if (partClosed && members)
+        {
+            for (TypeId member : members->options)
+            {
+                if (!get<NeverType>(follow(member)))
+                    hints.push_back(member);
+            }
+        }
+        else if (!partClosed || !get<NeverType>(hint))
+        {
+            hints.push_back(hint);
+        }
     }
     return hints;
 }
@@ -3027,13 +3132,18 @@ TypeFunctionReductionResult<TypeId> raisesTypeFunction(
     if (isPending(fnTy, ctx->solver))
         return {std::nullopt, Reduction::MaybeOk, {fnTy}, {}};
 
-    std::optional<std::vector<TypeId>> hints = errorHintsOf(fnTy, ctx);
+    bool closed = false;
+    std::optional<std::vector<TypeId>> hints = errorHintsOf(fnTy, ctx, closed);
     if (!hints)
         return {std::nullopt, Reduction::MaybeOk, {fnTy}, {}};
 
-    // A union built directly: simplifying it would let an `unknown` in a hint absorb the other members
+    // A union built directly: simplifying it would let an `unknown` in a hint absorb the other members. A closed hint
+    // raises nothing it doesn't name, so it gets no weakunknown.
     std::vector<TypeId> options = std::move(*hints);
-    options.push_back(ctx->builtins->weakUnknownType);
+    if (!closed)
+        options.push_back(ctx->builtins->weakUnknownType);
+    if (options.empty())
+        return {ctx->builtins->neverType, Reduction::MaybeOk, {}, {}};
     if (options.size() == 1)
         return {options[0], Reduction::MaybeOk, {}, {}};
     return {ctx->arena->addType(UnionType{std::move(options)}), Reduction::MaybeOk, {}, {}};
@@ -3068,10 +3178,12 @@ BuiltinTypeFunctions::BuiltinTypeFunctions()
     , setmetatableFunc{"setmetatable", setmetatableTypeFunction}
     , getmetatableFunc{"getmetatable", getmetatableTypeFunction}
     , objectFunc{"object", objectTypeFunction}
+    , integerFunc{"integer", integerTypeFunction}
     , classFunc{"class", classTypeFunction}
     , weakoptionalFunc{"weakoptional", weakoptionalTypeFunc}
     , unlessneverFunc{"unlessnever", unlessneverTypeFunction}
     , raisesFunc{"raises", raisesTypeFunction}
+    , qualifiedFunc{"qualified", qualifiedTypeFunction}
     , oneofFunc{"oneof", oneofTypeFunction}
 {
 }

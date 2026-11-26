@@ -55,8 +55,8 @@ public:
         std::vector<int32_t> methodNames;
         // Parallel to propertyNames/methodNames; LBC_CLASSMEMBER_* bits (see Luau/Bytecode.h) for
         // each member, in the same order (properties first, then methods).
-        std::vector<uint8_t> propertyFlags;
-        std::vector<uint8_t> methodFlags;
+        std::vector<uint16_t> propertyFlags;
+        std::vector<uint16_t> methodFlags;
         // Parallel to propertyNames: for a member flagged LBC_CLASSMEMBER_CONSTDEFAULT, the proto
         // constant index of its default value; -1 for every other member.
         std::vector<int32_t> propertyDefaults;
@@ -80,7 +80,8 @@ public:
     int32_t addConstantNil();
     int32_t addConstantBoolean(bool value);
     int32_t addConstantNumber(double value);
-    int32_t addConstantInteger(int64_t value);
+    int32_t addConstantInteger(int64_t value, uint8_t mode = 0);
+    int32_t addConstantIntegerHeap(StringRef value, uint8_t mode = 0);
     int32_t addConstantVectorf(float x, float y, float z, float w);
     int32_t addConstantVectord(double x, double y, double z, double w);
     int32_t addConstantString(StringRef value);
@@ -113,7 +114,7 @@ public:
     void stubFunction(uint32_t fid);
 
     void foldJumps();
-    std::vector<uint32_t> expandJumps();
+    std::vector<uint32_t> expandJumps(bool& hasLongJumpError);
 
     void setFunctionTypeInfo(std::string value);
     void pushLocalTypeInfo(LuauBytecodeType type, uint8_t reg, uint32_t startpc, uint32_t endpc);
@@ -225,9 +226,11 @@ protected:
             Type_Table,
             Type_Closure,
             Type_ClassShape,
+            Type_IntegerHeap,
         };
 
         Type type;
+        uint8_t mode = 0;
         union
         {
             bool valueBoolean;

@@ -16,6 +16,7 @@ static void visitVmRegDefsUses(T& visitor, IrFunction& function, IrInst& inst)
     switch (inst.cmd)
     {
     case IrCmd::LOAD_TAG:
+    case IrCmd::LOAD_EXTRA:
     case IrCmd::LOAD_POINTER:
     case IrCmd::LOAD_DOUBLE:
     case IrCmd::LOAD_INT:
@@ -227,22 +228,9 @@ static void visitVmRegDefsUses(T& visitor, IrFunction& function, IrInst& inst)
             visitor.useRange(vmRegOp(OP_C(inst)), form <= LBC_PRESIZE_ITER_HASH ? 2 : 3);
         break;
     }
-    case IrCmd::FALLBACK_WRAPRESULT:
-        // the ERR form also reads where the error was raised
-        visitor.useRange(vmRegOp(OP_B(inst)), function.intOp(OP_C(inst)) == LBC_WRAPRESULT_ERR ? 4 : 1);
-        visitor.def(OP_B(inst));
-        break;
     case IrCmd::FALLBACK_GETQUALIFIED:
         visitor.use(OP_C(inst));
         visitor.use(OP_D(inst));
-        visitor.def(OP_B(inst));
-        break;
-    case IrCmd::FALLBACK_PUSH:
-        visitor.use(OP_B(inst));
-        visitor.useRange(vmRegOp(OP_C(inst)), function.intOp(OP_D(inst)));
-        break;
-    case IrCmd::FALLBACK_POP:
-        visitor.use(OP_C(inst));
         visitor.def(OP_B(inst));
         break;
     case IrCmd::FALLBACK_TABLEBUNDLE:
@@ -253,6 +241,24 @@ static void visitVmRegDefsUses(T& visitor, IrFunction& function, IrInst& inst)
             visitor.use(OP_B(inst));
         else
             visitor.def(OP_B(inst));
+        break;
+    case IrCmd::FALLBACK_SETQUALIFIED:
+        visitor.use(OP_B(inst));
+        visitor.use(OP_C(inst));
+        visitor.use(OP_D(inst));
+        break;
+    case IrCmd::FALLBACK_PUSH:
+        visitor.use(OP_B(inst));
+        visitor.useRange(vmRegOp(OP_C(inst)), function.intOp(OP_D(inst)));
+        break;
+    case IrCmd::FALLBACK_POP:
+        visitor.use(OP_C(inst));
+        visitor.def(OP_B(inst));
+        break;
+    case IrCmd::FALLBACK_WRAPRESULT:
+        // the ERR form also reads where the error was raised
+        visitor.useRange(vmRegOp(OP_B(inst)), function.intOp(OP_C(inst)) == LBC_WRAPRESULT_ERR ? 4 : 1);
+        visitor.def(OP_B(inst));
         break;
     case IrCmd::FALLBACK_NEWCLASSMEMBER:
         visitor.use(OP_B(inst));
@@ -322,6 +328,30 @@ static void visitVmRegDefsUses(T& visitor, IrFunction& function, IrInst& inst)
         break;
     case IrCmd::MARK_TRY_READS:
         // Luwu try expressions: only dead store elimination reads it (see IrData.h)
+        break;
+
+        // Luwu: from upstream's LuauCodegenX64ConflictCheck (0.746). These read a VmReg only after optimizeMemoryOperandsX64 folds a
+        // load into them.
+    case IrCmd::CHECK_TAG:
+    case IrCmd::FLOOR_NUM:
+    case IrCmd::CEIL_NUM:
+    case IrCmd::ROUND_NUM:
+    case IrCmd::SQRT_NUM:
+    case IrCmd::ABS_NUM:
+        visitor.maybeUse(OP_A(inst));
+        break;
+    case IrCmd::CHECK_TRUTHY:
+    case IrCmd::ADD_NUM:
+    case IrCmd::SUB_NUM:
+    case IrCmd::MUL_NUM:
+    case IrCmd::DIV_NUM:
+    case IrCmd::IDIV_NUM:
+    case IrCmd::MOD_NUM:
+    case IrCmd::MIN_NUM:
+    case IrCmd::MAX_NUM:
+    case IrCmd::JUMP_CMP_NUM:
+        visitor.maybeUse(OP_A(inst));
+        visitor.maybeUse(OP_B(inst));
         break;
 
     default:

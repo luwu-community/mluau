@@ -1,6 +1,7 @@
 // This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 // This code is based on Lua 5.x implementation licensed under MIT License; see lua_LICENSE.txt for details
 #include "lualib.h"
+#include "linteger.h"
 
 #include "lobject.h"
 #include "lstate.h"
@@ -9,10 +10,9 @@
 #include "lapi.h"
 #include "lgc.h"
 #include "lnumutils.h"
+#include "ldebug.h"
 
 #include <string.h>
-
-LUAU_FASTFLAGVARIABLE(LuauCustomYieldablePcalls)
 
 // convert a stack index to positive
 #define abs_index(L, i) ((i) > 0 || (i) <= LUA_REGISTRYINDEX ? (i) : lua_gettop(L) + (i) + 1)
@@ -38,31 +38,12 @@ l_noret luaL_argerrorL(lua_State* L, int narg, const char* extramsg)
 {
     const char* fname = currfuncname(L);
 
-    if (fname)
-        luaL_error(L, "invalid argument #%d to '%s' (%s)", narg, fname, extramsg);
-    else
-        luaL_error(L, "invalid argument #%d (%s)", narg, extramsg);
+    luaG_argumenterror(L, narg, fname, extramsg);
 }
 
 l_noret luaL_typeerrorL(lua_State* L, int narg, const char* tname)
 {
-    const char* fname = currfuncname(L);
-    const TValue* obj = luaA_toobject(L, narg);
-
-    if (obj)
-    {
-        if (fname)
-            luaL_error(L, "invalid argument #%d to '%s' (%s expected, got %s)", narg, fname, tname, luaT_objtypename(L, obj));
-        else
-            luaL_error(L, "invalid argument #%d (%s expected, got %s)", narg, tname, luaT_objtypename(L, obj));
-    }
-    else
-    {
-        if (fname)
-            luaL_error(L, "missing argument #%d to '%s' (%s expected)", narg, fname, tname);
-        else
-            luaL_error(L, "missing argument #%d (%s expected)", narg, tname);
-    }
+    luaG_unexpectedtypeerror(L, narg, currfuncname(L), tname);
 }
 
 static l_noret tag_error(lua_State* L, int narg, int tag)
@@ -89,11 +70,9 @@ l_noret luaL_errorL(lua_State* L, const char* fmt, ...)
 {
     va_list argp;
     va_start(argp, fmt);
-    luaL_where(L, 1);
-    lua_pushvfstring(L, fmt, argp);
-    va_end(argp);
-    lua_concat(L, 2);
-    lua_error(L);
+    // Luwu structured runtime errors: recorded as an `Error.Runtime`, which `pcall` gets as luaL_where's position and
+    // the message
+    luaG_runerrorcallerv(L, LUWU_RUNTIME_LIBRARY, fmt, argp);
 }
 
 // }======================================================
@@ -246,6 +225,9 @@ int luaL_checkinteger(lua_State* L, int narg)
 
 int64_t luaL_checkinteger64(lua_State* L, int narg)
 {
+    // Luwu Integers (rfcs/integers.md): a bigint has no 64-bit value
+    if (lua_type(L, narg) == LUA_THEAPINTEGER)
+        luaL_argerrorL(L, narg, "integer doesn't fit in 64 bits");
     if (!lua_isinteger64(L, narg))
         tag_error(L, narg, LUA_TINTEGER);
     return lua_tointeger64(L, narg, nullptr);
@@ -294,9 +276,12 @@ int luaL_getmetafield(lua_State* L, int obj, const char* event)
     // metamethods still apply (`__tostring` through luaL_tolstring, for one), so read the field
     // straight out of it. The metamethods are static members of the class anyway, so this reveals
     // nothing new.
-    if (lua_isobject(L, obj))
+    // Luwu Traits (rfcs/classes/traits.md): a class or trait value's own metamethods (`function __tostring(Self)`) are in its
+    // metatable, which lua_getmetatable doesn't expose either
+    if (lua_isobject(L, obj) || lua_isclass(L, obj))
     {
-        LuaTable* mt = objectvalue(luaA_toobject(L, obj))->lclass->instancemetatable;
+        const TValue* value = luaA_toobject(L, obj);
+        LuaTable* mt = ttisobject(value) ? objectvalue(value)->lclass->instancemetatable : classvalue(value)->metatable;
         const TValue* field = mt ? luaH_getstr(mt, luaS_new(L, event)) : luaO_nilobject;
         if (ttisnil(field))
             return 0;
@@ -418,7 +403,6 @@ int luaL_callyieldable(lua_State* L, int nargs, int nresults)
 
 int luaL_pcallyieldable(lua_State* L, int nargs, int nresults, int errfunc)
 {
-    LUAU_ASSERT(FFlag::LuauCustomYieldablePcalls);
     api_check(L, iscfunction(L->ci->func));
     Closure* cl = clvalue(L->ci->func);
     api_check(L, cl->c.cont);
@@ -647,9 +631,10 @@ void luaL_addvalueany(luaL_Strbuf* B, int idx)
     }
     case LUA_TINTEGER:
     {
-        int64_t n = lua_tointeger64(L, idx, nullptr);
+        // Luwu Integers (rfcs/integers.md): upstream writes every integer as a signed int64, which prints a u64 past
+        // INT64_MAX as negative. A bigint goes through luaL_tolstring below.
         char s[LUAI_MAXINT2STR];
-        char* e = luai_int2str(s, n);
+        char* e = luaZ_formatinline(luaA_toobject(L, idx), s);
         luaL_addlstring(B, s, e - s);
         break;
     }
@@ -747,14 +732,11 @@ const char* luaL_tolstring(lua_State* L, int idx, size_t* len)
     case LUA_TSTRING:
         lua_pushvalue(L, idx);
         break;
+    // Luwu Integers (rfcs/integers.md): an integer in decimal, without its suffix
     case LUA_TINTEGER:
-    {
-        int64_t l = lua_tointeger64(L, idx, nullptr);
-        char s[LUAI_MAXINT2STR];
-        char* e = luai_int2str(s, l);
-        lua_pushlstring(L, s, e - s);
+    case LUA_THEAPINTEGER:
+        luaZ_pushstring(L, luaA_toobject(L, idx));
         break;
-    }
     default:
     {
         const void* ptr = lua_topointer(L, idx);

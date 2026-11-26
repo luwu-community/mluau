@@ -38,11 +38,6 @@ LUAU_FASTFLAGVARIABLE(DebugLuwuLuauClassCompat)
 LUAU_FASTFLAGVARIABLE(DebugLuauUserDefinedClasses)
 LUAU_FASTFLAGVARIABLE(DebugLuauUserDefinedClassesRuntime)
 
-// Luwu String Extensions (rfcs/string-extensions.md): trim, trimstart, trimend, startswith, endswith, contains, replace
-// and split's maxpieces argument. Off, the string library is exactly upstream's. The compiler reads it to emit the
-// startswith, endswith and contains fastcalls.
-LUAU_FASTFLAGVARIABLE(LuwuStringExtensions)
-
 namespace Luau
 {
 
@@ -52,6 +47,11 @@ bool luauClassCompat()
 }
 
 } // namespace Luau
+
+// Luwu String Extensions (rfcs/string-extensions.md): trim, trimstart, trimend, startswith, endswith, contains, replace
+// and split's maxpieces argument. Off, the string library is exactly upstream's. The compiler reads it to emit the
+// startswith, endswith and contains fastcalls.
+LUAU_FASTFLAGVARIABLE(LuwuStringExtensions)
 
 // Luwu builtin classes: standard library classes written in C++, in the VM and in Analysis's builtin definitions. So far
 // that's the `collections` library (`OrderedMap`, `Vec`, `VecDeque`). A prototype whose API can still change. Needs
@@ -63,6 +63,11 @@ LUAU_FASTFLAGVARIABLE(DebugLuwuBuiltinClasses)
 // and LuwuNonePrimitive. The parser gates the syntax, and while it is on the compiler emits WIP bytecode (version 200),
 // which holds the protected ranges.
 LUAU_FASTFLAGVARIABLE(DebugLuwuTryExpressions)
+
+// Luwu Integers (rfcs/integers.md): integer literals (`7int`, `255u8`), integer arithmetic and the `integer` library. A
+// Debug flag while it's in progress. The parser gates the syntax, and while it is on the compiler emits WIP bytecode
+// (version 200), whose integer constants carry their mode.
+LUAU_FASTFLAGVARIABLE(DebugLuwuIntegers)
 
 // Luwu bundles: the `bundle` library, its classes, and the compiler's fastcalls and unfolding for it. A prototype whose
 // API can still change. Needs LuwuClasses.

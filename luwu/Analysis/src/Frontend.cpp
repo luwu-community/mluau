@@ -14,6 +14,7 @@
 #include "Luau/ExpectedTypeVisitor.h"
 #include "Luau/FileResolver.h"
 #include "Luau/LuwonSyntax.h"
+#include "Luau/NeverReturns.h"
 #include "Luau/NonStrictTypeChecker.h"
 #include "Luau/NotNull.h"
 #include "Luau/Parser.h"
@@ -36,8 +37,6 @@
 LUAU_FASTINT(LuauTypeInferIterationLimit)
 LUAU_FASTINT(LuauTypeInferRecursionLimit)
 LUAU_FASTINT(LuauTarjanChildLimit)
-LUAU_FASTFLAGVARIABLE(LuauKnowsTheDataModel3)
-LUAU_FASTFLAGVARIABLE(LuauFrontendSourceNodeErase)
 LUAU_FASTFLAG(LuauSolverV2)
 LUAU_FASTFLAGVARIABLE(DebugLuauLogSolverToJson)
 LUAU_FASTFLAGVARIABLE(DebugLuauLogSolverToJsonFile)
@@ -1735,7 +1734,10 @@ ModulePtr check(
         }
     }
 
-    DataFlowGraph dfg = DataFlowGraphBuilder::build(sourceModule.root, NotNull{&module->defArena}, NotNull{&module->keyArena}, iceHandler);
+    module->neverReturningCalls = findNeverReturningCalls(sourceModule.root, parentScope, moduleResolver, module->name, requireCycles);
+    DataFlowGraph dfg = DataFlowGraphBuilder::build(
+        sourceModule.root, NotNull{&module->defArena}, NotNull{&module->keyArena}, iceHandler, &module->neverReturningCalls
+    );
 
     UnifierSharedState unifierState{iceHandler};
     unifierState.counters.recursionLimit = FInt::LuauTypeInferRecursionLimit;
@@ -2075,29 +2077,22 @@ std::pair<SourceNode*, SourceModule*> Frontend::getSourceNode(const ModuleName& 
 
     if (!source)
     {
-        if (FFlag::LuauFrontendSourceNodeErase)
+        if (auto it = sourceNodes.find(name); it != sourceNodes.end())
         {
-            if (auto it = sourceNodes.find(name); it != sourceNodes.end())
+            // Remove this module from the dependents set of each of its dependencies
+            for (const ModuleName& dep : it->second->requireSet)
             {
-                // Remove this module from the dependents set of each of its dependencies
-                for (const ModuleName& dep : it->second->requireSet)
-                {
-                    if (auto depIt = sourceNodes.find(dep); depIt != sourceNodes.end())
-                        depIt->second->dependents.erase(name);
-                }
-
-                sourceNodes.erase(it);
+                if (auto depIt = sourceNodes.find(dep); depIt != sourceNodes.end())
+                    depIt->second->dependents.erase(name);
             }
 
-            sourceModules.erase(name);
-            requireTrace.erase(name);
-            moduleResolver.eraseModule(name);
-            moduleResolverForAutocomplete.eraseModule(name);
+            sourceNodes.erase(it);
         }
-        else
-        {
-            sourceModules.erase(name);
-        }
+
+        sourceModules.erase(name);
+        requireTrace.erase(name);
+        moduleResolver.eraseModule(name);
+        moduleResolverForAutocomplete.eraseModule(name);
 
         return {nullptr, nullptr};
     }

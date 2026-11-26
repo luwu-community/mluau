@@ -1,6 +1,7 @@
 // This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 
 #include "Luau/Normalize.h"
+#include "Luau/IntegerModes.h"
 #include "Luau/ToString.h"
 
 #include <algorithm>
@@ -21,8 +22,6 @@ LUAU_FASTINTVARIABLE(LuauNormalizeCacheLimit, 100000)
 LUAU_FASTFLAG(LuauSolverV2)
 LUAU_FASTINTVARIABLE(LuauNormalizerInitialFuel, 3000)
 LUAU_FASTFLAG(LuauIntegerType2)
-LUAU_FASTFLAGVARIABLE(LuauAllowIntersectionOfOneTableWithExtern)
-LUAU_FASTFLAGVARIABLE(LuauAlwaysIntersectTablesWithTables)
 
 namespace Luau
 {
@@ -193,7 +192,8 @@ bool NormalizedType::isUnknown() const
     if (FFlag::LuauIntegerType2)
     {
         hasAllPrimitives = isPrim(booleans, PrimitiveType::Boolean) && isPrim(nils, PrimitiveType::NilType) && isNumber(numbers) &&
-                           strings.isString() && isThread(threads) && isBuffer(buffers) && Luau::isNone(nones) && isInteger(integers);
+                           strings.isString() && isThread(threads) && isBuffer(buffers) && Luau::isNone(nones) &&
+                           integerModesOf(integers) == kEveryIntegerMode;
     }
     else
     {
@@ -1773,7 +1773,7 @@ NormalizationResult Normalizer::unionNormals(NormalizedType& here, const Normali
     here.nils = (get<NeverType>(there.nils) ? here.nils : there.nils);
     here.numbers = (get<NeverType>(there.numbers) ? here.numbers : there.numbers);
     if (FFlag::LuauIntegerType2)
-        here.integers = (get<NeverType>(there.integers) ? here.integers : there.integers);
+        here.integers = unionOfIntegers(builtinTypes, *arena, here.integers, there.integers);
     unionStrings(here.strings, there.strings);
     here.threads = (get<NeverType>(there.threads) ? here.threads : there.threads);
     here.buffers = (get<NeverType>(there.buffers) ? here.buffers : there.buffers);
@@ -1931,7 +1931,7 @@ NormalizationResult Normalizer::unionNormalWithTy(
         else if (ptv->type == PrimitiveType::Number)
             here.numbers = there;
         else if (FFlag::LuauIntegerType2 && (ptv->type == PrimitiveType::Integer))
-            here.integers = there;
+            here.integers = unionOfIntegers(builtinTypes, *arena, here.integers, there);
         else if (ptv->type == PrimitiveType::String)
             here.strings.resetToString();
         else if (ptv->type == PrimitiveType::Thread)
@@ -2076,7 +2076,7 @@ std::optional<NormalizedType> Normalizer::negateNormal(const NormalizedType& her
     result.nils = get<NeverType>(here.nils) ? builtinTypes->nilType : builtinTypes->neverType;
     result.numbers = get<NeverType>(here.numbers) ? builtinTypes->numberType : builtinTypes->neverType;
     if (FFlag::LuauIntegerType2)
-        result.integers = get<NeverType>(here.integers) ? builtinTypes->integerType : builtinTypes->neverType;
+        result.integers = complementOfIntegers(builtinTypes, *arena, here.integers);
 
     result.strings = here.strings;
     result.strings.isCofinite = !result.strings.isCofinite;
@@ -2174,7 +2174,7 @@ void Normalizer::subtractPrimitive(NormalizedType& here, TypeId ty)
         here.numbers = builtinTypes->neverType;
         break;
     case PrimitiveType::Integer:
-        here.integers = builtinTypes->neverType;
+        here.integers = intersectionOfIntegers(builtinTypes, *arena, here.integers, complementOfIntegers(builtinTypes, *arena, ty));
         break;
     case PrimitiveType::String:
         here.strings.resetToNever();
@@ -3441,7 +3441,7 @@ NormalizationResult Normalizer::intersectNormals(NormalizedType& here, const Nor
     here.nils = (get<NeverType>(there.nils) ? there.nils : here.nils);
     here.numbers = (get<NeverType>(there.numbers) ? there.numbers : here.numbers);
     if (FFlag::LuauIntegerType2)
-        here.integers = (get<NeverType>(there.integers) ? there.integers : here.integers);
+        here.integers = intersectionOfIntegers(builtinTypes, *arena, here.integers, there.integers);
     intersectStrings(here.strings, there.strings);
     here.threads = (get<NeverType>(there.threads) ? there.threads : here.threads);
     here.buffers = (get<NeverType>(there.buffers) ? there.buffers : here.buffers);
@@ -3560,25 +3560,15 @@ NormalizationResult Normalizer::intersectNormalWithTy(
             TypeIds tables = std::move(here.tables);
             clearNormal(here);
 
-            if (FFlag::LuauAlwaysIntersectTablesWithTables)
+            // We intersect this table against the table part of the
+            // normalized type, which may include the top table type.
+            intersectTablesWithTable(tables, there, seenTablePropPairs, seenSetTypes);
+            if (!externTypes.isNever())
             {
-                // We intersect this table against the table part of the
-                // normalized type, which may include the top table type.
-                intersectTablesWithTable(tables, there, seenTablePropPairs, seenSetTypes);
-                if (!externTypes.isNever())
-                {
-                    // If we have extern types present, intersect this table
-                    // as a shape against the extern types of this normalized
-                    // type.
-                    intersectExternTypesWithShape(externTypes, there);
-                }
-            }
-            else
-            {
-                if (externTypes.isNever())
-                    intersectTablesWithTable(tables, there, seenTablePropPairs, seenSetTypes);
-                else
-                    intersectExternTypesWithShape(externTypes, there);
+                // If we have extern types present, intersect this table
+                // as a shape against the extern types of this normalized
+                // type.
+                intersectExternTypesWithShape(externTypes, there);
             }
 
             here.tables = std::move(tables);
@@ -3594,7 +3584,7 @@ NormalizationResult Normalizer::intersectNormalWithTy(
     }
     else if (get<ExternType>(there))
     {
-        if (FFlag::LuauAllowIntersectionOfOneTableWithExtern && useNewLuauSolver())
+        if (useNewLuauSolver())
         {
             NormalizedExternType nct = std::move(here.externTypes);
             TypeIds tables = std::move(here.tables);
@@ -3663,7 +3653,7 @@ NormalizationResult Normalizer::intersectNormalWithTy(
         else if (ptv->type == PrimitiveType::Number)
             here.numbers = numbers;
         else if (FFlag::LuauIntegerType2 && (ptv->type == PrimitiveType::Integer))
-            here.integers = integers;
+            here.integers = intersectionOfIntegers(builtinTypes, *arena, integers, there);
         else if (ptv->type == PrimitiveType::String)
             here.strings = std::move(strings);
         else if (ptv->type == PrimitiveType::Thread)
@@ -3910,7 +3900,17 @@ TypeId Normalizer::typeFromNormal(const NormalizedType& norm)
         result.push_back(norm.numbers);
     if (FFlag::LuauIntegerType2)
     {
-        if (get<NeverType>(norm.integers) == nullptr)
+        std::optional<IntegerModeSet> modes = integerModesOf(norm.integers);
+        bool severalModes = modes && *modes != kEveryIntegerMode && (*modes & (*modes - 1)) != 0;
+        if (severalModes)
+        {
+            for (int mode = 0; mode < kIntegerModeCount; ++mode)
+            {
+                if (*modes & (1 << mode))
+                    result.push_back(builtinTypes->integerModeTypes[mode]);
+            }
+        }
+        else if (get<NeverType>(norm.integers) == nullptr)
             result.push_back(norm.integers);
     }
     if (norm.strings.isString())

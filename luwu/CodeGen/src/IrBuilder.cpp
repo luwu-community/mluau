@@ -795,11 +795,11 @@ void IrBuilder::translateInst(LuauOpcode op, const Instruction* pc, int i)
     case LOP_NEWCLASSMEMBER:
     {
         // Luwu Traits (rfcs/classes/traits.md): the IMPLEMENTS form reads the traits and their argument counts, and the
-        // TRAITCOPY and QUALIFIED forms a function and its trait
+        // TRAITCOPY and qualified forms a value and its trait
         int regCount = 1;
         if (LUAU_INSN_B(*pc) == LBC_NEWCLASSMEMBER_IMPLEMENTS)
             regCount = int(pc[1]) * 2;
-        else if (LUAU_INSN_B(*pc) == LBC_NEWCLASSMEMBER_TRAITCOPY || LUAU_INSN_B(*pc) == LBC_NEWCLASSMEMBER_QUALIFIED)
+        else if (LUAU_INSN_B(*pc) == LBC_NEWCLASSMEMBER_TRAITCOPY || LBC_NEWCLASSMEMBER_ISQUALIFIED(LUAU_INSN_B(*pc)))
             regCount = 2;
         inst(IrCmd::FALLBACK_NEWCLASSMEMBER, constUint(i), vmReg(LUAU_INSN_A(*pc)), vmReg(LUAU_INSN_C(*pc)), constInt(regCount));
         break;
@@ -836,6 +836,10 @@ void IrBuilder::translateInst(LuauOpcode op, const Instruction* pc, int i)
 
     case LOP_GETQUALIFIED:
         inst(IrCmd::FALLBACK_GETQUALIFIED, constUint(i), vmReg(LUAU_INSN_A(*pc)), vmReg(LUAU_INSN_B(*pc)), vmReg(LUAU_INSN_C(*pc)));
+        break;
+
+    case LOP_SETQUALIFIED:
+        inst(IrCmd::FALLBACK_SETQUALIFIED, constUint(i), vmReg(LUAU_INSN_A(*pc)), vmReg(LUAU_INSN_B(*pc)), vmReg(LUAU_INSN_C(*pc)));
         break;
 
     case LOP_PUSH:
@@ -991,7 +995,10 @@ void IrBuilder::clone(std::vector<uint32_t> sourceIdxs, bool removeCurrentTermin
             IrInst clone = function.instructions[index];
 
             // Skip pseudo instructions to make clone more compact, but validate that they have no users
-            if (isPseudo(clone.cmd))
+            // Luwu: from upstream's LuauCodegenMarkUsed (0.745), MARK_DEAD and MARK_USED are kept: they mark register liveness.
+            // MARK_TRY_READS does too: a try handler reads those registers.
+            bool marksLiveness = clone.cmd == IrCmd::MARK_DEAD || clone.cmd == IrCmd::MARK_USED || clone.cmd == IrCmd::MARK_TRY_READS;
+            if (isPseudo(clone.cmd) && !marksLiveness)
             {
                 CODEGEN_ASSERT(clone.useCount == 0);
                 continue;

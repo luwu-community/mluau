@@ -48,7 +48,6 @@
 #include <stdlib.h>
 
 LUAU_FASTFLAG(DebugLuauTimeTracing)
-LUAU_FASTFLAG(LuauAutoStack)
 
 constexpr int MaxTraversalLimit = 50;
 
@@ -239,18 +238,12 @@ void setupState(lua_State* L)
 
 void setupArguments(lua_State* L, int argc, char** argv)
 {
-    if (!FFlag::LuauAutoStack)
-        lua_checkstack(L, argc);
-
     for (int i = 0; i < argc; ++i)
         lua_pushstring(L, argv[i]);
 }
 
 std::string runCode(lua_State* L, const std::string& source)
 {
-    if (!FFlag::LuauAutoStack)
-        lua_checkstack(L, LUA_MINSTACK);
-
     std::string bytecode = Luau::compile(source, copts());
 
     if (luau_load(L, "=stdin", bytecode.data(), bytecode.size(), 0) != 0)
@@ -425,9 +418,6 @@ static void completeIndexer(lua_State* L, const std::string& editBuffer, const A
 {
     std::string_view lookup = editBuffer;
     bool completeOnlyFunctions = false;
-
-    if (!FFlag::LuauAutoStack)
-        lua_checkstack(L, LUA_MINSTACK);
 
     // Push the global variable table to begin the search
     lua_pushvalue(L, LUA_GLOBALSINDEX);
@@ -670,6 +660,15 @@ static bool runFile(const char* name, lua_State* GL, bool repl)
         else if (const char* str = lua_tostring(L, -1))
         {
             error = str;
+        }
+        else
+        {
+            // Luwu: an error that isn't a string, such as an `Error.Overflow` object, prints as `tostring` gives it. The
+            // thread that raised it can't run `__tostring`, so the main thread does.
+            lua_pushvalue(L, -1);
+            lua_xmove(L, GL, 1);
+            error = luaL_tolstring(GL, -1, nullptr);
+            lua_pop(GL, 2);
         }
 
         error += "\nstacktrace:\n";

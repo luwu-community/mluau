@@ -11,18 +11,16 @@
 #include "lmem.h"
 #include "ludata.h"
 #include "lbuffer.h"
+#include "lbigint.h"
 #include "lclass.h"
 #include "lvector.h"
 
 #include <string.h>
 
-LUAU_FASTFLAG(LuauUdataDirectAccess6)
 LUAU_FASTFLAG(LuauDirectFieldGet)
 LUAU_FASTFLAGVARIABLE(LuauUdataMetatablePinned)
-LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauGcTableStepFix, false)
 LUAU_FASTFLAGVARIABLE(LuauGcTraceUdata)
 LUAU_FLAGVERSION(LuauGcTraceUdata, 2)
-LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauGcMarkUdataAccess, false)
 
 /*
  * Luau uses an incremental non-generational non-moving mark&sweep garbage collector.
@@ -246,6 +244,11 @@ static void reallymarkobject(global_State* g, GCObject* o)
     case LUA_TSTRING:
     {
         gray2black(o); // strings are never gray
+        return;
+    }
+    case LUA_THEAPINTEGER:
+    {
+        gray2black(o); // Integers have no children, mark them black
         return;
     }
     case LUA_TUSERDATA:
@@ -473,6 +476,8 @@ static void traverseclass(global_State* g, LuauClass* classdef)
 {
     markobject(g, classdef->name);
     markobject(g, classdef->memberstooffset);
+    if (classdef->staticshadows)
+        markobject(g, classdef->staticshadows);
     for (uint32_t i = 0; i < classdef->numberofallmembers; i++)
         if (classdef->offsettomember[i])
             markobject(g, classdef->offsettomember[i]);
@@ -588,10 +593,7 @@ static size_t propagatemark(global_State* g)
         if (traversetable(g, h)) // table is weak?
             black2gray(o);       // keep it gray
 
-        if (DFFlag::LuauGcTableStepFix)
-            return sizeof(LuaTable) + sizeof(TValue) * h->sizearray + sizeof(LuaNode) * (h->node == &luaH_dummynode ? 0 : sizenode(h));
-        else
-            return sizeof(LuaTable) + sizeof(TValue) * h->sizearray + sizeof(LuaNode) * sizenode(h);
+        return sizeof(LuaTable) + sizeof(TValue) * h->sizearray + sizeof(LuaNode) * (h->node == &luaH_dummynode ? 0 : sizenode(h));
     }
     case LUA_TFUNCTION:
     {
@@ -696,6 +698,13 @@ static int isobjcleared(GCObject* o)
         return 0;
     }
 
+    // Luwu Integers (rfcs/integers.md): bigints are values too, marked the way strings are
+    if (o->gch.tt == LUA_THEAPINTEGER)
+    {
+        stringmark(&o->gch);
+        return 0;
+    }
+
     return iswhite(o);
 }
 
@@ -758,10 +767,7 @@ static size_t cleartable(lua_State* L, GCObject* l)
     {
         LuaTable* h = gco2h(l);
 
-        if (DFFlag::LuauGcTableStepFix)
-            work += sizeof(LuaTable) + sizeof(TValue) * h->sizearray + sizeof(LuaNode) * (h->node == &luaH_dummynode ? 0 : sizenode(h));
-        else
-            work += sizeof(LuaTable) + sizeof(TValue) * h->sizearray + sizeof(LuaNode) * sizenode(h);
+        work += sizeof(LuaTable) + sizeof(TValue) * h->sizearray + sizeof(LuaNode) * (h->node == &luaH_dummynode ? 0 : sizenode(h));
 
         int i = h->sizearray;
         while (i--)
@@ -846,6 +852,9 @@ static void freeobj(lua_State* L, GCObject* o, lua_Page* page)
     case LUA_TOBJECT:
         luaR_freeobject(L, gco2object(o), page);
         break;
+    case LUA_THEAPINTEGER:
+        luaZB_freeheapinteger(L, gco2integer(o), page);
+        break;
     default:
         LUAU_ASSERT(0);
     }
@@ -912,7 +921,6 @@ void luaC_freeall(lua_State* L)
 
 static void markudatadirectaccess(global_State* g)
 {
-    LUAU_ASSERT(DFFlag::LuauGcMarkUdataAccess);
     for (int i = 0; i < UTAG_INTERNAL_LIMIT; i++)
     {
         lua_UdataDirectAccessData& udatadirect = g->udatadirect[i];
@@ -948,6 +956,24 @@ static void marktaggetmt(global_State* g)
     }
 }
 
+// Luwu structured runtime errors: the recorded error's values, which nothing else may hold until it's caught
+static void markerrorrecord(global_State* g)
+{
+    LuwuErrorRecord& record = g->errorrecord;
+    for (int i = 0; i < LUWU_ERROR_MAXFIELDS; i++)
+    {
+        markvalue(g, &record.fields[i]);
+        if (record.opaquetypes[i])
+            markobject(g, record.opaquetypes[i]);
+    }
+    if (record.source)
+        markobject(g, record.source);
+    if (record.prefix)
+        markobject(g, record.prefix);
+    if (g->opaqueplaceholder)
+        markobject(g, g->opaqueplaceholder);
+}
+
 // mark root set
 static void markroot(lua_State* L)
 {
@@ -964,6 +990,7 @@ static void markroot(lua_State* L)
         if (g->builtinclasses[i])
             markobject(g, g->builtinclasses[i]);
     }
+    markerrorrecord(g);
     g->gc_ref_gray = 0;
     for (int i = 0; i < g->ref_size; i++) {
         if (g->ref_array[i].tt != LUA_TNONE)
@@ -977,24 +1004,7 @@ static void markroot(lua_State* L)
             g->embeddergc(g->mainthread, nullptr);
     }
 
-    if (FFlag::LuauUdataDirectAccess6)
-    {
-        if (DFFlag::LuauGcMarkUdataAccess)
-        {
-            markudatadirectaccess(g);
-        }
-        else
-        {
-            for (int i = 0; i < UTAG_INTERNAL_LIMIT; i++)
-            {
-                lua_UdataDirectAccessData& udatadirect = L->global->udatadirect[i];
-
-                markvalue(g, &udatadirect.indextm);
-                markvalue(g, &udatadirect.newindextm);
-                markvalue(g, &udatadirect.namecalltm);
-            }
-        }
-    }
+    markudatadirectaccess(g);
 
     if (FFlag::LuauDirectFieldGet)
         markudatadirectfields(g);
@@ -1087,12 +1097,12 @@ static size_t atomic(lua_State* L)
 
     markobject(g, L); // mark running thread
     markmt(g);        // mark basic metatables (again)
+    markerrorrecord(g); // Luwu structured runtime errors: an error can be recorded after markroot
 
     if (FFlag::LuauUdataMetatablePinned)
         marktaggetmt(g); // mark tagged userdata metatables (again)
 
-    if (DFFlag::LuauGcMarkUdataAccess)
-        markudatadirectaccess(g); // mark tagged userdata direct access functions (again)
+    markudatadirectaccess(g); // mark tagged userdata direct access functions (again)
 
     if (FFlag::LuauDirectFieldGet)
         markudatadirectfields(g); // mark direct field dispatch tables (again)
@@ -1338,6 +1348,14 @@ static int64_t getheaptriggererroroffset(global_State* g)
     return int64_t(totalTerm * 1024);
 }
 
+// Luwu: from upstream's LuauGcHeapShrinkFix (0.741). The heap can shrink between measurements (after a full collection, or when
+// thread stacks shrink during marking), which counts as no growth. Subtracting would wrap around and give an int64_t conversion
+// with undefined behavior.
+static size_t getheapgrowth(size_t current, size_t previous)
+{
+    return current > previous ? current - previous : 0;
+}
+
 static size_t getheaptrigger(global_State* g, size_t heapgoal)
 {
     // adjust threshold based on a guess of how many bytes will be allocated between the cycle start and sweep phase
@@ -1349,7 +1367,7 @@ static size_t getheaptrigger(global_State* g, size_t heapgoal)
     if (allocationduration < durationthreshold)
         return heapgoal;
 
-    double allocationrate = (g->gcstats.atomicstarttotalsizebytes - g->gcstats.endtotalsizebytes) / allocationduration;
+    double allocationrate = getheapgrowth(g->gcstats.atomicstarttotalsizebytes, g->gcstats.endtotalsizebytes) / allocationduration;
     double markduration = g->gcstats.atomicstarttimestamp - g->gcstats.starttimestamp;
 
     int64_t expectedgrowth = int64_t(markduration * allocationrate);
@@ -1494,6 +1512,10 @@ void luaC_fullgc(lua_State* L)
 
     g->gcstats.heapgoalsizebytes = heapgoalsizebytes;
 
+    // Luwu: from upstream's LuauGcHeapShrinkFix (0.741), a full collection ends a cycle, so heap growth is measured from here
+    g->gcstats.endtimestamp = lua_clock();
+    g->gcstats.endtotalsizebytes = g->totalbytes;
+
 #ifdef LUAI_GCMETRICS
     finishGcCycleMetrics(g);
 #endif
@@ -1578,7 +1600,7 @@ int64_t luaC_allocationrate(lua_State* L)
         if (duration < durationthreshold)
             return -1;
 
-        return int64_t((g->totalbytes - g->gcstats.endtotalsizebytes) / duration);
+        return int64_t(getheapgrowth(g->totalbytes, g->gcstats.endtotalsizebytes) / duration);
     }
 
     // totalbytes is unstable during the sweep, use the rate measured at the end of mark phase
@@ -1587,7 +1609,7 @@ int64_t luaC_allocationrate(lua_State* L)
     if (duration < durationthreshold)
         return -1;
 
-    return int64_t((g->gcstats.atomicstarttotalsizebytes - g->gcstats.endtotalsizebytes) / duration);
+    return int64_t(getheapgrowth(g->gcstats.atomicstarttotalsizebytes, g->gcstats.endtotalsizebytes) / duration);
 }
 
 const char* luaC_statename(int state)

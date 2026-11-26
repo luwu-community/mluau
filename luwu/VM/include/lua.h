@@ -98,6 +98,7 @@ enum lua_Type
     LUA_TBUFFER,
     LUA_TCLASS,
     LUA_TOBJECT,
+    LUA_THEAPINTEGER,
 
     // When vector components are 'double', it is a GCObject with heap-allocated data
 #if LUA_VECTOR_DOUBLE == 1
@@ -161,6 +162,7 @@ LUA_API void lua_xpush(lua_State* from, lua_State* to, int idx);
 LUA_API int lua_isnumber(lua_State* L, int idx);
 LUA_API int lua_isstring(lua_State* L, int idx);
 LUA_API int lua_isinteger64(lua_State* L, int idx);
+LUA_API int lua_isheapinteger(lua_State* L, int idx);
 LUA_API int lua_iscfunction(lua_State* L, int idx);
 LUA_API int lua_isLfunction(lua_State* L, int idx);
 LUA_API int lua_isuserdata(lua_State* L, int idx);
@@ -547,6 +549,7 @@ LUA_API void lua_cstackrelease(lua_State* L, int n);
 #define lua_isnil(L, n) (lua_type(L, (n)) == LUA_TNIL)
 #define lua_isboolean(L, n) (lua_type(L, (n)) == LUA_TBOOLEAN)
 #define lua_isinteger64(L, n) (lua_type(L, (n)) == LUA_TINTEGER)
+#define lua_isheapinteger(L, n) (lua_type(L, (n)) == LUA_THEAPINTEGER)
 #define lua_isvector(L, n) (lua_type(L, (n)) == LUA_TVECTOR)
 #define lua_isthread(L, n) (lua_type(L, (n)) == LUA_TTHREAD)
 #define lua_isbuffer(L, n) (lua_type(L, (n)) == LUA_TBUFFER)
@@ -583,6 +586,10 @@ LUA_API int lua_classof(lua_State* L, int idx);
 // Luwu Classes (rfcs/classes): `class.is` for embedders. Returns 1 if the value at `idx` is an object of exactly the class
 // at `classidx`, 0 otherwise. Raises if the value at `classidx` isn't a class.
 LUA_API int lua_classis(lua_State* L, int idx, int classidx);
+// Luwu opaque values: marks the class at `idx`, or the class of the object at `idx`, opaque. Its objects then never
+// appear in error records, `class.fields` raises on it, and reading a private member from outside raises the error a
+// missing member gives. A mark can't be removed. Raises if the value isn't a class or object.
+LUA_API void lua_setclassopaque(lua_State* L, int idx);
 
 // Luwu try expressions: options and results for embedders. Building one raises if the result library (luaopen_result)
 // isn't open. lua_pushsome pushes `Some(v)` for the value at `idx`, which can be nil or none. An empty option is

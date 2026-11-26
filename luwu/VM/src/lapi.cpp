@@ -22,8 +22,6 @@
 
 LUAU_FASTFLAG(LuauDirectFieldGet)
 LUAU_FASTFLAG(LuwuNonePrimitive)
-LUAU_FASTFLAGVARIABLE(LuauAutoStack)
-LUAU_FASTFLAGVARIABLE(LuauCloneTableFix)
 LUAU_FASTFLAGVARIABLE(LuwuExternallyManagedBuffers)
 LUAU_FASTFLAGVARIABLE(LuwuExternalString)
 LUAU_FASTFLAGVARIABLE(DebugLuwuAllowNonNullTerminatedStrings)
@@ -68,7 +66,7 @@ const char* luwu_ident = "$Luwu: Copyright (C) 2026 Luwu contributors $\n"
 
 #define ensure_stack_impl(L, errorL, size) \
     { \
-        if (FFlag::LuauAutoStack && L->top + (size) > L->ci->top && !lua_checkstack(L, (size))) \
+        if (L->top + (size) > L->ci->top && !lua_checkstack(L, (size))) \
         { \
             luaO_pushfstring(errorL, "stack overflow"); \
             lua_error(errorL); \
@@ -492,7 +490,8 @@ int lua_toboolean(lua_State* L, int idx)
 int64_t lua_tointeger64(lua_State* L, int idx, int* isinteger)
 {
     const TValue* o = index2addr(L, idx);
-    if (ttisinteger(o))
+    // Luwu Integers (rfcs/integers.md): the bits of an inline integer of any mode; a bigint has no 64-bit value
+    if (ttype(o) == LUA_TINTEGER)
     {
         if (isinteger)
             *isinteger = 1;
@@ -1752,7 +1751,21 @@ static const TValue* findclassmember(lua_State* L, int idx, const char* memberna
     if (!*classdef)
         luaG_runerror(L, "expected a class or object, got %s", luaT_objtypename(L, o));
 
-    return luaH_getstr((*classdef)->memberstooffset, luaS_new(L, membername));
+    TString* name = luaS_new(L, membername);
+    if (ttisclass(o))
+        return luaR_classvalueoffset(*classdef, name);
+
+    return luaH_getstr((*classdef)->memberstooffset, name);
+}
+
+void lua_setclassopaque(lua_State* L, int idx)
+{
+    const TValue* o = index2addr(L, idx);
+    LuauClass* classdef = classofvalue(o);
+    if (!classdef)
+        luaG_runerror(L, "expected a class or object, got %s", luaT_objtypename(L, o));
+
+    classdef->isopaque = true;
 }
 
 int lua_istrait(lua_State* L, int idx)
@@ -1873,8 +1886,9 @@ int lua_ismemberconst(lua_State* L, int idx, const char* membername)
         return 0;
 
     uint32_t offsetnum = uint32_t(nvalue(offset));
-    // functions (static members) are always immutable
-    return offsetnum >= classdef->numberofinstancemembers || (classdef->memberflags[offsetnum] & LBC_CLASSMEMBER_CONST) != 0;
+    // functions (static members) are always immutable; a field on the class value is unless it's const
+    bool function = offsetnum >= classdef->numberofinstancemembers && !(classdef->memberflags[offsetnum] & LBC_CLASSMEMBER_CLASSFIELD);
+    return function || (classdef->memberflags[offsetnum] & LBC_CLASSMEMBER_CONST) != 0;
 }
 
 // Whether a trait the class implements, directly or through `needs`, declares `name` final. The class's own copy of a
@@ -2562,11 +2576,8 @@ void lua_cleartable(lua_State* L, int idx)
 
 void lua_clonetable(lua_State* L, int idx)
 {
-    if (FFlag::LuauCloneTableFix)
-    {
-        luaC_checkGC(L);
-        luaC_threadbarrier(L);
-    }
+    luaC_checkGC(L);
+    luaC_threadbarrier(L);
 
     ensure_stack(L, 1);
     StkId t = index2addr(L, idx);

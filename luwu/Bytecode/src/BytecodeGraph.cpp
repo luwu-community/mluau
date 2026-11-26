@@ -162,9 +162,12 @@ std::optional<CompTimeBcFunction> fromFunctionBytecode(std::string bytecode, std
         case LBC_CONSTANT_INTEGER:
         {
             fn.constants[i].kind = BcVmConstKind::Integer;
-            bool isNegative = read<uint8_t>(data, offset);
+            uint8_t signAndMode = read<uint8_t>(data, offset);
+            bool isNegative = signAndMode & 1;
+            uint8_t mode = signAndMode >> 1;
             uint64_t magnitude = readVarInt64(data, offset);
             fn.constants[i].valueInteger = isNegative ? (int64_t)(~magnitude + 1) : (int64_t)magnitude;
+            fn.constants[i].mode = mode;
             break;
         }
 
@@ -185,7 +188,7 @@ std::optional<CompTimeBcFunction> fromFunctionBytecode(std::string bytecode, std
             for (uint32_t j = 0; j < propertyCount; ++j)
             {
                 shape.propertyNames.push_back(readVarInt(data, offset));
-                shape.propertyFlags.push_back(uint8_t(readVarInt(data, offset)));
+                shape.propertyFlags.push_back(uint16_t(readVarInt(data, offset)));
                 shape.propertyDefaults.push_back(
                     (shape.propertyFlags.back() & LBC_CLASSMEMBER_CONSTDEFAULT) ? int32_t(readVarInt(data, offset)) : -1
                 );
@@ -197,7 +200,7 @@ std::optional<CompTimeBcFunction> fromFunctionBytecode(std::string bytecode, std
             for (uint32_t j = 0; j < methodCount; ++j)
             {
                 shape.methodNames.push_back(readVarInt(data, offset));
-                shape.methodFlags.push_back(uint8_t(readVarInt(data, offset)));
+                shape.methodFlags.push_back(uint16_t(readVarInt(data, offset)));
             }
 
             fn.classShapes.push_back(std::move(shape));
@@ -382,7 +385,7 @@ std::string toFunctionBytecode(BytecodeBuilder& bcb, CompTimeBcFunction& fn)
             break;
 
         case BcVmConstKind::Integer:
-            consts.push_back(bcb.addConstantInteger(c.valueInteger));
+            consts.push_back(bcb.addConstantInteger(c.valueInteger, c.mode));
             break;
 
         case BcVmConstKind::ClassShape:
@@ -413,7 +416,11 @@ std::string toFunctionBytecode(BytecodeBuilder& bcb, CompTimeBcFunction& fn)
 
     bcb.foldJumps();
 
-    bcb.expandJumps();
+    bool hasLongJumpError = false;
+    bcb.expandJumps(hasLongJumpError);
+
+    if (hasLongJumpError)
+        return "";
 
     bcb.endFunction(fn.maxstacksize, fn.nups, fn.flags);
 

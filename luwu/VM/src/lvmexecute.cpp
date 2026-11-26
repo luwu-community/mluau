@@ -1,6 +1,7 @@
 // This file is part of the Luwu programming language and is licensed under MIT License; see LICENSE.txt for details
 // This code is based on Lua 5.x implementation licensed under MIT License; see lua_LICENSE.txt for details
 #include "lclass.h"
+#include "linteger.h"
 #include "lvm.h"
 
 #include "lstate.h"
@@ -25,7 +26,6 @@ LUAU_FLAGVERSION(LuauDirectFieldGet, 3)
 
 LUAU_FASTFLAGVARIABLE(LuauCIProto)
 LUAU_FASTFLAGVARIABLE(LuauCallFeedback)
-LUAU_FASTFLAGVARIABLE(LuauYieldIter2)
 LUAU_FASTFLAGVARIABLE(LuauPromoteProto)
 
 // Disable c99-designator to avoid the warning in computed goto dispatch table
@@ -115,6 +115,7 @@ LUAU_FASTFLAGVARIABLE(LuauPromoteProto)
         } \
     }
 
+
 #define VM_DISPATCH_OP(op) &&CASE_##op
 
 #define VM_DISPATCH_TABLE() \
@@ -140,10 +141,10 @@ LUAU_FASTFLAGVARIABLE(LuauPromoteProto)
         VM_DISPATCH_OP(LOP_IDIVK), VM_DISPATCH_OP(LOP_GETUDATAKS), VM_DISPATCH_OP(LOP_SETUDATAKS), VM_DISPATCH_OP(LOP_NAMECALLUDATA), \
         VM_DISPATCH_OP(LOP_NEWCLASSMEMBER), VM_DISPATCH_OP(LOP_CALLFB), VM_DISPATCH_OP(LOP_CMPPROTO), VM_DISPATCH_OP(LOP_CHECKSELFCLASS), \
         VM_DISPATCH_OP(LOP_JUMPXISA), VM_DISPATCH_OP(LOP_NEWOBJECT), \
-        VM_DISPATCH_OP(LOP_GETOBJECTMEMBER), VM_DISPATCH_OP(LOP_SETOBJECTMEMBER), VM_DISPATCH_OP(LOP_INITTRAITS), \
-        VM_DISPATCH_OP(LOP_PRESIZETABLE), VM_DISPATCH_OP(LOP_APPENDTABLE), VM_DISPATCH_OP(LOP_WRAPRESULT), VM_DISPATCH_OP(LOP_RESULTGET), \
-        VM_DISPATCH_OP(LOP_GETQUALIFIED), VM_DISPATCH_OP(LOP_GETPOSITIONAL), VM_DISPATCH_OP(LOP_JUMPXTYPE), VM_DISPATCH_OP(LOP_JUMPXMATCH), \
-        VM_DISPATCH_OP(LOP_PUSH), VM_DISPATCH_OP(LOP_POP), VM_DISPATCH_OP(LOP_GETTABLEBUNDLE), VM_DISPATCH_OP(LOP_SETTABLEBUNDLE),
+        VM_DISPATCH_OP(LOP_GETOBJECTMEMBER), VM_DISPATCH_OP(LOP_SETOBJECTMEMBER), VM_DISPATCH_OP(LOP_INITTRAITS), VM_DISPATCH_OP(LOP_PRESIZETABLE), \
+        VM_DISPATCH_OP(LOP_APPENDTABLE), VM_DISPATCH_OP(LOP_WRAPRESULT), VM_DISPATCH_OP(LOP_RESULTGET), VM_DISPATCH_OP(LOP_GETQUALIFIED), \
+        VM_DISPATCH_OP(LOP_GETPOSITIONAL), VM_DISPATCH_OP(LOP_GETTABLEBUNDLE), VM_DISPATCH_OP(LOP_SETTABLEBUNDLE), VM_DISPATCH_OP(LOP_JUMPXTYPE), \
+        VM_DISPATCH_OP(LOP_JUMPXMATCH), VM_DISPATCH_OP(LOP_SETQUALIFIED), VM_DISPATCH_OP(LOP_PUSH), VM_DISPATCH_OP(LOP_POP),
 
 #if defined(__GNUC__) || defined(__clang__)
 #define VM_USE_CGOTO 1
@@ -709,7 +710,7 @@ reentry:
                         // to the class member with the same name.
                         uint8_t slot = LUAU_INSN_C(insn);
                         LuauObject* inst = objectvalue(rb);
-                        if (LUAU_LIKELY(slot < inst->lclass->numberofallmembers && tsvalue(kv) == inst->lclass->offsettomember[slot]))
+                        if (LUAU_LIKELY(slot < inst->lclass->numberofobjectmembers && tsvalue(kv) == inst->lclass->offsettomember[slot]))
                         {
                             if (LUAU_UNLIKELY(inst->lclass->hasprivatemembers))
                                 luaR_checkprivateaccessfast(L, kv, inst->lclass, cl, slot, pc);
@@ -720,7 +721,8 @@ reentry:
                         else
                         {
                             const TValue* offset = luaH_getstr(inst->lclass->memberstooffset, tsvalue(kv));
-                            if (ttisnil(offset))
+                            // Luwu Traits (rfcs/classes/traits.md): a member only the class value reads is missing here
+                            if (ttisnil(offset) || uint32_t(nvalue(offset)) >= inst->lclass->numberofobjectmembers)
                             {
                                 VM_PROTECT_PC();
                                 luaG_missingmembererror(L, rb, kv);
@@ -750,7 +752,7 @@ reentry:
                         // slow-er path: the slot mismatched so we fall back to looking up the offset from the string.
                         else
                         {
-                            const TValue* offset = luaH_getstr(lco->memberstooffset, tsvalue(kv));
+                            const TValue* offset = luaR_classvalueoffset(lco, tsvalue(kv));
                             if (ttisnil(offset))
                             {
                                 VM_PROTECT_PC();
@@ -869,12 +871,17 @@ reentry:
                         else
                         {
                             const TValue* offset = luaH_getstr(inst->lclass->memberstooffset, tsvalue(kv));
-                            if (ttisnil(offset))
+                            if (ttisnil(offset) || uint32_t(nvalue(offset)) >= inst->lclass->numberofobjectmembers)
                             {
                                 VM_PROTECT_PC();
                                 luaG_missingmembererror(L, rb, kv);
                             }
                             const uint32_t offsetnum = uint32_t(nvalue(offset));
+                            if (offsetnum >= inst->lclass->numberofinstancemembers && (inst->lclass->memberflags[offsetnum] & LBC_CLASSMEMBER_CLASSFIELD))
+                            {
+                                VM_PROTECT_PC();
+                                luaR_sharedfieldwriteerror(L, inst, kv);
+                            }
                             if (offsetnum >= inst->lclass->numberofinstancemembers)
                             {
                                 VM_PROTECT_PC();
@@ -1120,7 +1127,7 @@ reentry:
                     // metatable machinery below applies to them.
                     uint8_t slot = LUAU_INSN_C(insn);
                     LuauObject* inst = objectvalue(rb);
-                    if (slot < inst->lclass->numberofallmembers && tsvalue(kv) == inst->lclass->offsettomember[slot])
+                    if (slot < inst->lclass->numberofobjectmembers && tsvalue(kv) == inst->lclass->offsettomember[slot])
                     {
                         if (LUAU_UNLIKELY(inst->lclass->hasprivatemembers))
                             luaR_checkprivateaccessfast(L, kv, inst->lclass, cl, slot, pc);
@@ -1152,7 +1159,7 @@ reentry:
                     else
                     {
                         const TValue* offset = luaH_getstr(inst->lclass->memberstooffset, tsvalue(kv));
-                        if (ttisnil(offset))
+                        if (ttisnil(offset) || uint32_t(nvalue(offset)) >= inst->lclass->numberofobjectmembers)
                         {
                             VM_PROTECT_PC();
                             luaG_missingmembererror(L, rb, kv);
@@ -1635,10 +1642,14 @@ reentry:
                         // need to invoke metamethods).
                         break;
 
+                    // Luwu Integers (rfcs/integers.md): equal integers have the same value and mode
                     case LUA_TINTEGER:
-                        pc += lvalue(ra) == lvalue(rb) ? LUAU_INSN_D(insn) : 1;
+                        pc += (ra->value.l == rb->value.l && ra->extra[0] == rb->extra[0]) ? LUAU_INSN_D(insn) : 1;
                         VM_ASSERT_PC(pc);
                         VM_NEXT();
+
+                    case LUA_THEAPINTEGER:
+                        break;
 
                     default:
                         LUAU_ASSERT(!"Unknown value type");
@@ -1769,10 +1780,14 @@ reentry:
                         // need to invoke metamethods).
                         break;
 
+                    // Luwu Integers (rfcs/integers.md): see LOP_JUMPIFEQ
                     case LUA_TINTEGER:
-                        pc += lvalue(ra) != lvalue(rb) ? LUAU_INSN_D(insn) : 1;
+                        pc += (ra->value.l != rb->value.l || ra->extra[0] != rb->extra[0]) ? LUAU_INSN_D(insn) : 1;
                         VM_ASSERT_PC(pc);
                         VM_NEXT();
+
+                    case LUA_THEAPINTEGER:
+                        break;
 
                     default:
                         LUAU_ASSERT(!"Unknown value type");
@@ -1950,6 +1965,14 @@ reentry:
                 }
                 else
                 {
+                    // Luwu Integers (rfcs/integers.md): two inline integers of one mode, unless the result needs the
+                    // slow path. Numbers and vectors are tested first, so they don't pay for it.
+                    bool integerDone = luaZ_fastarith<TM_ADD>(ra, rb, rc);
+                    if (integerDone)
+                    {
+                        VM_NEXT();
+                    }
+
                     // fast-path for userdata with C functions
                     const TValue* fn = 0;
                     if (ttisuserdata(rb) && (fn = luaT_gettmbyobj(L, rb, TM_ADD)) && ttisfunction(fn) && clvalue(fn)->isC)
@@ -1996,6 +2019,14 @@ reentry:
                 }
                 else
                 {
+                    // Luwu Integers (rfcs/integers.md): two inline integers of one mode, unless the result needs the
+                    // slow path. Numbers and vectors are tested first, so they don't pay for it.
+                    bool integerDone = luaZ_fastarith<TM_SUB>(ra, rb, rc);
+                    if (integerDone)
+                    {
+                        VM_NEXT();
+                    }
+
                     // fast-path for userdata with C functions
                     const TValue* fn = 0;
                     if (ttisuserdata(rb) && (fn = luaT_gettmbyobj(L, rb, TM_SUB)) && ttisfunction(fn) && clvalue(fn)->isC)
@@ -2056,6 +2087,14 @@ reentry:
                 }
                 else
                 {
+                    // Luwu Integers (rfcs/integers.md): two inline integers of one mode, unless the result needs the
+                    // slow path. Numbers and vectors are tested first, so they don't pay for it.
+                    bool integerDone = luaZ_fastarith<TM_MUL>(ra, rb, rc);
+                    if (integerDone)
+                    {
+                        VM_NEXT();
+                    }
+
                     // fast-path for userdata with C functions
                     StkId rbc = ttisnumber(rb) ? rc : rb;
                     const TValue* fn = 0;
@@ -2995,18 +3034,11 @@ reentry:
                     L->top = ra + 3 + 3; // func + 2 args (state and index)
                     LUAU_ASSERT(L->top <= L->stack_last);
 
-                    if (FFlag::LuauYieldIter2)
-                    {
-                        bool yielded;
-                        VM_PROTECT(yielded = luaD_performcally(L, ra + 3, uint8_t(aux)));
+                    bool yielded;
+                    VM_PROTECT(yielded = luaD_performcally(L, ra + 3, uint8_t(aux)));
 
-                        if (yielded)
-                            goto exit;
-                    }
-                    else
-                    {
-                        VM_PROTECT(luaD_call(L, ra + 3, uint8_t(aux)));
-                    }
+                    if (yielded)
+                        goto exit;
 
                     L->top = L->ci->top;
 
@@ -3884,12 +3916,14 @@ reentry:
                     VM_NEXT();
                 }
 
-                // Luwu Traits (rfcs/classes/traits.md): the class's qualified implementation of a trait's function
-                if (LUAU_INSN_B(insn) == LBC_NEWCLASSMEMBER_QUALIFIED)
+                // Luwu Traits (rfcs/classes/traits.md): the class's qualified implementation of a trait's function, or its value of a
+                // trait's scoped field
+                bool qualified = LBC_NEWCLASSMEMBER_ISQUALIFIED(LUAU_INSN_B(insn));
+                if (qualified)
                 {
                     TValue* name = VM_KV(aux);
                     LUAU_ASSERT(ttisstring(name));
-                    VM_PROTECT(luaR_addqualified(L, classvalue(ra), rc + 1, tsvalue(name), rc));
+                    VM_PROTECT(luaR_addqualified(L, classvalue(ra), rc + 1, tsvalue(name), rc, LUAU_INSN_B(insn)));
                     VM_NEXT();
                 }
 
@@ -3898,6 +3932,24 @@ reentry:
                 {
                     VM_PROTECT_PC();
                     luaR_setconstructor(L, classvalue(ra), rc);
+                    VM_NEXT();
+                }
+
+                // Luwu Traits (rfcs/classes/traits.md): a metamethod of the class value itself
+                if (LUAU_INSN_B(insn) == LBC_NEWCLASSMEMBER_VALUEMETAMETHOD)
+                {
+                    TValue* name = VM_KV(aux);
+                    LUAU_ASSERT(ttisstring(name));
+                    luaR_addvaluemetamethod(L, classvalue(ra), tsvalue(name), rc);
+                    VM_NEXT();
+                }
+
+                // Luwu Traits (rfcs/classes/traits.md): the value of a field on the class value
+                if (LUAU_INSN_B(insn) == LBC_NEWCLASSMEMBER_FIELD)
+                {
+                    TValue* name = VM_KV(aux);
+                    LUAU_ASSERT(ttisstring(name));
+                    luaR_addclassfield(L, classvalue(ra), tsvalue(name), rc);
                     VM_NEXT();
                 }
 
@@ -3967,9 +4019,21 @@ reentry:
                     classdef = classvalue(classReg);
                 }
 
-                if (LUAU_LIKELY(ttisobject(self) && objectvalue(self)->lclass == classdef))
+                // Luwu Traits (rfcs/classes/traits.md): a class method's `Self` is the class itself
+                bool classmethod = LUAU_INSN_C(insn) == LBC_SELFCLASS_CLASSMETHOD;
+
+                if (LUAU_LIKELY(ttisobject(self) && objectvalue(self)->lclass == classdef && !classmethod))
                 {
                     VM_NEXT();
+                }
+                else if (classmethod && ttisclass(self) && classvalue(self) == classdef)
+                {
+                    VM_NEXT();
+                }
+                else if (classmethod)
+                {
+                    VM_PROTECT_PC();
+                    luaG_classmethoderror(L, self, classdef, tsvalue(VM_KV(aux)));
                 }
                 else
                 {
@@ -4223,6 +4287,38 @@ reentry:
                 VM_NEXT();
             }
 
+            VM_CASE(LOP_WRAPRESULT)
+            {
+                // Luwu try expressions: the value of a `try` expression, or the error its protected range caught
+                Instruction insn = *pc++;
+                StkId ra = VM_REG(LUAU_INSN_A(insn));
+
+                VM_PROTECT_PC(); // raises when the result library isn't open, and allocates
+                luaR_wrapresult(L, ra, LUAU_INSN_B(insn) == LBC_WRAPRESULT_ERR);
+                VM_PROTECT(luaC_checkGC(L));
+                VM_NEXT();
+            }
+
+            VM_CASE(LOP_RESULTGET)
+            {
+                // Luwu try expressions: `r:ok()` or `r:err()` of a result kept in registers
+                Instruction insn = *pc++;
+                StkId ra = VM_REG(LUAU_INSN_A(insn));
+                StkId rb = VM_REG(LUAU_INSN_B(insn));
+
+                bool isOk = !l_isfalse(rb + LBC_TRYRESULT_OKFLAG);
+                bool wantsOk = LUAU_INSN_C(insn) == LBC_RESULTGET_OK;
+                if (isOk == wantsOk)
+                {
+                    setobj2s(L, ra, rb);
+                }
+                else
+                {
+                    setsymnonevalue(ra);
+                }
+                VM_NEXT();
+            }
+
             VM_CASE(LOP_PRESIZETABLE)
             {
                 // Luwu Table Comprehensions (rfcs/control-flow/table-comprehensions.md): sizes or trims the table a comprehension builds
@@ -4271,38 +4367,6 @@ reentry:
                 VM_NEXT();
             }
 
-            VM_CASE(LOP_WRAPRESULT)
-            {
-                // Luwu try expressions: the value of a `try` expression, or the error its protected range caught
-                Instruction insn = *pc++;
-                StkId ra = VM_REG(LUAU_INSN_A(insn));
-
-                VM_PROTECT_PC(); // raises when the result library isn't open, and allocates
-                luaR_wrapresult(L, ra, LUAU_INSN_B(insn) == LBC_WRAPRESULT_ERR);
-                VM_PROTECT(luaC_checkGC(L));
-                VM_NEXT();
-            }
-
-            VM_CASE(LOP_RESULTGET)
-            {
-                // Luwu try expressions: `r:ok()` or `r:err()` of a result kept in registers
-                Instruction insn = *pc++;
-                StkId ra = VM_REG(LUAU_INSN_A(insn));
-                StkId rb = VM_REG(LUAU_INSN_B(insn));
-
-                bool isOk = !l_isfalse(rb + LBC_TRYRESULT_OKFLAG);
-                bool wantsOk = LUAU_INSN_C(insn) == LBC_RESULTGET_OK;
-                if (isOk == wantsOk)
-                {
-                    setobj2s(L, ra, rb);
-                }
-                else
-                {
-                    setsymnonevalue(ra);
-                }
-                VM_NEXT();
-            }
-
             VM_CASE(LOP_GETQUALIFIED)
             {
                 // Luwu Traits (rfcs/classes/traits.md): `obj:Trait:name`, `Class:Trait.name`
@@ -4327,6 +4391,21 @@ reentry:
                 int c = LUAU_INSN_C(insn);
 
                 VM_PROTECT(luaV_getpositional(L, rb, c, ra));
+                VM_NEXT();
+            }
+
+            VM_CASE(LOP_SETQUALIFIED)
+            {
+                // Luwu Traits (rfcs/classes/traits.md): `obj:Trait.name = value`, `Class:Trait.name = value`
+                Instruction insn = *pc++;
+                uint32_t aux = *pc++;
+                StkId ra = VM_REG(LUAU_INSN_A(insn));
+                StkId rb = VM_REG(LUAU_INSN_B(insn));
+                StkId rc = VM_REG(LUAU_INSN_C(insn));
+                TValue* name = VM_KV(aux);
+                LUAU_ASSERT(ttisstring(name));
+
+                VM_PROTECT(luaR_setqualified(L, rb, rc, tsvalue(name), ra));
                 VM_NEXT();
             }
 
